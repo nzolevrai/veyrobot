@@ -30,7 +30,7 @@ if (!envResult.success) {
   process.exit(1);
 }
 const env = envResult.data;
-const [db, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
+const [db, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation/service')]);
 const { prisma } = db;
 
 const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.method, path: req.url?.split('?')[0] }) } }, trustProxy: env.NODE_ENV === 'production', bodyLimit: 16_384 });

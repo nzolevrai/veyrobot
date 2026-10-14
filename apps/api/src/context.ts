@@ -6,7 +6,7 @@ export type DiscordGuild = { id: string; name: string; icon: string | null; owne
 export type Session = { user: DiscordUser; accessToken: string; csrf: string; sessionId: string };
 export type ApiFailure = Error & { statusCode?: number; code?: string; retryAfter?: string };
 type Db = typeof import('@veyrobot/db');
-type Moderation = typeof import('@veyrobot/moderation');
+type Moderation = typeof import('@veyrobot/moderation/service');
 
 export type ApiContext = {
   env: { API_PUBLIC_URL: string; DASHBOARD_URL: string; DISCORD_CLIENT_ID: string; DISCORD_CLIENT_SECRET: string; DISCORD_BOT_TOKEN: string };

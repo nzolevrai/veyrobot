@@ -34,7 +34,7 @@ const guildIds = Array.from({ length: quietGuilds + 1 }, (_, index) => String(20
 const dominantGuild = guildIds[0];
 const actorId = '123456789012345679';
 const counters = { offered: 0, accepted: 0, refused: 0, admissionErrors: 0, arrivalsDelayed: 0, completed: 0, failed: 0, uncertain: 0, expired: 0, expiryUncertain: 0, expiryFailed: 0, discordActionCalls: 0, discordExpiryCalls: 0, dispatchErrors: 0 };
-const publicationTimes = new Map();
+const enqueueAttemptTimes = new Map();
 const latency = { quietDispatch: [], quietSerialization: [], quietWorkerWait: [], quietTotal: [], dominantDispatch: [], dominantSerialization: [], dominantWorkerWait: [], dominantTotal: [], expiryDispatch: [], expirySerialization: [], expiryWorkerWait: [], expiryTotal: [] };
 const lastGuildFinishAt = new Map();
 let busyGuildSkips = 0;
@@ -89,29 +89,30 @@ const elapsedSlopePerMinute = (rows, key) => {
   const denominator = xs.reduce((sum, x) => sum + (x - xMean) ** 2, 0);
   return denominator ? +((xs.reduce((sum, x, i) => sum + (x - xMean) * (ys[i] - yMean), 0) / denominator) * 60).toFixed(2) : 0;
 };
-function recordPublication(event) {
-  const prior = publicationTimes.get(event.operationId);
-  publicationTimes.set(event.operationId, { first: prior?.first ?? event.enqueueStartedAt, last: event.enqueueStartedAt, count: (prior?.count ?? 0) + 1 });
+function recordEnqueueAttempt(event) {
+  const prior = enqueueAttemptTimes.get(event.operationId);
+  enqueueAttemptTimes.set(event.operationId, { last: event.queueAddStartedAt, count: (prior?.count ?? 0) + 1 });
 }
 function recordAttemptStarted(attempt) {
-  const publication = publicationTimes.get(attempt.operationId);
-  if (!publication) return;
+  const enqueueAttempt = enqueueAttemptTimes.get(attempt.operationId);
+  if (!enqueueAttempt) return;
   const startedAt = Date.now();
   const previousFinishAt = lastGuildFinishAt.get(attempt.guildId) ?? attempt.createdAt.getTime();
+  const enqueueStartedAt = enqueueAttempt.last;
   if (attempt.kind === 'expiry') {
     const dueAt = attempt.scheduledAt?.getTime() ?? attempt.createdAt.getTime();
-    latency.expiryDispatch.push(Math.max(0, publication.first - Math.max(dueAt, previousFinishAt)));
+    latency.expiryDispatch.push(Math.max(0, enqueueStartedAt - Math.max(dueAt, previousFinishAt)));
     latency.expirySerialization.push(Math.max(0, previousFinishAt - dueAt));
-    latency.expiryWorkerWait.push(Math.max(0, startedAt - publication.first));
+    latency.expiryWorkerWait.push(Math.max(0, startedAt - Math.max(enqueueStartedAt, previousFinishAt)));
     latency.expiryTotal.push(Math.max(0, startedAt - dueAt));
   } else {
     const category = attempt.guildId === dominantGuild ? 'dominant' : 'quiet';
-    latency[`${category}Dispatch`].push(Math.max(0, publication.first - Math.max(attempt.createdAt.getTime(), previousFinishAt)));
+    latency[`${category}Dispatch`].push(Math.max(0, enqueueStartedAt - Math.max(attempt.createdAt.getTime(), previousFinishAt)));
     latency[`${category}Serialization`].push(Math.max(0, previousFinishAt - attempt.createdAt.getTime()));
-    latency[`${category}WorkerWait`].push(Math.max(0, startedAt - publication.first));
+    latency[`${category}WorkerWait`].push(Math.max(0, startedAt - Math.max(enqueueStartedAt, previousFinishAt)));
     latency[`${category}Total`].push(Math.max(0, startedAt - attempt.createdAt.getTime()));
   }
-  publicationTimes.delete(attempt.operationId);
+  enqueueAttemptTimes.delete(attempt.operationId);
 }
 function chooseProfile(elapsedSeconds) {
   const phase = Math.floor(elapsedSeconds / phaseSeconds) % 4;
@@ -142,7 +143,7 @@ async function createExpiry() {
   const operationId = `${prefix}expiry_${String(Date.now())}_${String(sequence).padStart(5, '0')}`;
   const guildId = guildIds[1 + (sequence % quietGuilds)];
   const targetId = String(400_000_000_000_000_000n + BigInt(sequence));
-  const row = await prisma.moderationCase.create({ data: { guildId, actorId, targetId, action: 'TEMPBAN', reason: 'isolated expiry benchmark', status: 'succeeded', operationId, banMarker: `veyro-case-${operationId}`, banGeneration: 1, expiryStatus: 'scheduled', expiresAt: new Date(Date.now() - 1_000), createdAt: new Date() } });
+  const row = await prisma.moderationCase.create({ data: { guildId, actorId, targetId, action: 'TEMPBAN', reason: 'isolated expiry benchmark', status: 'succeeded', operationId, banMarker: `veyro-case-${operationId}`, banGeneration: 1, expiryStatus: 'scheduled', expiresAt: new Date(Date.now() - 1), createdAt: new Date() } });
   counters.expired++;
 }
 
@@ -191,7 +192,7 @@ try {
     onGuildBusySkip: () => { busyGuildSkips++; },
   });
   worker.on('error', error => { counters.dispatchErrors++; console.error(JSON.stringify({ event: 'bench_worker_error', name: error?.name })); });
-  dispatch = createDispatcher(prisma, queue, () => true, () => { counters.dispatchErrors++; }, recordPublication);
+  dispatch = createDispatcher(prisma, queue, () => true, () => { counters.dispatchErrors++; }, recordEnqueueAttempt);
   dispatchTimer = setInterval(() => void dispatch(), 5_000);
   expiryTimer = setInterval(() => { void createExpiry().catch(error => { counters.admissionErrors++; console.error(JSON.stringify({ event: 'bench_expiry_seed_error', name: error?.name })); }); }, expiryPerMinute === 0 ? 2_147_000_000 : 60_000 / expiryPerMinute);
   loop.enable();
@@ -264,10 +265,10 @@ try {
     runId, scope: 'production createDispatcher + createModerationWorker + executeModerationAction/expireTemporaryBan; local controlled Discord adapter; isolated PostgreSQL and Redis DB 9; no real Discord requests',
     machine: { node: process.version, platform: `${os.type()} ${os.release()}`, cpus: os.cpus().length, cpuModel: os.cpus()[0]?.model },
     config: { seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, drainTimeoutMs, workerConcurrency: 4, maxActivePerGuild: 1, admissionGlobal: Number(env.MAX_PENDING_GLOBAL ?? 5000), admissionPerGuild: Number(env.MAX_PENDING_PER_GUILD ?? 100), poolMax: Number(env.DATABASE_POOL_SIZE ?? 10), dispatcherIntervalMs: 5000 },
-    counts: { ...counters, busyGuildSkips, unclaimedPublications: publicationTimes.size, rows: rows.length, terminal: actionRows.filter(row => ['succeeded', 'failed', 'uncertain'].includes(row.status)).length, expiredCompleted: expiryRows.filter(row => ['succeeded', 'failed', 'uncertain', 'superseded'].includes(row.expiryStatus)).length, pendingAfterDrain: pendingRows },
+    counts: { ...counters, busyGuildSkips, unmatchedEnqueueAttempts: enqueueAttemptTimes.size, rows: rows.length, terminal: actionRows.filter(row => ['succeeded', 'failed', 'uncertain'].includes(row.status)).length, expiredCompleted: expiryRows.filter(row => ['succeeded', 'failed', 'uncertain', 'superseded'].includes(row.expiryStatus)).length, pendingAfterDrain: pendingRows },
     latencyMs: Object.fromEntries(Object.entries(latency).map(([key, value]) => [key, summary(value)])),
     category: Object.fromEntries(byCategory),
-    resourceSamples: { count: samples.length, activeHeapSlopeBytesPerMinute: elapsedSlopePerMinute(samples.filter(row => row.activeLoad), 'heapUsedBytes'), idleHeapSlopeBytesPerMinute: elapsedSlopePerMinute(idleSamples, 'heapUsedBytes'), idleRssSlopeBytesPerMinute: elapsedSlopePerMinute(idleSamples, 'rssBytes'), peakRssBytes: Math.max(...samples.map(row => row.rssBytes), drainMemory.rss), beforeDrainRssBytes: drainMemory.rss, afterIdleRssBytes: afterIdle.rss, beforeDrainHeapBytes: drainMemory.heapUsed, afterIdleHeapBytes: afterIdle.heapUsed, maxEventLoopP95Ms: +Math.max(...samples.map(row => row.eventLoopP95Ms)).toFixed(2), maxWaitingJobs: Math.max(...samples.map(row => row.waitingJobs)), maxActiveJobs: Math.max(...samples.map(row => row.activeJobs)), maxRequestedRunning: Math.max(...samples.map(row => row.requestedRunning)), maxOldestRequestMs: Math.max(...samples.map(row => row.oldestRequestedMs)), maxOverdueExpiryRows: Math.max(...samples.map(row => row.scheduledOverdue)), maxOldestExpiryMs: Math.max(...samples.map(row => row.oldestExpiryMs)), maxPoolTotal: Math.max(...samples.map(row => row.poolTotal)), maxPoolWaiting: Math.max(...samples.map(row => row.poolWaiting)), maxPgPoolAcquireWaitMs: Math.max(0, ...poolWindows.map(row => row.maxWaitMs)), totalPgPoolAcquisitions: poolWindows.reduce((sum, row) => sum + row.acquisitions, 0), totalAdmissionLockWaitMs: lockWindows.reduce((sum, row) => sum + row.lockWaitTotalMs, 0), maxAdmissionLockWaitMs: Math.max(0, ...lockWindows.map(row => row.lockWaitMaxMs)), totalAdmissionCountMs: lockWindows.reduce((sum, row) => sum + row.countTotalMs, 0), maxAdmissionCountMs: Math.max(0, ...lockWindows.map(row => row.countMaxMs)), maxAdmissionLockHeldMs: Math.max(0, ...lockWindows.map(row => row.lockHeldMaxMs)), admissionWindows: lockWindows.length, cpuUserMs: +(cpu.user / 1000).toFixed(2), cpuSystemMs: +(cpu.system / 1000).toFixed(2) },
+    resourceSamples: { count: samples.length, intervalSeconds: sampleSeconds, oldestExpiryAgeIsSampled: true, activeHeapSlopeBytesPerMinute: elapsedSlopePerMinute(samples.filter(row => row.activeLoad), 'heapUsedBytes'), idleHeapSlopeBytesPerMinute: elapsedSlopePerMinute(idleSamples, 'heapUsedBytes'), idleRssSlopeBytesPerMinute: elapsedSlopePerMinute(idleSamples, 'rssBytes'), peakRssBytes: Math.max(...samples.map(row => row.rssBytes), drainMemory.rss), beforeDrainRssBytes: drainMemory.rss, afterIdleRssBytes: afterIdle.rss, beforeDrainHeapBytes: drainMemory.heapUsed, afterIdleHeapBytes: afterIdle.heapUsed, maxEventLoopP95Ms: +Math.max(...samples.map(row => row.eventLoopP95Ms)).toFixed(2), maxWaitingJobs: Math.max(...samples.map(row => row.waitingJobs)), maxActiveJobs: Math.max(...samples.map(row => row.activeJobs)), maxRequestedRunning: Math.max(...samples.map(row => row.requestedRunning)), maxOldestRequestMs: Math.max(...samples.map(row => row.oldestRequestedMs)), maxOverdueExpiryRows: Math.max(...samples.map(row => row.scheduledOverdue)), maxOldestExpiryMs: Math.max(...samples.map(row => row.oldestExpiryMs)), maxPoolTotal: Math.max(...samples.map(row => row.poolTotal)), maxPoolWaiting: Math.max(...samples.map(row => row.poolWaiting)), maxPgPoolAcquireWaitMs: Math.max(0, ...poolWindows.map(row => row.maxWaitMs)), totalPgPoolAcquisitions: poolWindows.reduce((sum, row) => sum + row.acquisitions, 0), totalAdmissionLockWaitMs: lockWindows.reduce((sum, row) => sum + row.lockWaitTotalMs, 0), maxAdmissionLockWaitMs: Math.max(0, ...lockWindows.map(row => row.lockWaitMaxMs)), totalAdmissionCountMs: lockWindows.reduce((sum, row) => sum + row.countTotalMs, 0), maxAdmissionCountMs: Math.max(0, ...lockWindows.map(row => row.countMaxMs)), maxAdmissionLockHeldMs: Math.max(0, ...lockWindows.map(row => row.lockHeldMaxMs)), admissionWindows: lockWindows.length, cpuUserMs: +(cpu.user / 1000).toFixed(2), cpuSystemMs: +(cpu.system / 1000).toFixed(2) },
     drainMs,
   }));
   if (counters.admissionErrors || counters.failed || counters.uncertain || counters.expiryUncertain || counters.expiryFailed || counters.dispatchErrors || counters.accepted !== counters.completed || counters.discordActionCalls !== counters.completed || counters.discordExpiryCalls !== counters.expired || pendingRows) process.exitCode = 1;

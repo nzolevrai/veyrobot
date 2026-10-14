@@ -27,6 +27,7 @@ for (const file of files) {
   }
   visit(source);
   for (const spec of specs) {
+    if (owner === 'apps/api' && spec === '@veyrobot/moderation') errors.push(`${path.relative(root, file)}: API must use the Discord-free @veyrobot/moderation/service entrypoint`);
     if (client && /^(@veyrobot\/(db|moderation)|discord\.js|bullmq|pg|@prisma\/)/.test(spec)) errors.push(`${path.relative(root, file)}: client bundle imports ${spec}`);
     if (owner === 'packages/contracts' && /^@veyrobot\//.test(spec)) errors.push(`${path.relative(root, file)}: contracts depend on ${spec}`);
     if (owner === 'packages/db' && spec === '@veyrobot/moderation') errors.push(`${path.relative(root, file)}: database depends on moderation`);

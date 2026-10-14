@@ -7,7 +7,7 @@ Lire `README.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE-MATRIX.md`, `docs/DASHBO
 - `apps/dashboard` : interface Next.js, routes par compte et par serveur, composants et styles communs. Elle appelle l'API ; elle ne détient pas de Gateway ni de logique de sanction.
 - `apps/api` : Fastify, OAuth et sessions, contrôle d'accès aux serveurs, configuration, dossiers et demandes d'action durables dans PostgreSQL.
 - `apps/bot` : Gateway discord.js, commandes slash et worker BullMQ. Il distribue les demandes enregistrées, appelle Discord et réconcilie les résultats et échéances.
-- `packages/db` : schéma, migrations et accès Prisma/PostgreSQL ; `packages/contracts` : types et permissions partagés ; `packages/moderation` : service métier et vérifications d'action communs à l'API et au bot.
+- `packages/db` : schéma, migrations et accès Prisma/PostgreSQL ; `packages/contracts` : types et permissions partagés ; `packages/moderation/service` : règles et soumission métier sans Discord.js ; `packages/moderation/executor` : vérifications d'action et mutations Discord consommées par le bot. L'entrée racine reste un barrel de compatibilité.
 
 Utiliser Node >= 24.17.0 (24.21.0 dans `.node-version`, `.nvmrc`, CI et Docker), pnpm 10.18.3 et un gestionnaire Node qui sélectionne réellement cette version. Vérifier `node --version` : le `corepack.cmd` de Windows peut utiliser un autre Node. Les commandes depuis la racine sont :
 

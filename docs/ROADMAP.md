@@ -65,7 +65,7 @@ Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interr
 
 ### Tâches restantes, priorisées
 
-1. Pour mise en production : revue humaine des changements, vérification GitHub CI, navigateur réel et contrôles Discord autorisés; aucune sanction réelle n'est requise pour la fusion des correctifs backend.
+1. Pour cette PR : vérifier la CI sur la tête exacte et recueillir les revues indépendantes via [le guide de revue](REVIEW-GUIDE.md). Pour mise en production : contrôle visuel navigateur et vérifications Discord autorisées; aucune sanction réelle n'est requise pour la fusion des correctifs backend.
 2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
 3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
 

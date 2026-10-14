@@ -18,10 +18,14 @@ app.get('/oauth/discord/callback', async (req, reply) => {
   const query = z.object({ code: z.string().min(1), state: z.string().min(1) }).safeParse(req.query);
   const initial = session(req);
   if (!query.success || !initial?.csrf || query.data.state !== initial.csrf) return reply.code(400).send({ error: 'État OAuth invalide ou expiré.' });
-  const tokenResponse = await fetch(`${api}/oauth2/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: env.DISCORD_CLIENT_ID, client_secret: env.DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code: query.data.code, redirect_uri: `${env.API_PUBLIC_URL}/oauth/discord/callback` }) });
+  let tokenResponse: Response;
+  try { tokenResponse = await fetch(`${api}/oauth2/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: env.DISCORD_CLIENT_ID, client_secret: env.DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code: query.data.code, redirect_uri: `${env.API_PUBLIC_URL}/oauth/discord/callback` }), signal: AbortSignal.timeout(8_000) }); }
+  catch { return reply.code(502).send({ error: 'Discord est temporairement indisponible pendant la connexion.' }); }
   if (!tokenResponse.ok) return reply.code(401).send({ error: 'La connexion Discord a échoué.' });
   const token = z.object({ access_token: z.string(), token_type: z.string(), expires_in: z.number() }).parse(await tokenResponse.json());
-  const userResponse = await fetch(`${api}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` } });
+  let userResponse: Response;
+  try { userResponse = await fetch(`${api}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` }, signal: AbortSignal.timeout(8_000) }); }
+  catch { return reply.code(502).send({ error: 'Discord est temporairement indisponible pendant la connexion.' }); }
   if (!userResponse.ok) return reply.code(401).send({ error: 'Impossible de lire le profil Discord.' });
   const user = z.object({ id: z.string(), username: z.string(), avatar: z.string().nullable() }).parse(await userResponse.json());
   const sessionId = crypto.randomUUID();

@@ -45,3 +45,4 @@ jobs:
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
           RUN_POSTGRES_INTEGRATION: '1'
+          RUN_DASHBOARD_ROUTE_INTEGRATION: '1'

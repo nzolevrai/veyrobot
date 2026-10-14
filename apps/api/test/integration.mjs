@@ -49,6 +49,16 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     const callback = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
     assert.equal(callback.status, 302);
     assert.equal(callback.headers.get('location'), 'http://localhost:3000/dashboard/user');
+    await stop();
+    childEnv.MOCK_OAUTH_TOKEN_DELAY_MS = '9000';
+    await start();
+    const slowStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
+    const slowState = new URL(slowStart.headers.get('location')).searchParams.get('state');
+    const slowStateCookie = slowStart.headers.get('set-cookie').split(';', 1)[0];
+    const slowCallback = await call(`/oauth/discord/callback?code=fixture&state=${slowState}`, slowStateCookie, { redirect: 'manual' });
+    assert.equal(slowCallback.status, 502, 'A stalled Discord token exchange must time out with a bounded response');
+    delete childEnv.MOCK_OAUTH_TOKEN_DELAY_MS;
+    await stop(); await start();
     let cookie = callback.headers.get('set-cookie').split(';', 1)[0];
     assert.equal(cookie.split('=', 1)[0], 'veyrobot_session', 'Unexpected OAuth session cookie name');
     if (process.env.RUN_DASHBOARD_ROUTE_INTEGRATION === '1') {
