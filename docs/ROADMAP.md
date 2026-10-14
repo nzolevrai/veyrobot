@@ -59,7 +59,7 @@ La prochaine vérification en direct doit activer Avertissements sur sa page dé
 
 ## Reprise après la revue du 14 octobre 2026
 
-Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime sont livrés sur la branche d'architecture. Les validations locales et les performances avec leurs incertitudes figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les prochaines priorités sont des campagnes de pannes Redis/PostgreSQL et charge prolongée, des métriques corrélées, un essai de restauration, la politique de croissance des dossiers d'action et la validation navigateur/Discord réel sans sanction. Aucun déploiement multi-processus n'est autorisé par le code actuel.
+Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime sont livrés sur la branche d'architecture. Les validations locales, les coupures isolées Redis/PostgreSQL et les performances avec leurs incertitudes figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les prochaines priorités sont des pannes pendant l'exécution Discord et charge prolongée, des métriques corrélées, un essai de restauration, la politique de croissance des dossiers d'action et la validation navigateur/Discord réel sans sanction. Aucun déploiement multi-processus n'est autorisé par le code actuel.
 
 ### Navigation routée et édition commune — 13 octobre 2026
 
