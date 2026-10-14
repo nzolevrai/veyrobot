@@ -31,7 +31,9 @@ const activeGuilds = new Set<string>();
       await prisma.moderationCase.update({ where: { id: row.id }, data: { expiryStatus: 'failed', expiryResult: 'Le bot ne peut plus accéder à ce serveur. Réactivez la planification après avoir restauré son accès.' } });
       return;
     }
-    await expireTemporaryBan({ guild, caseRecord: row, store: prisma });
+    const began = performance.now();
+    try { await expireTemporaryBan({ guild, caseRecord: row, store: prisma }); }
+    finally { console.info(JSON.stringify({ event: 'moderation_expiry_attempt', operationId: row.operationId, caseId: row.id, durationMs: +(performance.now() - began).toFixed(2) })); }
     return;
   }
   const { operationId } = job.data as { operationId: string; guildId: string };
@@ -56,7 +58,9 @@ const activeGuilds = new Set<string>();
     await prisma.moderationCase.update({ where: { id: row.id }, data: { status: 'failed', completedAt: new Date(), result: 'Le bot ne peut pas accéder au serveur; aucune action Discord n’a été envoyée.' } });
     return;
   }
-  await executeModerationAction({ operationId, guild, caseRecord: row, store: prisma });
+  const began = performance.now();
+  try { await executeModerationAction({ operationId, guild, caseRecord: row, store: prisma }); }
+  finally { console.info(JSON.stringify({ event: 'moderation_action_attempt', operationId, caseId: row.id, action: row.action, durationMs: +(performance.now() - began).toFixed(2) })); }
   } finally {
     activeGuilds.delete(guildId);
     onDrained();

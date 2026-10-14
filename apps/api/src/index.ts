@@ -3,12 +3,13 @@ import type { FastifyRequest } from 'fastify';
 import secureSession from '@fastify/secure-session';
 import rateLimit from '@fastify/rate-limit';
 import { createHash } from 'node:crypto';
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { z } from 'zod';
 import { canManageGuild } from '@veyrobot/contracts';
 import type { ApiContext, DiscordGuild as DGuild, Session } from './context.js';
 import { oauthRoutes } from './oauth-routes.js';
 import { guildRoutes } from './guild-routes.js';
-import { moderationRoutes } from './moderation-routes.js';
+import { moderationRoutes, admissionTotals } from './moderation-routes.js';
 import { GuildListCache } from './guild-list-cache.js';
 
 const envSchema = z.object({
@@ -105,7 +106,20 @@ await app.register(oauthRoutes(context));
 await app.register(guildRoutes(context));
 await app.register(moderationRoutes(context));
 
-app.addHook('onClose', async () => { await prisma.$disconnect(); });
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+let previousElu = performance.eventLoopUtilization();
+const resourceTimer = setInterval(() => {
+  const memory = process.memoryUsage();
+  const elu = performance.eventLoopUtilization(previousElu);
+  previousElu = performance.eventLoopUtilization();
+  app.log.info({ metric: 'api_resources', acceptedResponses: admissionTotals.accepted, backlogRefusals: admissionTotals.refused,
+    rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
+    eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, 'api operational snapshot');
+  loopDelay.reset();
+}, 60_000);
+resourceTimer.unref();
+app.addHook('onClose', async () => { clearInterval(resourceTimer); loopDelay.disable(); await prisma.$disconnect(); });
 await app.listen({ port: env.API_PORT, host: '0.0.0.0' });
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {

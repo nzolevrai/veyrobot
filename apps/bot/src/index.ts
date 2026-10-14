@@ -1,5 +1,6 @@
 import { Client, Events, GatewayIntentBits } from 'discord.js';
 import { Queue } from 'bullmq';
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { createModerationWorker } from './worker.js';
 import { createDispatcher } from './dispatcher.js';
 import { z } from 'zod';
@@ -7,7 +8,9 @@ import { acquireSingleBotLease } from './single-instance.js';
 import { registerInteractionHandler } from './interactions.js';
 
 const lastErrorLogAt = new Map<string, number>();
+const errorTotals = new Map<string, number>();
 function logThrottled(key: string, message: string, error: unknown): void {
+  errorTotals.set(key, (errorTotals.get(key) ?? 0) + 1);
   const now = Date.now();
   if (now - (lastErrorLogAt.get(key) ?? 0) < 60_000) return;
   lastErrorLogAt.set(key, now);
@@ -83,7 +86,33 @@ client.once(Events.ClientReady, async ready => {
   await dispatchRequested();
   const dispatchTimer = setInterval(() => void dispatchRequested(), 5_000);
   const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => console.error('stale moderation operation reconciliation failed', error)), 60_000);
-  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); process.exit(0); };
+  const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+  loopDelay.enable();
+  let previousElu = performance.eventLoopUtilization();
+  const metricsTimer = setInterval(() => { void (async () => {
+    const [rows, queueCounts, connections] = await Promise.all([
+      prisma.$queryRaw<Array<{ requested: bigint; running: bigint; uncertainActions: bigint; uncertainExpiries: bigint; oldestRequestedSeconds: number | null; overdueExpiries: bigint; oldestExpirySeconds: number | null }>>`
+        SELECT
+          (SELECT COUNT(*) FROM "ModerationCase" WHERE status = 'requested') AS requested,
+          (SELECT COUNT(*) FROM "ModerationCase" WHERE status = 'running') AS running,
+          (SELECT COUNT(*) FROM "ModerationCase" WHERE status = 'uncertain') AS "uncertainActions",
+          (SELECT COUNT(*) FROM "ModerationCase" WHERE "expiryStatus" = 'uncertain') AS "uncertainExpiries",
+          (SELECT EXTRACT(EPOCH FROM now() - MIN("createdAt"))::float8 FROM "ModerationCase" WHERE status = 'requested') AS "oldestRequestedSeconds",
+          (SELECT COUNT(*) FROM "ModerationCase" WHERE action = 'TEMPBAN' AND status = 'succeeded' AND "expiryStatus" = 'scheduled' AND "expiresAt" < now()) AS "overdueExpiries",
+          (SELECT EXTRACT(EPOCH FROM now() - MIN("expiresAt"))::float8 FROM "ModerationCase" WHERE action = 'TEMPBAN' AND status = 'succeeded' AND "expiryStatus" = 'scheduled' AND "expiresAt" < now()) AS "oldestExpirySeconds"`,
+      queue.getJobCounts('waiting', 'active', 'delayed', 'failed'),
+      prisma.$queryRaw<Array<{ count: number; lockWaiters: number }>>`SELECT COUNT(*)::integer AS count, COUNT(*) FILTER (WHERE wait_event_type = 'Lock')::integer AS "lockWaiters" FROM pg_stat_activity WHERE datname = current_database()`,
+    ]);
+    const memory = process.memoryUsage();
+    const elu = performance.eventLoopUtilization(previousElu);
+    previousElu = performance.eventLoopUtilization();
+    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, sql: connections[0],
+      errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
+      eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, (_key, value) => typeof value === 'bigint' ? Number(value) : value));
+    loopDelay.reset();
+  })().catch(error => logThrottled('operational-metrics', 'Operational snapshot failed', error)); }, 60_000);
+  metricsTimer.unref();
+  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); process.exit(0); };
   process.once('SIGINT', () => void shutdown()); process.once('SIGTERM', () => void shutdown());
 });
 

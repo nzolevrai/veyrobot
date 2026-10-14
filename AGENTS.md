@@ -1,6 +1,6 @@
 # Consignes de reprise — VeyroBot
 
-Lire `README.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE-MATRIX.md`, `docs/DASHBOARD-DESIGN.md`, `docs/PERFORMANCE-BASELINE.md`, `docs/RELIABILITY-REVIEW-2026-10-14.md`, `docs/MODULE-CONVENTION.md`, `docs/OPERATIONS.md` et `docs/ROADMAP.md` selon le domaine modifié. Ces documents décrivent l'état actuel et les travaux restants ; ce fichier fixe les règles de travail. Signaler les écarts entre le code et la documentation et les corriger dans la même modification.
+Lire `README.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE-MATRIX.md`, `docs/DASHBOARD-DESIGN.md`, `docs/PERFORMANCE-BASELINE.md`, `docs/RELIABILITY-REVIEW-2026-10-14.md`, `docs/RELIABILITY-VERIFICATION-2026-10-14.md`, `docs/MODULE-CONVENTION.md`, `docs/OPERATIONS.md` et `docs/ROADMAP.md` selon le domaine modifié. Ces documents décrivent l'état actuel et les travaux restants ; ce fichier fixe les règles de travail. Signaler les écarts entre le code et la documentation et les corriger dans la même modification.
 
 ## Monorepo et exécution
 
@@ -41,6 +41,7 @@ Créer `.env` localement à partir de `.env.example` sans recopier de valeurs da
 - Conserver pagination des dossiers, fetch Discord ciblés, limites de purge de 100 messages et absence de lecture du contenu des messages. Le pool PostgreSQL est borné à 10 connexions par processus par défaut ; BullMQ a une concurrence de quatre, avec une seule action par serveur. Mesurer avant d'augmenter les limites ou le nombre de processus.
 - `docs/PERFORMANCE-BASELINE.md` mesure le banc PostgreSQL historique ; `docs/RELIABILITY-REVIEW-2026-10-14.md` distingue SQL, pipeline PostgreSQL/BullMQ/HTTP simulé et objets discord.js synthétiques. Aucun ne prouve une capacité Gateway ou REST Discord réelle. Les coûts mémoire varient selon salons, rôles et activité ; ne pas convertir les chiffres en promesse de débit, latence ou disponibilité en production.
 - Respecter l'identité du dashboard décrite dans `docs/DASHBOARD-DESIGN.md` : anthracite `#15161b`, navigation `#191b21`, surface `#202229`, accent indigo `#7775f5`. Réutiliser `apps/dashboard/app/components.tsx`, `navigation.tsx`, `dashboard-context.tsx`, `module-registry.ts` et les styles communs ; préserver les états chargement/erreur, le clavier, le focus et le brouillon non sauvegardé. Les modules désactivés ou non livrés ne doivent pas sembler utilisables. Avant de coder avec Next.js, lire le guide correspondant dans `apps/dashboard/node_modules/next/dist/docs/`, car la version installée peut différer des connaissances de l'assistant. Le fichier `apps/dashboard/AGENTS.md` est généré localement par Next.js et ignoré par Git : lorsqu'il existe, lire aussi ses consignes.
+- Le proxy dashboard limite les corps à 1 MiB pendant la lecture et annule l'amont sur déconnexion ou `API_PROXY_TIMEOUT_MS`. Conserver les en-têtes OAuth `Set-Cookie`, les redirections manuelles et le filtrage hop-by-hop. Tester par Web Request et, pour les parcours OAuth, par le serveur Next construit.
 
 ## Vérification, secrets et documentation
 

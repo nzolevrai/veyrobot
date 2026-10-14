@@ -4,6 +4,8 @@ import { canModerateMembers } from '@veyrobot/contracts';
 import type { ModerationAction } from '@veyrobot/moderation';
 import type { ApiContext } from './context.js';
 
+export const admissionTotals = { accepted: 0, refused: 0 };
+
 export function moderationRoutes(ctx: ApiContext): FastifyPluginAsync {
   const { env, prisma, requireInstalledGuild, isBotOnlineInGuild } = ctx;
   const { casesForGuildQuery, createWarningCase, withModerationAdmission } = ctx.db;
@@ -33,8 +35,9 @@ app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/actio
     if (input.action === 'SLOWMODE' && input.rateLimitSeconds === undefined) return reply.code(400).send({ error: 'La valeur du slowmode est obligatoire (0 pour le désactiver).'});
     if (!await isBotOnlineInGuild(req.params.guildId)) return reply.code(503).send({ error: 'Le bot est installé mais temporairement hors ligne. Réessayez après son retour.' });
     const item = await withModerationAdmission(prisma, req.params.guildId, input.operationId, tx => submitModerationAction(tx, { guildId: req.params.guildId, actorId: s.user.id, targetId: input.targetId, action: input.action, reason: input.reason, ...(input.durationMinutes === undefined ? {} : { durationMinutes: input.durationMinutes }), ...(input.channelId === undefined ? {} : { channelId: input.channelId }), ...(input.filterAuthorId === undefined ? {} : { filterAuthorId: input.filterAuthorId }), ...(input.requestedCount === undefined ? {} : { requestedCount: input.requestedCount }), ...(input.rateLimitSeconds === undefined ? {} : { rateLimitSeconds: input.rateLimitSeconds }), operationId: input.operationId }));
+    admissionTotals.accepted++;
     return reply.code(202).send(item);
-  } catch (e) { return reply.code((e as { statusCode?: number }).statusCode ?? 400).send({ error: e instanceof Error ? e.message : 'Erreur de requête.' }); }
+  } catch (e) { if ((e as { code?: string }).code === 'MODERATION_BACKLOG_LIMIT') admissionTotals.refused++; return reply.code((e as { statusCode?: number }).statusCode ?? 400).send({ error: e instanceof Error ? e.message : 'Erreur de requête.' }); }
 });
 const warningInput = z.object({ targetId: z.string().regex(/^\d{17,20}$/), reason: z.string().trim().min(1).max(500), csrf: z.string().min(1) });
 app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/warnings', async (req, reply) => {
