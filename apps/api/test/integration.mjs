@@ -59,6 +59,12 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       let available = false;
       for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { available = true; break; } } catch { /* wait for Next */ } await delay(100); }
       assert.equal(available, true, 'Dashboard test process did not start');
+      const proxiedBody = async size => fetch(`http://localhost:${dashboardPort}/api/guilds/${guildA}/actions`, {
+        method: 'POST', duplex: 'half', headers: { 'content-type': 'application/json' },
+        body: new ReadableStream({ start(controller) { controller.enqueue(size === 2 ? Buffer.from('{}') : new Uint8Array(size)); controller.close(); } }),
+      });
+      assert.equal((await proxiedBody(1_048_577)).status, 413, 'Next must reject a chunked oversized body before the API');
+      assert.equal((await proxiedBody(2)).status, 401, 'Next must forward a bounded chunked body to the API');
       const noSession = await fetch(direct, { redirect: 'manual' });
       assert.equal(noSession.status, 307);
       const userRoute = `http://localhost:${dashboardPort}/dashboard/user`;
