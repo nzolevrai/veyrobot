@@ -1,5 +1,7 @@
 # Banc de charge local (hors Discord)
 
+Ce document conserve la référence historique **PostgreSQL seul** du 13 octobre. La [revue du 14 octobre](RELIABILITY-REVIEW-2026-10-14.md) ajoute des essais API, BullMQ avec HTTP simulé, objets discord.js, plans SQL et leurs limites. Aucun de ces bancs ne mesure la capacité Gateway ou REST Discord réelle.
+
 ## Reproduction
 
 Avec PostgreSQL local démarré et les migrations à jour :
