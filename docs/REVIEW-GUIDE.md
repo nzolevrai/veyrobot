@@ -1,6 +1,6 @@
 # Guide de revue indépendante
 
-Ce guide décrit les preuves disponibles pour la PR [#1](https://github.com/nzolevrai/veyrobot/pull/1). **Commit de code et tests à examiner : `e12dc42248bfb6eedeac40d79c26a0e3b2cdee91`** (`Harden OAuth and split moderation service boundaries`). Le commit suivant ajoute uniquement ce guide et sa référence SHA; le code et les mesures sont ceux de ce SHA. Après checkout de la tête de PR, vérifier `git rev-parse HEAD^` et confirmer qu’il correspond au commit de code ci-dessus. Vérifier les checks CI sur la tête finale de PR. La PR reste en brouillon et ne doit pas être fusionnée automatiquement.
+Ce guide décrit les preuves disponibles pour la PR [#1](https://github.com/nzolevrai/veyrobot/pull/1). **Commit de code et tests à examiner : `d60786a12426f8501b4e027a8367de2f7823348f`** (`Use Discord-free moderation types in API`). Il comprend le correctif de sous-chemin API découvert pendant la CI. Le commit qui ajoute cette mise à jour du guide est documentaire; examiner la tête de PR pour le dépôt complet et vérifier les checks CI sur cette tête. La PR reste en brouillon et ne doit pas être fusionnée automatiquement.
 
 ChatGPT, Claude et Gemini peuvent utiliser le même SHA et les commandes ci-dessous, mais doivent examiner le code eux-mêmes. Rapporter chaque constat avec chemin/ligne, scénario reproductible, gravité et impact; signaler aussi les zones non vérifiables depuis le dépôt. Ne pas inférer une garantie à partir d’un test simulé.
 
