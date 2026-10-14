@@ -27,7 +27,9 @@ export function canActOnTarget(input: { actorIsOwner: boolean; actorAboveTarget:
   return !input.targetIsOwner && (input.actorIsOwner || input.actorAboveTarget) && input.botAboveTarget;
 }
 
-export class ModerationRuleError extends Error {}
+export class ModerationRuleError extends Error {
+  constructor(message: string) { super(message); this.name = 'ModerationRuleError'; }
+}
 
 export function validateModerationInput(input: ModerationInput): void {
   if (!/^\d{17,20}$/.test(input.guildId) || !/^\d{17,20}$/.test(input.actorId) || !/^\d{17,20}$/.test(input.targetId)) throw new ModerationRuleError('Identifiant Discord invalide.');

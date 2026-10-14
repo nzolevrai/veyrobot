@@ -14,6 +14,7 @@ import { GuildListCache } from './guild-list-cache.js';
 
 const envSchema = z.object({
   API_PORT: z.coerce.number().default(4000),
+  API_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(90),
   API_PUBLIC_URL: z.string().url(),
   DASHBOARD_URL: z.string().url(),
   DATABASE_URL: z.string().min(1),
@@ -21,6 +22,7 @@ const envSchema = z.object({
   DISCORD_CLIENT_SECRET: z.string().min(1),
   DISCORD_BOT_TOKEN: z.string().min(1),
   SESSION_KEY: z.string().regex(/^[a-f\d]{64}$/i),
+  API_TRUSTED_PROXIES: z.string().default(''),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 });
 const envResult = envSchema.safeParse(process.env);
@@ -33,14 +35,33 @@ const env = envResult.data;
 const [db, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation/service')]);
 const { prisma } = db;
 
-const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.method, path: req.url?.split('?')[0] }) } }, trustProxy: env.NODE_ENV === 'production', bodyLimit: 16_384 });
+const trustedProxies = env.API_TRUSTED_PROXIES.split(',').map(value => value.trim()).filter(Boolean);
+const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.method, path: req.url?.split('?')[0] }) } }, trustProxy: trustedProxies.length ? trustedProxies : false, bodyLimit: 16_384 });
 app.addHook('onRequest', async (req, reply) => { reply.header('x-request-id', req.id); });
-await app.register(rateLimit, { max: 90, timeWindow: '1 minute', errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
+await app.register(rateLimit, { hook: 'preHandler', max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: req => {
+  const auth = (req.session as { get(key: string): unknown } | undefined)?.get('auth') as Partial<Session> | undefined;
+  return auth?.sessionId ? `session:${auth.sessionId}` : `ip:${req.ip}`;
+}, errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
 await app.register(secureSession, { key: Buffer.from(env.SESSION_KEY, 'hex'), cookieName: 'veyrobot_session', cookie: { path: '/', httpOnly: true, sameSite: 'lax', secure: env.NODE_ENV === 'production', maxAge: 60 * 60 * 8 } });
 
 const api = 'https://discord.com/api/v10';
-const session = (req: import('fastify').FastifyRequest): Session | null => (req.session as { get(key: string): unknown }).get('auth') as Session | null ?? null;
+const session = (req: import('fastify').FastifyRequest): Session | null => {
+  const auth = (req.session as { get(key: string): unknown }).get('auth') as Partial<Session> | null;
+  if (!auth || !auth.user || typeof auth.user.id !== 'string' || typeof auth.user.username !== 'string' || typeof auth.accessToken !== 'string' || typeof auth.csrf !== 'string' || typeof auth.sessionId !== 'string') return null;
+  return auth as Session;
+};
 const sessionHash = (id: string) => createHash('sha256').update(id).digest('hex');
+const sendError: ApiContext['sendError'] = (request, reply, error) => {
+  const candidate = error as { statusCode?: number; code?: string; retryAfter?: string };
+  const dependencyUnavailable = ['P1000', 'P1001', 'P1002', 'P1017', 'P2024'].includes(candidate.code ?? '') || (error instanceof Error && error.name === 'PrismaClientInitializationError');
+  const status = error instanceof z.ZodError || (error instanceof Error && error.name === 'ModerationRuleError') ? 400 : candidate.statusCode ?? (candidate.code === 'P2002' || candidate.code === 'P2034' ? 409 : candidate.code === 'MODERATION_BACKLOG_LIMIT' ? 429 : dependencyUnavailable ? 503 : 500);
+  const code = error instanceof z.ZodError ? 'VALIDATION_ERROR' : candidate.code ?? (status === 401 ? 'SESSION_ABSENT' : status === 403 ? 'ACCESS_DENIED' : status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_FAILED');
+  if (candidate.retryAfter) reply.header('retry-after', candidate.retryAfter);
+  app.log.warn({ requestId: request.id, status, code, errorName: error instanceof Error ? error.name : 'unknown' }, 'API request failed');
+  const message = status === 400 ? 'Requête invalide.' : status === 401 ? 'Reconnectez votre compte.' : status === 403 ? 'Accès refusé.' : status === 409 ? 'Conflit avec une opération existante.' : status === 429 ? 'Trop de requêtes ou capacité atteinte.' : status === 503 || status === 502 ? 'Service temporairement indisponible.' : 'Erreur interne.';
+  return reply.code(status).send({ code, error: message, requestId: request.id });
+};
+app.setErrorHandler((error, request, reply) => sendError(request, reply, error));
 app.addHook('preHandler', async (req, reply) => {
   const path = req.url.split('?')[0];
   if (path === '/health' || path === '/ready' || path === '/public-config' || path === '/oauth/discord/start' || path === '/oauth/discord/callback') return;
@@ -101,7 +122,7 @@ app.get('/ready', { config: { rateLimit: false } }, async (_req, reply) => {
   catch { return reply.code(503).send({ status: 'degraded', dependency: 'postgresql' }); }
 });
 app.get('/public-config', async () => ({ discordClientId: env.DISCORD_CLIENT_ID }));
-const context: ApiContext = { env, db, moderation, prisma, guildListCache, sessionHash, session, getCachedGuilds, authorizeGuild, requireInstalledGuild, validMutation, isBotOnlineInGuild };
+const context: ApiContext = { env, db, moderation, prisma, guildListCache, sessionHash, sendError, session, getCachedGuilds, authorizeGuild, requireInstalledGuild, validMutation, isBotOnlineInGuild };
 await app.register(oauthRoutes(context));
 await app.register(guildRoutes(context));
 await app.register(moderationRoutes(context));

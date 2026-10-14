@@ -23,6 +23,8 @@ test('rejects declared and streamed oversized bodies before contacting the API',
 test('forwards a bounded body without Content-Length and filters hop headers in both directions', async () => {
   const upstream: typeof fetch = async (_url, init) => {
     assert.equal(init?.headers instanceof Headers && init.headers.get('x-drop'), null);
+    assert.equal(init?.headers instanceof Headers && init.headers.get('x-forwarded-for'), null);
+    assert.equal(init?.headers instanceof Headers && init.headers.get('forwarded'), null);
     assert.equal(init?.headers instanceof Headers && init.headers.get('connection'), null);
     assert.equal(Buffer.from(init?.body as Uint8Array).toString(), 'payload');
     const headers = new Headers({ connection: 'x-response-drop', 'x-response-drop': 'internal', location: '/next' });
@@ -30,7 +32,7 @@ test('forwards a bounded body without Content-Length and filters hop headers in 
     headers.append('set-cookie', 'second=2; HttpOnly');
     return new Response(null, { status: 302, headers });
   };
-  const response = await proxyRequest(streamedRequest([Buffer.from('pay'), Buffer.from('load')], { connection: 'x-drop', 'x-drop': 'internal' }), ['test'], '', upstream);
+  const response = await proxyRequest(streamedRequest([Buffer.from('pay'), Buffer.from('load')], { connection: 'x-drop', 'x-drop': 'internal', 'x-forwarded-for': '203.0.113.1', forwarded: 'for=203.0.113.1' }), ['test'], '', upstream);
   assert.equal(response.status, 302);
   assert.equal(response.headers.get('location'), '/next');
   assert.equal(response.headers.get('x-response-drop'), null);

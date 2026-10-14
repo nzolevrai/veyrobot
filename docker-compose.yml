@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: sentinelle
       POSTGRES_PASSWORD: sentinelle_local
       POSTGRES_DB: sentinelle
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sentinelle -d sentinelle"]
@@ -18,7 +18,7 @@ services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     volumes: ["redisdata:/data"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -49,7 +49,7 @@ services:
       API_PUBLIC_URL: http://localhost:4000
       DASHBOARD_URL: http://localhost:3000
       DATABASE_URL: postgresql://sentinelle:sentinelle_local@postgres:5432/sentinelle?schema=public
-    ports: ["4000:4000"]
+    ports: ["127.0.0.1:4000:4000"]
     command: ["corepack", "pnpm", "--filter", "@veyrobot/api", "start"]
     depends_on:
       migrate:
@@ -65,6 +65,7 @@ services:
       DATABASE_URL: postgresql://sentinelle:sentinelle_local@postgres:5432/sentinelle?schema=public
       REDIS_URL: redis://redis:6379
     command: ["corepack", "pnpm", "--filter", "@veyrobot/bot", "start"]
+    restart: on-failure
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -77,7 +78,7 @@ services:
       NODE_ENV: production
       API_INTERNAL_URL: http://api:4000
       SUPPORT_DISCORD_URL: ${SUPPORT_DISCORD_URL:-}
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     command: ["corepack", "pnpm", "--filter", "@veyrobot/dashboard", "start"]
     depends_on: [api]
 volumes:

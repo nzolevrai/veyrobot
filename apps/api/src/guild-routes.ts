@@ -4,7 +4,7 @@ import { canManageGuild } from '@veyrobot/contracts';
 import type { ApiContext, ApiFailure } from './context.js';
 
 export function guildRoutes(ctx: ApiContext): FastifyPluginAsync {
-  const { env, prisma, session, getCachedGuilds, authorizeGuild, requireInstalledGuild, validMutation, isBotOnlineInGuild } = ctx;
+  const { env, prisma, session, getCachedGuilds, authorizeGuild, requireInstalledGuild, validMutation, isBotOnlineInGuild, sendError } = ctx;
   const { defaultGuildConfig, guildSettingsSchema, moduleIds } = ctx.db;
   const api = 'https://discord.com/api/v10';
   return async app => {
@@ -39,7 +39,7 @@ app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/insta
     if (!response.ok) return reply.code(503).send({ error: 'La vérification Discord est temporairement indisponible. Réessayez plus tard.' });
     await prisma.guildPresence.upsert({ where: { guildId: req.params.guildId }, create: { guildId: req.params.guildId, shardId: -1 }, update: {} });
     return { botInstalled: true, botOnline: await isBotOnlineInGuild(req.params.guildId) };
-  } catch (e) { return reply.code((e as { statusCode?: number }).statusCode ?? 503).send({ error: e instanceof Error ? e.message : 'Vérification indisponible.' }); }
+  } catch (e) { return sendError(req, reply, e); }
 });
 app.get<{ Params: { guildId: string } }>('/guilds/:guildId/config', async (req, reply) => {
   try {
@@ -82,12 +82,7 @@ app.put<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/config
     if (!updated) return reply.code(409).send({ error: 'Ce serveur a été modifié par une autre personne. Actualisez les réglages.' });
     return updated;
   } catch (e) {
-    if (['P2002', 'P2034'].includes((e as { code?: string }).code ?? '')) return reply.code(409).send({ error: 'La configuration a changé pendant l’enregistrement. Actualisez les réglages.' });
-    if (e instanceof z.ZodError) return reply.code(400).send({ error: e.issues[0]?.message ?? 'Réglages invalides.' });
-    const status = (e as { statusCode?: number }).statusCode;
-    if (status) return reply.code(status).send({ error: e instanceof Error ? e.message : 'Accès refusé.' });
-    app.log.error({ err: e }, 'guild config update failed');
-    return reply.code(500).send({ error: 'La configuration n’a pas pu être enregistrée.' });
+    return sendError(req, reply, e);
   }
 });
   };

@@ -42,6 +42,21 @@ let wakeRequestDispatcher: (() => Promise<void>) | undefined;
 const worker = createModerationWorker(client, connection, prisma, moderation, rejectPendingAfterDisable,
   () => { if (wakeRequestDispatcher) setTimeout(() => void wakeRequestDispatcher?.(), 0); });
 worker.on('error', error => logThrottled('moderation-redis-worker', 'Redis worker error', error));
+let stopBot: (() => Promise<void>) | undefined;
+let fatalShutdown: Promise<void> | undefined;
+const failProcess = (error: unknown, source: string) => {
+  logThrottled(`fatal-${source}`, `Fatal bot error from ${source}`, error);
+  if (!fatalShutdown) fatalShutdown = (async () => {
+    try {
+      if (stopBot) await stopBot();
+      else { await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); }
+    } catch (shutdownError) { logThrottled('fatal-shutdown', 'Fatal shutdown cleanup failed', shutdownError); }
+    process.exit(1);
+  })();
+};
+client.on(Events.Error, error => failProcess(error, 'discord-client'));
+process.on('unhandledRejection', reason => failProcess(reason, 'unhandled-rejection'));
+process.on('uncaughtException', error => failProcess(error, 'uncaught-exception'));
 
 client.once(Events.ClientReady, async ready => {
   console.info(`Connecté comme ${ready.user.tag}`);
@@ -84,7 +99,7 @@ client.once(Events.ClientReady, async ready => {
   const timer = setInterval(() => void publishPresence().catch(err => logThrottled('presence-heartbeat', 'presence heartbeat failed', err)), 30_000);
   if (!membershipsSynced) membershipRetryTimer = setInterval(() => void syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync retry failed', error)), 30_000);
   await dispatchRequested();
-  const dispatchTimer = setInterval(() => void dispatchRequested(), 5_000);
+  const dispatchTimer = setInterval(() => void dispatchRequested(), 1_000);
   const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => console.error('stale moderation operation reconciliation failed', error)), 60_000);
   const loopDelay = monitorEventLoopDelay({ resolution: 20 });
   loopDelay.enable();
@@ -112,11 +127,14 @@ client.once(Events.ClientReady, async ready => {
     loopDelay.reset();
   })().catch(error => logThrottled('operational-metrics', 'Operational snapshot failed', error)); }, 60_000);
   metricsTimer.unref();
-  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); process.exit(0); };
+  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); };
+  stopBot = shutdown;
   process.once('SIGINT', () => void shutdown()); process.once('SIGTERM', () => void shutdown());
 });
 
-registerInteractionHandler(client);
+registerInteractionHandler(client, () => {
+  if (wakeRequestDispatcher) void wakeRequestDispatcher().catch(error => logThrottled('moderation-request-wake', 'slash admission dispatcher wake failed', error));
+});
 client.on(Events.GuildCreate, guild => void prisma.guildPresence.upsert({ where: { guildId: guild.id }, create: { guildId: guild.id, shardId: guild.shardId }, update: { shardId: guild.shardId, lastSeenAt: new Date() } }).catch(error => logThrottled('guild-membership-event', 'guild join presence update failed', error)));
 client.on(Events.GuildDelete, guild => void prisma.guildPresence.deleteMany({ where: { guildId: guild.id } }).catch(error => logThrottled('guild-membership-event', 'guild leave presence update failed', error)));
 

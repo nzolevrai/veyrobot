@@ -21,14 +21,16 @@ const discordDelayMs = Number(process.env.BENCH_DISCORD_DELAY_MS ?? 150);
 const sampleSeconds = Number(process.env.BENCH_SAMPLE_SECONDS ?? 5);
 const progressSeconds = Number(process.env.BENCH_PROGRESS_SECONDS ?? 60);
 const drainTimeoutMs = Number(process.env.BENCH_DRAIN_TIMEOUT_MS ?? 300_000);
+const dispatcherIntervalMs = Number(process.env.BENCH_DISPATCH_INTERVAL_MS ?? 1_000);
 const runId = randomUUID().replaceAll('-', '').slice(0, 12);
 const prefix = `bench_${runId}_`;
 const queueName = 'veyrobot-moderation';
 const env = process.env;
-if (![seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, progressSeconds, drainTimeoutMs].every(Number.isFinite) || seconds < 30 || seconds > 86_400 || phaseSeconds < 30 || idleSeconds < 0 || quietGuilds < 2 || quietGuilds > 2_000 || normalRps < 0.1 || normalRps > 100 || dominantRps < 0.1 || dominantRps > 100 || burstRps < 0.1 || burstRps > 200 || burstSeconds < 1 || burstSeconds > 60 || expiryPerMinute < 0 || expiryPerMinute > 60 || discordDelayMs < 0 || discordDelayMs > 5_000 || sampleSeconds < 1 || sampleSeconds > 60 || progressSeconds < 0) throw new Error('Invalid benchmark parameters.');
+if (![seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, progressSeconds, drainTimeoutMs, dispatcherIntervalMs].every(Number.isFinite) || seconds < 30 || seconds > 86_400 || phaseSeconds < 30 || idleSeconds < 0 || quietGuilds < 2 || quietGuilds > 2_000 || normalRps < 0.1 || normalRps > 100 || dominantRps < 0.1 || dominantRps > 100 || burstRps < 0.1 || burstRps > 200 || burstSeconds < 1 || burstSeconds > 60 || expiryPerMinute < 0 || expiryPerMinute > 60 || discordDelayMs < 0 || discordDelayMs > 5_000 || sampleSeconds < 1 || sampleSeconds > 60 || progressSeconds < 0 || dispatcherIntervalMs < 100 || dispatcherIntervalMs > 60_000) throw new Error('Invalid benchmark parameters.');
 if (seconds < 1800 && env.BENCH_ALLOW_SHORT !== '1') throw new Error('A decision campaign must run at least 1800s. Use BENCH_ALLOW_SHORT=1 only for a harness smoke test.');
 if (!env.DATABASE_URL?.includes('veyrobot_arch_bench')) throw new Error('Use the isolated veyrobot_arch_bench database.');
-if (!env.REDIS_URL?.endsWith('/9')) throw new Error('Use isolated Redis DB 9.');
+const redisDb = env.REDIS_URL ? new URL(env.REDIS_URL).pathname : '';
+if (!/^\/(?:[1-9]|1[0-5])$/.test(redisDb)) throw new Error('Use a dedicated nonzero Redis logical database (1–15) for the benchmark.');
 
 const guildIds = Array.from({ length: quietGuilds + 1 }, (_, index) => String(200_000_000_000_000_000n + BigInt(index)));
 const dominantGuild = guildIds[0];
@@ -193,7 +195,7 @@ try {
   });
   worker.on('error', error => { counters.dispatchErrors++; console.error(JSON.stringify({ event: 'bench_worker_error', name: error?.name })); });
   dispatch = createDispatcher(prisma, queue, () => true, () => { counters.dispatchErrors++; }, recordEnqueueAttempt);
-  dispatchTimer = setInterval(() => void dispatch(), 5_000);
+  dispatchTimer = setInterval(() => void dispatch(), dispatcherIntervalMs);
   expiryTimer = setInterval(() => { void createExpiry().catch(error => { counters.admissionErrors++; console.error(JSON.stringify({ event: 'bench_expiry_seed_error', name: error?.name })); }); }, expiryPerMinute === 0 ? 2_147_000_000 : 60_000 / expiryPerMinute);
   loop.enable();
   const cpuStarted = process.cpuUsage();
@@ -262,9 +264,9 @@ try {
   const idleSamples = samples.filter(row => row.elapsedSeconds >= (performance.now() - campaignStart) / 1_000 - idleSeconds - sampleSeconds);
   const cpu = process.cpuUsage(cpuStarted);
   console.log(JSON.stringify({
-    runId, scope: 'production createDispatcher + createModerationWorker + executeModerationAction/expireTemporaryBan; local controlled Discord adapter; isolated PostgreSQL and Redis DB 9; no real Discord requests',
+    runId, scope: 'production createDispatcher + createModerationWorker + executeModerationAction/expireTemporaryBan; local controlled Discord adapter; isolated PostgreSQL and Redis DB; no real Discord requests',
     machine: { node: process.version, platform: `${os.type()} ${os.release()}`, cpus: os.cpus().length, cpuModel: os.cpus()[0]?.model },
-    config: { seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, drainTimeoutMs, workerConcurrency: 4, maxActivePerGuild: 1, admissionGlobal: Number(env.MAX_PENDING_GLOBAL ?? 5000), admissionPerGuild: Number(env.MAX_PENDING_PER_GUILD ?? 100), poolMax: Number(env.DATABASE_POOL_SIZE ?? 10), dispatcherIntervalMs: 5000 },
+    config: { seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, drainTimeoutMs, workerConcurrency: 4, maxActivePerGuild: 1, admissionGlobal: Number(env.MAX_PENDING_GLOBAL ?? 5000), admissionPerGuild: Number(env.MAX_PENDING_PER_GUILD ?? 100), poolMax: Number(env.DATABASE_POOL_SIZE ?? 10), dispatcherIntervalMs, redisDatabase: redisDb },
     counts: { ...counters, busyGuildSkips, unmatchedEnqueueAttempts: enqueueAttemptTimes.size, rows: rows.length, terminal: actionRows.filter(row => ['succeeded', 'failed', 'uncertain'].includes(row.status)).length, expiredCompleted: expiryRows.filter(row => ['succeeded', 'failed', 'uncertain', 'superseded'].includes(row.expiryStatus)).length, pendingAfterDrain: pendingRows },
     latencyMs: Object.fromEntries(Object.entries(latency).map(([key, value]) => [key, summary(value)])),
     category: Object.fromEntries(byCategory),

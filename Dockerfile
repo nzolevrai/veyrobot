@@ -14,7 +14,10 @@ FROM node:24.21.0-bookworm-slim AS runtime
 WORKDIR /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
+ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable && corepack prepare pnpm@10.18.3 --activate
-COPY --from=build /workspace ./
+RUN chown -R node:node /opt/corepack
+COPY --from=build --chown=node:node /workspace ./
+USER node
 EXPOSE 3000 4000
 CMD ["pnpm", "--filter", "@veyrobot/api", "start"]

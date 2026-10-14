@@ -18,12 +18,12 @@ function deferred() {
   return { promise, release };
 }
 
-function controlledGuild(options: { kick?: () => Promise<void>; beforeTarget?: () => Promise<void>; unban?: () => Promise<void> } = {}) {
+function controlledGuild(options: { kick?: () => Promise<void>; beforeTarget?: () => Promise<void>; unban?: () => Promise<void>; ban?: () => Promise<void>; banReason?: string } = {}) {
   let kicks = 0;
   let unbans = 0;
   const actor = { id: actorId, permissions: { bitfield: PermissionFlagsBits.KickMembers }, roles: { highest: { comparePositionTo: () => 1 } } };
   const bot = { id: '687654321012345678', permissions: { bitfield: PermissionFlagsBits.KickMembers | PermissionFlagsBits.BanMembers, has: () => true }, roles: { highest: { comparePositionTo: () => 1 } } };
-  const target = { id: targetId, roles: { highest: {} }, kick: async () => { kicks++; await options.kick?.(); } };
+  const target = { id: targetId, roles: { highest: {} }, kick: async () => { kicks++; await options.kick?.(); }, ban: async () => { await options.ban?.(); } };
   const guild = {
     ownerId: actorId,
     members: {
@@ -31,7 +31,7 @@ function controlledGuild(options: { kick?: () => Promise<void>; beforeTarget?: (
       fetchMe: async () => bot,
       unban: async () => { unbans++; await options.unban?.(); },
     },
-    bans: { fetch: async () => ({ reason: 'test [veyro-case-test]' }) },
+    bans: { fetch: async () => ({ reason: options.banReason ?? 'test [veyro-case-test]' }) },
   } as unknown as Guild;
   return { guild, get kicks() { return kicks; }, get unbans() { return unbans; } };
 }
@@ -159,4 +159,52 @@ test('production expiry: interrupted unban is uncertain and never automatically 
     await expireTemporaryBan({ guild: discord.guild, caseRecord: row, store: prisma });
     assert.equal(discord.unbans, 1);
   } finally { gate.release(); await prisma.moderationCase.delete({ where: { id: row.id } }); }
+});
+
+test('production expiry keeps the original tempban scheduled when a newer BAN request failed', { skip: !integration }, async () => {
+  const operationId = `test-${randomUUID()}`;
+  const failedOperationId = `test-${randomUUID()}`;
+  const row = await prisma.moderationCase.create({ data: {
+    guildId, actorId, targetId, action: 'TEMPBAN', reason: 'prior temporary ban', status: 'succeeded', operationId,
+    banMarker: 'veyro-case-prior', banGeneration: 1, expiresAt: new Date(0), expiryStatus: 'scheduled',
+  } });
+  await prisma.guildTargetDecision.create({ data: { guildId, targetId, generation: 2, latestOperationId: failedOperationId, appliedGeneration: 1, appliedOperationId: operationId } });
+  await prisma.moderationCase.create({ data: { guildId, actorId, targetId, action: 'BAN', reason: 'failed newer request', status: 'failed', operationId: failedOperationId, banGeneration: 2 } });
+  const discord = controlledGuild({ banReason: '[veyro-case-prior]' });
+  try {
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: row, store: prisma });
+    const expiry = await prisma.moderationCase.findUniqueOrThrow({ where: { id: row.id } });
+    assert.equal(discord.unbans, 1);
+    assert.equal(expiry.expiryStatus, 'succeeded');
+    const decision = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId, targetId } } });
+    assert.equal(decision.generation, 2);
+    assert.equal(decision.appliedGeneration, 1);
+  } finally {
+    await prisma.moderationCase.deleteMany({ where: { operationId: { in: [operationId, failedOperationId] } } });
+    await prisma.guildTargetDecision.deleteMany({ where: { guildId, targetId } });
+  }
+});
+
+test('production BAN success advances applied generation atomically with the dossier', { skip: !integration }, async () => {
+  const operationId = `test-${randomUUID()}`;
+  const row = await prisma.moderationCase.create({ data: {
+    guildId, actorId, targetId, action: 'BAN', reason: 'applied generation integration', status: 'requested', operationId, banGeneration: 1,
+  } });
+  await prisma.guildTargetDecision.create({ data: { guildId, targetId, generation: 1, latestOperationId: operationId, appliedGeneration: 0 } });
+  let bans = 0;
+  const discord = controlledGuild({ ban: async () => { bans++; } });
+  try {
+    await executeModerationAction({ operationId, guild: discord.guild, caseRecord: row, store: prisma });
+    const [finalCase, decision] = await Promise.all([
+      prisma.moderationCase.findUniqueOrThrow({ where: { id: row.id } }),
+      prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId, targetId } } }),
+    ]);
+    assert.equal(bans, 1);
+    assert.equal(finalCase.status, 'succeeded');
+    assert.equal(decision.appliedGeneration, 1);
+    assert.equal(decision.appliedOperationId, operationId);
+  } finally {
+    await prisma.moderationCase.delete({ where: { id: row.id } });
+    await prisma.guildTargetDecision.deleteMany({ where: { guildId, targetId } });
+  }
 });

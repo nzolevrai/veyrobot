@@ -70,7 +70,7 @@ export async function proxyRequest(request: Request, path: string[], search = ''
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(new Error('Upstream timeout')), timeoutMs);
   const signal = AbortSignal.any([request.signal, timeout.signal]);
-  const headers = withoutHopHeaders(request.headers, ['host', 'content-length']);
+  const headers = withoutHopHeaders(request.headers, ['host', 'content-length', 'forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip']);
   const requestId = crypto.randomUUID();
   const upstreamStarted = performance.now();
   try {

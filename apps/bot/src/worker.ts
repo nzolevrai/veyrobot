@@ -6,10 +6,10 @@ type Services = typeof import('@veyrobot/moderation');
 export type WorkerAttempt = { operationId: string; guildId: string; kind: 'action' | 'expiry'; createdAt: Date; scheduledAt?: Date };
 export type WorkerTelemetry = { onAttemptStarted?: (attempt: WorkerAttempt) => void; onAttemptFinished?: (guildId: string, operationId: string) => void; onGuildBusySkip?: (guildId: string, operationId: string) => void };
 
-export function createModerationWorker(client: Client, connection: ConnectionOptions, prisma: Store, moderation: Services, rejectPendingAfterDisable: typeof import('@veyrobot/db').rejectPendingAfterDisable, onDrained: () => void, telemetry?: WorkerTelemetry): Worker {
+export function createModerationWorker(client: Client, connection: ConnectionOptions, prisma: Store, moderation: Services, rejectPendingAfterDisable: typeof import('@veyrobot/db').rejectPendingAfterDisable, onDrained: () => void, telemetry?: WorkerTelemetry, queueName = 'veyrobot-moderation'): Worker {
   const { executeModerationAction, expireTemporaryBan } = moderation;
 const activeGuilds = new Set<string>();
-  return new Worker('veyrobot-moderation', async job => {
+  return new Worker(queueName, async job => {
   if (!client.isReady()) return; // PostgreSQL keeps the request pending for the next Ready/reconciliation.
   const guildId = String((job.data as { guildId: string }).guildId);
   // A busy guild cannot occupy every worker slot. Skipped jobs remain requested

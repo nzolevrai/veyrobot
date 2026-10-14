@@ -16,6 +16,14 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -32,6 +40,10 @@ jobs:
       - run: pnpm db:migrate
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
+      - run: pnpm exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+        working-directory: packages/db
+        env:
+          DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
       - run: pnpm typecheck
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
@@ -45,4 +57,6 @@ jobs:
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
           RUN_POSTGRES_INTEGRATION: '1'
+          RUN_REDIS_INTEGRATION: '1'
+          REDIS_URL: redis://127.0.0.1:6379
           RUN_DASHBOARD_ROUTE_INTEGRATION: '1'

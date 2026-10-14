@@ -1,4 +1,4 @@
-import type { FastifyRequest } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { GuildListCache } from './guild-list-cache.js';
 
 export type DiscordUser = { id: string; username: string; avatar: string | null };
@@ -15,6 +15,7 @@ export type ApiContext = {
   prisma: Db['prisma'];
   guildListCache: GuildListCache<DiscordGuild[]>;
   sessionHash: (id: string) => string;
+  sendError: (request: FastifyRequest, reply: FastifyReply, error: unknown) => FastifyReply;
   session: (req: FastifyRequest) => Session | null;
   getCachedGuilds: (session: Session) => Promise<DiscordGuild[]>;
   authorizeGuild: (req: FastifyRequest, guildId: string, fresh?: boolean) => Promise<{ session: Session; guild: DiscordGuild }>;

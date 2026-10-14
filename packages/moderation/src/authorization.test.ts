@@ -77,6 +77,12 @@ test('permission and hierarchy checks reject revoked permissions, equal roles, a
   assert.equal(canActOnTarget({ actorIsOwner: false, actorAboveTarget: false, botAboveTarget: true, targetIsOwner: false }), false);
   assert.equal(canActOnTarget({ actorIsOwner: true, actorAboveTarget: false, botAboveTarget: true, targetIsOwner: false }), true);
   assert.equal(canActOnTarget({ actorIsOwner: true, actorAboveTarget: true, botAboveTarget: true, targetIsOwner: true }), false);
+  assert.equal(hasModerationPermission('KICK', PermissionFlagsBits.Administrator), true);
+  assert.equal(hasModerationPermission('BAN', PermissionFlagsBits.Administrator), true);
+  assert.equal(hasModerationPermission('TIMEOUT', PermissionFlagsBits.Administrator), true);
+  assert.equal(hasModerationPermission('KICK', PermissionFlagsBits.KickMembers), true);
+  assert.equal(hasModerationPermission('KICK', PermissionFlagsBits.BanMembers), false);
+  assert.equal(canActOnTarget({ actorIsOwner: false, actorAboveTarget: true, botAboveTarget: false, targetIsOwner: false }), false);
 });
 
 test('a duplicate queue delivery cannot claim or execute a case twice', async () => {
@@ -98,14 +104,15 @@ test('a freshly revoked moderator permission records a failure before reaching t
   assert.match(String(final?.result), /permission Discord a été retirée/);
 });
 
-test('network failures are recorded as uncertain and are never reported as success', async () => {
+test('pre-mutation network failures are recorded as failed rather than uncertain', async () => {
   const store = fakeCaseStore();
   const actor = { id: '123456789012345679', permissions: { bitfield: PermissionFlagsBits.BanMembers } };
   const bot = { id: '123456789012345681', permissions: { bitfield: PermissionFlagsBits.BanMembers } };
   const guild = { ownerId: '123456789012345682', members: { fetch: async ({ user }: { user: string }) => { if (user === actor.id) return actor; throw new Error('ECONNRESET'); }, fetchMe: async () => bot } } as unknown as Guild;
   const row = { id: 'case-2', guildId: '123456789012345678', actorId: actor.id, targetId: '123456789012345680', action: 'BAN', reason: 'raison', status: 'requested', createdAt: new Date() } as ModerationCase;
   await executeModerationAction({ operationId: 'operation-id-0002', guild, caseRecord: row, store });
-  assert.equal(store.updates.at(-1)?.data.status, 'uncertain');
+  assert.equal(store.updates.at(-1)?.data.status, 'failed');
+  assert.equal(store.updates.at(-1)?.data.executionPhase, undefined);
 });
 
 test('an ambiguous ban response is stored uncertain and a redelivery cannot issue another ban', async () => {
@@ -168,6 +175,39 @@ test('temporary ban expiry is superseded by a newer in-app ban decision', async 
   await expireTemporaryBan({ guild, caseRecord: row, store });
   assert.equal(unbans, 0);
   assert.equal(store.updates.at(-1)?.data.expiryStatus, 'superseded');
+});
+
+test('a failed newer ban request does not cancel the prior temporary-ban expiry', async () => {
+  const base = fakeCaseStore('succeeded', 'scheduled');
+  const store = {
+    ...base,
+    guildTargetDecision: { findUnique: async () => ({ generation: 2, appliedGeneration: 1 }) },
+    moderationCase: { ...base.moderationCase, findMany: async () => [{ status: 'failed' }] },
+  };
+  let unbans = 0;
+  const marker = 'veyro-case-original-tempban';
+  const guild = { members: { fetchMe: async () => ({ permissions: { has: () => true } }), unban: async () => { unbans++; } }, bans: { fetch: async () => ({ reason: `[${marker}]` }) } } as unknown as Guild;
+  const row = { id: 'tempban-original', operationId: 'operation-original-0001', guildId: '123456789012345678', targetId: '123456789012345680', action: 'TEMPBAN', status: 'succeeded', expiresAt: new Date(Date.now() - 1), banMarker: marker, banGeneration: 1, expiryStatus: 'scheduled' } as ModerationCase;
+  await expireTemporaryBan({ guild, caseRecord: row, store });
+  assert.equal(unbans, 1);
+  assert.equal(base.updates.at(-1)?.data.expiryStatus, 'succeeded');
+});
+
+test('a newer active decision defers the expiry without calling Discord', async () => {
+  const base = fakeCaseStore('succeeded', 'scheduled');
+  const store = {
+    ...base,
+    guildTargetDecision: { findUnique: async () => ({ generation: 2, appliedGeneration: 1 }) },
+    moderationCase: { ...base.moderationCase, findMany: async () => [{ status: 'requested' }] },
+  };
+  let unbans = 0;
+  const marker = 'veyro-case-original-tempban';
+  const guild = { members: { fetchMe: async () => ({ permissions: { has: () => true } }), unban: async () => { unbans++; } }, bans: { fetch: async () => ({ reason: `[${marker}]` }) } } as unknown as Guild;
+  const row = { id: 'tempban-deferred', guildId: '123456789012345678', targetId: '123456789012345680', action: 'TEMPBAN', status: 'succeeded', expiresAt: new Date(Date.now() - 1), banMarker: marker, banGeneration: 1, expiryStatus: 'scheduled' } as ModerationCase;
+  await expireTemporaryBan({ guild, caseRecord: row, store });
+  assert.equal(unbans, 0);
+  assert.equal(base.updates.at(-1)?.data.expiryStatus, 'scheduled');
+  assert.equal(base.updates.at(-1)?.data.expiryClaimToken, null);
 });
 
 test('a ban decision recorded between marker read and unban request cancels the old expiry', async () => {

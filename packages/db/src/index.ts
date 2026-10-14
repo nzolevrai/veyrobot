@@ -45,7 +45,7 @@ export * from './restore-quarantine.js';
 export async function createWarningCase(input: WarningCaseInput) {
   return prisma.$transaction(async tx => {
     const config = await tx.guildConfig.findUnique({ where: { guildId: input.guildId }, select: { warningsEnabled: true } });
-    if (!config?.warningsEnabled) throw new Error('Le module Avertissements est désactivé sur ce serveur.');
+    if (!config?.warningsEnabled) throw Object.assign(new Error('Le module Avertissements est désactivé sur ce serveur.'), { statusCode: 400, code: 'MODULE_DISABLED' });
     return persistWarningCase({ create: ({ data }) => tx.moderationCase.create({ data }) }, input);
   }, { isolationLevel: 'Serializable' });
 }

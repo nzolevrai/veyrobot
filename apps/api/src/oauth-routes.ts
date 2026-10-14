@@ -9,14 +9,14 @@ export function oauthRoutes(ctx: ApiContext): FastifyPluginAsync {
   return async app => {
 app.get('/oauth/discord/start', async (_req, reply) => {
   const state = crypto.randomUUID();
-  const s = { csrf: state } as Session;
+  const s = { csrf: state };
   (_req.session as { set(key: string, value: unknown): void }).set('auth', s);
   const params = new URLSearchParams({ client_id: env.DISCORD_CLIENT_ID, response_type: 'code', redirect_uri: `${env.API_PUBLIC_URL}/oauth/discord/callback`, scope: 'identify guilds', state });
   return reply.redirect(`https://discord.com/oauth2/authorize?${params}`);
 });
 app.get('/oauth/discord/callback', async (req, reply) => {
   const query = z.object({ code: z.string().min(1), state: z.string().min(1) }).safeParse(req.query);
-  const initial = session(req);
+  const initial = (req.session as { get(key: string): unknown }).get('auth') as { csrf?: string } | null;
   if (!query.success || !initial?.csrf || query.data.state !== initial.csrf) return reply.code(400).send({ error: 'État OAuth invalide ou expiré.' });
   let tokenResponse: Response;
   try { tokenResponse = await fetch(`${api}/oauth2/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: env.DISCORD_CLIENT_ID, client_secret: env.DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code: query.data.code, redirect_uri: `${env.API_PUBLIC_URL}/oauth/discord/callback` }), signal: AbortSignal.timeout(8_000) }); }

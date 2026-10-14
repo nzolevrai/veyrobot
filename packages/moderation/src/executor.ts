@@ -1,5 +1,6 @@
 import { DiscordAPIError, PermissionFlagsBits, Routes, type Guild, type GuildMember } from 'discord.js';
 import type { ModerationCase } from '@veyrobot/db';
+import { hasPermissionBits } from '@veyrobot/contracts';
 import { ACTIONS, canActOnTarget, ModerationRuleError, type ModerationAction } from './service.js';
 
 const requiredPermission: Record<ModerationAction, bigint> = {
@@ -15,7 +16,7 @@ const requiredPermission: Record<ModerationAction, bigint> = {
   UNLOCK_CHANNEL: PermissionFlagsBits.ManageRoles,
 };
 export function hasModerationPermission(action: ModerationAction, permissions: bigint, isGuildOwner = false): boolean {
-  return isGuildOwner || (permissions & requiredPermission[action]) === requiredPermission[action];
+  return isGuildOwner || hasPermissionBits(permissions, requiredPermission[action]);
 }
 
 function assertRoleAbove(actor: GuildMember, bot: GuildMember, target: GuildMember, guild: Guild): void {
@@ -89,9 +90,21 @@ async function executeChannelAction(input: { action: ModerationAction; guild: Gu
   return 'Permission SendMessages restaurée à sa valeur antérieure; les autres permissions du salon n’ont pas été touchées.';
 }
 
+type ExecutionStore = LockStore & {
+  moderationCase: {
+    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
+    findMany?(args: { where: Record<string, unknown>; select: Record<string, boolean> }): Promise<unknown[]>;
+  };
+  guildTargetDecision?: {
+    findUnique(args: { where: { guildId_targetId: { guildId: string; targetId: string } } }): Promise<{ generation: number; appliedGeneration?: number } | null>;
+    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
+  };
+  $transaction?: (fn: (tx: ExecutionStore) => Promise<void>) => Promise<void>;
+};
+
 export async function executeModerationAction(input: {
   operationId: string; guild: Guild; caseRecord: ModerationCase;
-  store: { moderationCase: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }> }; guildTargetDecision?: { findUnique(args: { where: { guildId_targetId: { guildId: string; targetId: string } } }): Promise<{ generation: number } | null> } } & LockStore;
+  store: ExecutionStore;
 }): Promise<void> {
   const { caseRecord, guild, store } = input;
   const claimToken = crypto.randomUUID();
@@ -112,14 +125,16 @@ export async function executeModerationAction(input: {
     if (leaseLost) throw new ModerationRuleError('Le bail d’exécution a été perdu avant l’appel Discord.');
     const edge = await store.moderationCase.updateMany({ where: { id: caseRecord.id, status: 'running', claimToken, claimLeaseUntil: { gt: new Date() } }, data: { executionPhase: 'discord_request_inflight' } });
     if (edge.count !== 1) { leaseLost = true; throw new ModerationRuleError('Le bail d’exécution n’appartient plus à ce worker.'); }
+    mutationMayHaveStarted = true;
   };
   let finalStatus: string | null = null;
   let finalResult = '';
   let finalExpiryData: Record<string, unknown> = {};
+  let mutationMayHaveStarted = false;
   try {
     const action = caseRecord.action as ModerationAction;
     if (!ACTIONS.includes(action)) throw new ModerationRuleError('Action enregistrée inconnue.');
-    const [actor, bot] = await Promise.all([guild.members.fetch({ user: caseRecord.actorId, force: true }), guild.members.fetchMe()]);
+    const [actor, bot] = await Promise.all([guild.members.fetch({ user: caseRecord.actorId, force: true, cache: false }), guild.members.fetchMe()]);
     if (!isChannelAction(action) && !hasModerationPermission(action, actor.permissions.bitfield, actor.id === guild.ownerId)) throw new ModerationRuleError('Votre permission Discord a été retirée ou ne permet pas cette action.');
     if (!isChannelAction(action) && !hasModerationPermission(action, bot.permissions.bitfield)) throw new ModerationRuleError('Le bot ne possède pas la permission Discord requise.');
     const assertCurrentDecision = async () => {
@@ -134,7 +149,7 @@ export async function executeModerationAction(input: {
     if (isChannelAction(action)) {
       finalResult = await executeChannelAction({ action, guild, actor, bot, caseRecord, store, beforeDiscordMutation });
     } else if (action === 'UNBAN') {
-      try { await guild.bans.fetch(caseRecord.targetId); } catch (error) {
+      try { await guild.bans.fetch({ user: caseRecord.targetId, force: true, cache: false }); } catch (error) {
         if (error instanceof DiscordAPIError && error.status === 404) finalResult = 'Aucun ban n’existe dans Discord; l’état demandé est déjà atteint.';
         else throw error;
       }
@@ -145,7 +160,7 @@ export async function executeModerationAction(input: {
       }
     } else {
       let target: GuildMember | null = null;
-      try { target = await guild.members.fetch({ user: caseRecord.targetId, force: true }); } catch (error) {
+      try { target = await guild.members.fetch({ user: caseRecord.targetId, force: true, cache: false }); } catch (error) {
         if (action !== 'BAN' || !(error instanceof DiscordAPIError) || error.status !== 404) throw error;
         try { await guild.bans.fetch({ user: caseRecord.targetId, force: true, cache: false }); }
         catch (banError) {
@@ -172,7 +187,7 @@ export async function executeModerationAction(input: {
     finalStatus = 'succeeded'; finalResult ||= 'Action confirmée par Discord.';
     finalExpiryData = action === 'TEMPBAN' ? { expiresAt: new Date(completedAt.getTime() + caseRecord.durationMinutes! * 60_000), expiryStatus: 'scheduled' } : {};
   } catch (error) {
-    const certain = error instanceof ModerationRuleError || (error instanceof DiscordAPIError && error.status >= 400 && error.status < 500);
+    const certain = error instanceof ModerationRuleError || (error instanceof DiscordAPIError && error.status >= 400 && error.status < 500) || !mutationMayHaveStarted;
     const status = certain ? 'failed' : 'uncertain';
     const message = error instanceof Error ? error.message : 'Résultat Discord indéterminé.';
     finalStatus = status; finalResult = message.slice(0, 500);
@@ -182,14 +197,27 @@ export async function executeModerationAction(input: {
     await heartbeat;
   }
   if (!finalStatus || leaseLost) return;
-  await store.moderationCase.updateMany({ where: { id: caseRecord.id, status: 'running', claimToken, claimLeaseUntil: { gt: new Date() } }, data: { status: finalStatus, completedAt: new Date(), result: finalResult, ...finalExpiryData } });
+  const where = { id: caseRecord.id, status: 'running', claimToken, claimLeaseUntil: { gt: new Date() } };
+  const data = { status: finalStatus, completedAt: new Date(), result: finalResult, ...finalExpiryData };
+  const banAction = caseRecord.action === 'BAN' || caseRecord.action === 'TEMPBAN' || caseRecord.action === 'UNBAN';
+  if (banAction && finalStatus === 'succeeded' && caseRecord.banGeneration != null && store.$transaction && store.guildTargetDecision) {
+    await store.$transaction(async tx => {
+      const completed = await tx.moderationCase.updateMany({ where, data });
+      if (completed.count !== 1) throw new Error('Moderation claim expired before durable completion.');
+      const applied = await tx.guildTargetDecision!.updateMany({
+        where: { guildId: caseRecord.guildId, targetId: caseRecord.targetId, generation: caseRecord.banGeneration },
+        data: { appliedGeneration: caseRecord.banGeneration, appliedOperationId: caseRecord.operationId },
+      });
+      if (applied.count !== 1) throw new Error('Ban decision generation changed before durable completion.');
+    });
+  } else await store.moderationCase.updateMany({ where, data });
 }
 
 function actionFor(record: ModerationCase): ModerationAction { return record.action as ModerationAction; }
 
 export async function expireTemporaryBan(input: {
   guild: Guild; caseRecord: ModerationCase;
-  store: { moderationCase: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }> }; guildTargetDecision?: { findUnique(args: { where: { guildId_targetId: { guildId: string; targetId: string } } }): Promise<{ generation: number } | null> } };
+  store: ExecutionStore;
 }): Promise<void> {
   const { guild, caseRecord, store } = input;
   if (caseRecord.action !== 'TEMPBAN' || !caseRecord.expiresAt || caseRecord.expiresAt > new Date() || !caseRecord.banMarker) return;
@@ -214,15 +242,29 @@ export async function expireTemporaryBan(input: {
     const me = await guild.members.fetchMe();
     if (!me.permissions.has(PermissionFlagsBits.BanMembers)) throw new ModerationRuleError('Le bot ne possède plus la permission Bannir des membres.');
     let ban;
-    try { ban = await guild.bans.fetch(caseRecord.targetId); } catch (error) {
+    try { ban = await guild.bans.fetch({ user: caseRecord.targetId, force: true, cache: false }); } catch (error) {
       if (error instanceof DiscordAPIError && error.status === 404) {
         throw new ExpiryTerminal('superseded', 'Le ban a déjà été retiré manuellement; aucune requête de débannissement n’a été envoyée.');
       }
       throw error;
     }
     const decision = await store.guildTargetDecision?.findUnique({ where: { guildId_targetId: { guildId: caseRecord.guildId, targetId: caseRecord.targetId } } });
-    if (decision && caseRecord.banGeneration !== decision.generation) {
+    if (decision && (decision.appliedGeneration ?? decision.generation) > (caseRecord.banGeneration ?? 0)) {
       throw new ExpiryTerminal('superseded', 'Une décision de ban/déban plus récente a été enregistrée dans l’application; cette échéance est annulée.');
+    }
+    if (decision && decision.generation > (caseRecord.banGeneration ?? 0)) {
+      const later = await store.moderationCase.findMany?.({
+        where: { guildId: caseRecord.guildId, targetId: caseRecord.targetId, banGeneration: { gt: caseRecord.banGeneration ?? 0 }, action: { in: ['BAN', 'TEMPBAN', 'UNBAN'] } },
+        select: { status: true },
+      }) as Array<{ status: string }> | undefined;
+      if (later?.some(row => row.status === 'uncertain')) throw new ExpiryTerminal('uncertain', 'Une décision plus récente a un résultat incertain; cette échéance requiert une réconciliation humaine.');
+      if (later?.some(row => row.status === 'requested' || row.status === 'running')) {
+        await store.moderationCase.updateMany({
+          where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } },
+          data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Une décision plus récente est en cours; échéance réévaluée après sa conclusion.' },
+        });
+        return;
+      }
     }
     if (!ban.reason?.includes(`[${caseRecord.banMarker}]`)) {
       throw new ExpiryTerminal('uncertain', 'La raison du ban Discord ne correspond plus au marqueur initial. Aucun débannissement automatique n’a été effectué.');
@@ -232,7 +274,22 @@ export async function expireTemporaryBan(input: {
     const edge = await store.moderationCase.updateMany({ where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } }, data: { expiryResult: 'discord_request_inflight' } });
     if (edge.count !== 1) { leaseLost = true; throw new ExpiryTerminal('uncertain', 'Le bail d’expiration n’appartient plus à cet exécuteur.'); }
     const latestDecision = await store.guildTargetDecision?.findUnique({ where: { guildId_targetId: { guildId: caseRecord.guildId, targetId: caseRecord.targetId } } });
-    if (latestDecision && caseRecord.banGeneration !== latestDecision.generation) throw new ExpiryTerminal('superseded', 'Une décision plus récente a été enregistrée avant l’appel de débannissement; aucun appel n’a été envoyé.');
+    if (latestDecision && (latestDecision.appliedGeneration ?? latestDecision.generation) > (caseRecord.banGeneration ?? 0)) throw new ExpiryTerminal('superseded', 'Une décision plus récente a été appliquée avant l’appel de débannissement; aucun appel n’a été envoyé.');
+    if (latestDecision && latestDecision.generation > (caseRecord.banGeneration ?? 0)) {
+      const latest = await store.moderationCase.findMany?.({
+        where: { guildId: caseRecord.guildId, targetId: caseRecord.targetId, banGeneration: { gt: caseRecord.banGeneration ?? 0 }, action: { in: ['BAN', 'TEMPBAN', 'UNBAN'] } },
+        select: { status: true },
+      }) as Array<{ status: string }> | undefined;
+      if (latest?.some(row => row.status === 'uncertain')) throw new ExpiryTerminal('uncertain', 'Une nouvelle décision a un résultat incertain pendant la fenêtre de déban; examen humain requis.');
+      if (latest?.some(row => row.status === 'requested' || row.status === 'running')) {
+        await store.moderationCase.updateMany({
+          where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } },
+          data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Une décision plus récente est arrivée avant le déban; échéance réévaluée après sa conclusion.' },
+        });
+        return;
+      }
+      if (latest?.some(row => row.status === 'succeeded')) throw new ExpiryTerminal('uncertain', 'Une nouvelle décision réussie ne correspond pas à la génération appliquée; réconciliation humaine requise.');
+    }
     // Discord ne fournit pas de comparaison-et-suppression conditionnelle du motif du ban.
     await guild.members.unban(caseRecord.targetId, `Expiration automatique du dossier ${caseRecord.id}`);
     finalExpiryStatus = 'succeeded'; unbannedAt = new Date(); finalExpiryResult = 'Débannissement confirmé par Discord.';
