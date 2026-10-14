@@ -96,3 +96,27 @@ test('a local HTTP upstream that never answers is aborted at the configured dead
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('a slow request body is canceled before any upstream request starts', async () => {
+  const old = process.env.API_PROXY_BODY_TIMEOUT_MS;
+  process.env.API_PROXY_BODY_TIMEOUT_MS = '100';
+  let cancelled = false;
+  let sent = false;
+  let delayedChunk: ReturnType<typeof setTimeout>;
+  const request = new Request('http://localhost/api/test', {
+    method: 'POST', duplex: 'half',
+    body: new ReadableStream({
+      start(controller) { delayedChunk = setTimeout(() => controller.enqueue(Buffer.from('late')), 500); },
+      cancel() { cancelled = true; clearTimeout(delayedChunk); },
+    }),
+  } as RequestInit);
+  try {
+    const response = await proxyRequest(request, ['test'], '', async () => { sent = true; return new Response('unexpected'); });
+    assert.equal(response.status, 408);
+    assert.equal(sent, false);
+    assert.equal(cancelled, true);
+  } finally {
+    if (old === undefined) delete process.env.API_PROXY_BODY_TIMEOUT_MS;
+    else process.env.API_PROXY_BODY_TIMEOUT_MS = old;
+  }
+});

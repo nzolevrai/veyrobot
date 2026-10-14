@@ -14,18 +14,18 @@ function failure(status: number, code: string, message: string): Response {
 
 class BodyTooLarge extends Error {}
 
-async function boundedBody(request: Request): Promise<Uint8Array | undefined> {
+async function boundedBody(request: Request, signal: AbortSignal): Promise<Uint8Array | undefined> {
   if (!request.body) return undefined;
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
-  const cancel = () => { void reader.cancel(request.signal.reason).catch(() => undefined); };
-  request.signal.addEventListener('abort', cancel, { once: true });
+  const cancel = () => { void reader.cancel(signal.reason).catch(() => undefined); };
+  signal.addEventListener('abort', cancel, { once: true });
   try {
-    if (request.signal.aborted) throw request.signal.reason ?? new Error('Client disconnected');
+    if (signal.aborted) throw signal.reason ?? new Error('Request interrupted');
     while (true) {
       const { done, value } = await reader.read();
-      if (request.signal.aborted) throw request.signal.reason ?? new Error('Client disconnected');
+      if (signal.aborted) throw signal.reason ?? new Error('Request interrupted');
       if (done) break;
       size += value.byteLength;
       if (size > MAX_BODY_BYTES) {
@@ -39,7 +39,7 @@ async function boundedBody(request: Request): Promise<Uint8Array | undefined> {
     for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
     return body;
   } finally {
-    request.signal.removeEventListener('abort', cancel);
+    signal.removeEventListener('abort', cancel);
     reader.releaseLock();
   }
 }
@@ -50,13 +50,20 @@ export async function proxyRequest(request: Request, path: string[], search = ''
   const declared = request.headers.get('content-length');
   if (declared !== null && /^\d+$/.test(declared) && Number(declared) > MAX_BODY_BYTES) return failure(413, 'BODY_TOO_LARGE', 'Requête trop volumineuse.');
   let body: Uint8Array | undefined;
+  const configuredReadTimeout = Number(process.env.API_PROXY_BODY_TIMEOUT_MS ?? 15_000);
+  const bodyTimeoutMs = Number.isInteger(configuredReadTimeout) && configuredReadTimeout >= 100 && configuredReadTimeout <= 120_000 ? configuredReadTimeout : 15_000;
+  const bodyTimeout = new AbortController();
+  const bodyTimer = setTimeout(() => bodyTimeout.abort(new Error('Request body read timeout')), bodyTimeoutMs);
   try {
-    if (request.method !== 'GET' && request.method !== 'HEAD') body = await boundedBody(request);
+    if (request.method !== 'GET' && request.method !== 'HEAD') body = await boundedBody(request, AbortSignal.any([request.signal, bodyTimeout.signal]));
   } catch (error) {
+    clearTimeout(bodyTimer);
     if (error instanceof BodyTooLarge) return failure(413, 'BODY_TOO_LARGE', 'Requête trop volumineuse.');
     if (request.signal.aborted) return failure(499, 'CLIENT_ABORTED', 'Requête annulée.');
+    if (bodyTimeout.signal.aborted) return failure(408, 'BODY_READ_TIMEOUT', 'Délai de lecture du corps dépassé.');
     return failure(400, 'BODY_READ_FAILED', 'Lecture de la requête impossible.');
   }
+  clearTimeout(bodyTimer);
   if (request.signal.aborted) return failure(499, 'CLIENT_ABORTED', 'Requête annulée.');
   const configuredTimeout = Number(process.env.API_PROXY_TIMEOUT_MS ?? 10_000);
   const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout >= 100 && configuredTimeout <= 60_000 ? configuredTimeout : 10_000;

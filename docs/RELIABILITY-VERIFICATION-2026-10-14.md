@@ -33,3 +33,38 @@ Vérifications finales : `corepack pnpm typecheck`, `corepack pnpm lint` (fronti
 3. Profiler le verrou global d'admission et l'attente du pool sous des rafales répétées, avec essais avant/après suffisants. Les plafonds restent en place.
 4. Implémenter et tester les tombstones transactionnels avant toute suppression des dossiers d'action ; leur politique cible est dans `OPERATIONS.md`.
 5. Rendre vérifiable la reprise après restauration ancienne par un essai de réconciliation contrôlée avant d'autoriser les mutations.
+
+## Campagne de reprise ciblée — 14 octobre 2026
+
+Les essais utilisent le vrai `createDispatcher`, `createModerationWorker`, `executeModerationAction` et `expireTemporaryBan`, avec PostgreSQL 17, Redis 7 DB 9 isolée et un adaptateur Discord local contrôlé. Aucun token, Gateway ou appel Discord réel. Machine : Windows 10.0.26300, Node 24.21.0, i5-1135G7, 8 CPU logiques. RSS/CPU comprennent le générateur de charge dans le même processus.
+
+- Campagne de 30 min, drainage puis 5 min au repos : 100 guildes calmes, 2 offres/s en normal; phase dominante à 8/s, 80 % sur une guilde; rafales à 20/s pendant 10 s/min; 6 échéances dues/min; latence Discord simulée 150 ms; concurrence worker 4; une action par guilde; admission 5 000 global/100 par guilde; pool 10. Résultat : 9 300 offres, 8 516 acceptées et réussies, 784 refus explicites, 179/179 échéances réussies, 0 erreur d'admission, échec ou incertitude. Profondeur active max 108, âge max 23,63 s dans la phase dominante. P95 de début dominant 23,315 s, dont sérialisation par guilde 23,302 s; délai dispatcher 175 ms; attente worker après mise en file 11 ms. P95 échéance environ 2,0 s depuis l'heure due; plus vieux retard échantillonné 1,263 s. Aucun backlog restant après drainage. RSS de pointe 249,8 Mo; snapshots des dernières minutes au repos entre 112 et 119 Mo après GC. Le heap a oscillé avec GC. Cela explique les 14,48 s du banc précédent par l'action sérialisée derrière les demandes de la même guilde et bornée à 100, pas par le dispatcher. Aucun changement des plafonds ou de l'ordre n'est justifié.
+- Surcharge courte avec le worker réel : 120 s, phase dominante à 30 offres/s, REST simulé 100 ms. 1 535 offertes, 1 085 acceptées/réussies, 450 refusées, 11 échéances réussies; 0 erreur, 0 `uncertain`. P95 dominant : attente de sérialisation 13,459 s, dispatcher 6 ms, attente worker après publication 12 ms, total 13,472 s. Profondeur max 102, âge max 13,625 s, drainage 11,798 s. C'est une comparaison indicative, pas une reproduction à profil identique des 14,48 s du banc simplifié.
+- Admission sur PostgreSQL réel : 12 demandes concurrentes sur 0, 1 000, 4 000 et 5 000 lignes actives. Coût maximal des deux comptages par admission : 17,4; 4,3; 5,7; 5,5 ms. Au plafond 5 000, les 12 admissions ont été refusées. Le verrou atomique reste nécessaire. `pg.Pool.connect()` a été mesuré directement : avec les 10 clients retenus et libération après 150 ms, attente observée 162 ms. Campagne longue : pool 10, attente `connect()` max 685 ms, deux demandeurs max; coût maximal comptage 112 ms, appel d'acquisition du verrou 1,85 s et durée sous verrou avant retour callback 254 ms. Ces maxima sous rafales ne sont pas un p95 de production; instrumenter et surveiller avant de relever les plafonds. Le palier mono-API conserve ce verrou.
+- Sauvegarde ancienne : `node apps/bot/tools/restore-quarantine-proof.mjs` a sauvegardé des états `requested`, `running` et échéance due; la source a été avancée après sauvegarde par mutations simulées; après restauration, la quarantaine les a marqués `uncertain`, et le dispatcher de production a publié 0 job. Aucun bot n'a démarré.
+- La purge des dossiers d'action reste désactivée. Les `operationId` et preuves d'idempotence sont conservés; suivre la taille de `ModerationCase`. Les tombstones transactionnels restent une tâche distincte.
+- Le proxy Next applique `API_PROXY_BODY_TIMEOUT_MS=15000` (100 ms–120 s) avant le timeout amont. L'intégration Next a validé une requête chunked lente : 408 sans appel API; les corps sans longueur, dépassements, annulation, OAuth, cookies et déconnexion restent testés.
+
+Les mesures simulées ne prouvent pas une capacité en nombre de guildes Discord. Reste bloquant pour mise en production : contrôle navigateur visuel, parcours Discord autorisés et vérification CI GitHub sur la tête finale. Le sharding et la coordination REST multi-processus sont des évolutions futures; le verrou mono-processus reste actif.
+
+### État final des points de contrôle
+
+La campagne de 30 minutes avec worker réel, les mesures d'admission/pool et l'essai de restauration ancienne couvrent maintenant les points 2, 3 et 5 ci-dessus. La contention globale et la sérialisation par guilde sont quantifiées; les plafonds restent conservés. Les points non terminés pour la mise en production sont la validation visuelle navigateur, les parcours Discord autorisés sans mutation destructive et les checks GitHub sur le commit final. La conservation des dossiers reste sans purge; le travail tombstones reste ouvert et ne bloque pas les correctifs sûrs de cette PR.
+
+### Reproduction depuis la racine (PowerShell)
+
+Préparer les bases de test avec les migrations; remplacer l'URL fictive par l'URL de la base locale isolée, sans la committer :
+
+```powershell
+docker compose up -d postgres redis
+$env:DATABASE_URL = 'postgresql://<user>:<password>@127.0.0.1:5432/veyrobot_arch_bench?schema=public'
+$env:REDIS_URL = 'redis://127.0.0.1:6379/9'
+corepack pnpm db:generate
+corepack pnpm db:migrate
+corepack pnpm --filter @veyrobot/bot build
+node apps/bot/tools/bench-production.mjs
+```
+
+La campagne utilise `BENCH_SECONDS=1800`, `BENCH_PHASE_SECONDS=300`, `BENCH_IDLE_SECONDS=300`, `BENCH_QUIET_GUILDS=100`, `BENCH_NORMAL_RPS=2`, `BENCH_DOMINANT_RPS=8`, `BENCH_BURST_RPS=20`, `BENCH_BURST_SECONDS=10`, `BENCH_EXPIRIES_PER_MINUTE=6`, `BENCH_DISCORD_DELAY_MS=150`, `BENCH_SAMPLE_SECONDS=10`, les plafonds 5 000/100 et pool 10. Ces variables sont surchargeables; le banc refuse une durée sous 1 800 s sauf `BENCH_ALLOW_SHORT=1` pour un smoke test.
+
+Mesurer le coût admission/pool séparément avec `node apps/bot/tools/bench-admission.mjs`; `ADMISSION_SIZES` et `ADMISSION_ROUNDS` configurent les tailles et échantillons. L'essai de restauration ancienne reproductible est `node apps/bot/tools/restore-quarantine-proof.mjs`; il exige Docker Compose et ne démarre aucun bot. Les cibles temporaires sont supprimées par le banc après vérification.

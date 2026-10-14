@@ -30,7 +30,7 @@ const releaseBotLease = await acquireSingleBotLease(env.DATABASE_URL, () => {
   console.error('Verrou de processus bot perdu : arrêt pour éviter deux exécuteurs actifs.');
   process.exit(1);
 });
-const [{ rejectPendingAfterDisable, prisma }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
+const [{ rejectPendingAfterDisable, prisma, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
 const { markInterruptedOperationsUncertain, redisConnection } = moderation;
 // Uncertain network/5xx responses must reach our durable state machine; avoid
 // the REST layer automatically repeating non-idempotent moderation requests.
@@ -106,7 +106,7 @@ client.once(Events.ClientReady, async ready => {
     const memory = process.memoryUsage();
     const elu = performance.eventLoopUtilization(previousElu);
     previousElu = performance.eventLoopUtilization();
-    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, sql: connections[0],
+    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
       errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
       eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, (_key, value) => typeof value === 'bigint' ? Number(value) : value));
     loopDelay.reset();

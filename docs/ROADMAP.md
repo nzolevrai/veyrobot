@@ -61,7 +61,13 @@ La prochaine vérification en direct doit activer Avertissements sur sa page dé
 
 Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime sont livrés sur la branche d'architecture. Les validations locales, les coupures isolées Redis/PostgreSQL et les performances avec leurs incertitudes figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les prochaines priorités sont des pannes pendant l'exécution Discord et charge prolongée, des métriques corrélées, un essai de restauration, la politique de croissance des dossiers d'action et la validation navigateur/Discord réel sans sanction. Aucun déploiement multi-processus n'est autorisé par le code actuel.
 
-Suite sur la même branche : lecture bornée et délai du proxy, tests sur l'exécuteur réel avec PostgreSQL isolé et processus tué, restauration essayée, métriques agrégées et essais de rafales/accumulation sont consignés dans [RELIABILITY-VERIFICATION-2026-10-14.md](RELIABILITY-VERIFICATION-2026-10-14.md). Restent prioritaires : campagne longue avec échéances concurrentes, preuve d'équité entre guildes, observation de l'attente interne du pool, tombstones transactionnels avant toute purge des dossiers d'action, procédure vérifiée de reprise d'une sauvegarde ancienne, puis validation visuelle et Discord sur environnement de test autorisé. La PR reste en brouillon pendant ces lacunes.
+Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interruption sur l'exécuteur réel, quarantaine à la restauration, banc PostgreSQL/BullMQ/worker de 30 minutes, attente du pool et admission sont consignés dans [RELIABILITY-VERIFICATION-2026-10-14.md](RELIABILITY-VERIFICATION-2026-10-14.md). Les dossiers d'action ne sont pas purgés : ils croissent jusqu'à une conception et un test de course des tombstones; suivre la taille de `ModerationCase` avant saturation. Avant mise en production, valider le rendu dans un navigateur et les parcours Discord autorisés sans sanction destructive. Les résultats simulés ne prouvent pas les limites de Discord réel. La PR reste en brouillon.
+
+### Tâches restantes, priorisées
+
+1. Pour mise en production : revue humaine des changements, vérification GitHub CI, navigateur réel et contrôles Discord autorisés; aucune sanction réelle n'est requise pour la fusion des correctifs backend.
+2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
+3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
 
 ### Navigation routée et édition commune — 13 octobre 2026
 

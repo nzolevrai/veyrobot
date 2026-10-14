@@ -114,7 +114,10 @@ const resourceTimer = setInterval(() => {
   const elu = performance.eventLoopUtilization(previousElu);
   previousElu = performance.eventLoopUtilization();
   app.log.info({ metric: 'api_resources', acceptedResponses: admissionTotals.accepted, backlogRefusals: admissionTotals.refused,
+    moderationAdmission: db.takeAdmissionMetrics(),
+    poolAcquisition: db.takePoolAcquireMetrics(),
     rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
+    pool: { total: db.postgresPool.totalCount, idle: db.postgresPool.idleCount, waiting: db.postgresPool.waitingCount },
     eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, 'api operational snapshot');
   loopDelay.reset();
 }, 60_000);

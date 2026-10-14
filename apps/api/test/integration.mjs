@@ -24,7 +24,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const offlineShard = onlineShard + 1;
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC };
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -65,6 +65,13 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       });
       assert.equal((await proxiedBody(1_048_577)).status, 413, 'Next must reject a chunked oversized body before the API');
       assert.equal((await proxiedBody(2)).status, 401, 'Next must forward a bounded chunked body to the API');
+      let delayedUpload;
+      const slowBody = new ReadableStream({
+        start(controller) { controller.enqueue(Buffer.from('{')); delayedUpload = setTimeout(() => { controller.enqueue(Buffer.from('}')); controller.close(); }, 500); },
+        cancel() { clearTimeout(delayedUpload); },
+      });
+      const slowResponse = await fetch(`http://localhost:${dashboardPort}/api/guilds/${guildA}/actions`, { method: 'POST', duplex: 'half', headers: { 'content-type': 'application/json' }, body: slowBody });
+      assert.equal(slowResponse.status, 408, 'Next must time out a slow body before contacting the API');
       const noSession = await fetch(direct, { redirect: 'manual' });
       assert.equal(noSession.status, 307);
       const userRoute = `http://localhost:${dashboardPort}/dashboard/user`;
