@@ -20,7 +20,7 @@ export function redisConnection(urlString: string, producer = false): Connection
     ...(url.pathname.length > 1 ? { db: Number(url.pathname.slice(1)) } : {}),
     ...(url.protocol === 'rediss:' ? { tls: {} } : {}),
     maxRetriesPerRequest: producer ? 1 : null,
-    ...(producer ? { enableOfflineQueue: false, connectTimeout: 3_000, retryStrategy: (attempt: number) => attempt > 2 ? null : attempt * 250 } : {}),
+    ...(producer ? { enableOfflineQueue: false, connectTimeout: 3_000, retryStrategy: (attempt: number) => Math.min(1_000 * 2 ** Math.min(attempt - 1, 4), 20_000) } : {}),
   };
 }
 
@@ -62,21 +62,33 @@ export async function submitModerationAction(
   input: ModerationInput & { operationId: string },
 ): Promise<ModerationCase> {
   validateModerationInput(input);
-  if (store.guildConfig && !moduleEnabled(await store.guildConfig.findUnique({ where: { guildId: input.guildId } }), moduleForAction(input.action))) throw new ModerationRuleError('Ce module est désactivé sur ce serveur.');
   if (!/^[\w-]{16,80}$/.test(input.operationId)) throw new ModerationRuleError('Identifiant d’opération invalide.');
-  const prior = await store.moderationCase.findUnique({ where: { operationId: input.operationId } });
-  if (prior) {
-    if (prior.guildId !== input.guildId || prior.actorId !== input.actorId || prior.targetId !== input.targetId || prior.action !== input.action || prior.reason !== input.reason.trim() || prior.durationMinutes !== (input.durationMinutes ?? null)) throw new ModerationRuleError('Identifiant déjà utilisé pour une autre opération.');
-    return prior;
-  }
   const channelAction = ['PURGE_MESSAGES', 'SLOWMODE', 'LOCK_CHANNEL', 'UNLOCK_CHANNEL'].includes(input.action);
+  const original = async () => {
+    const prior = await store.moderationCase.findUnique({ where: { operationId: input.operationId } });
+    if (!prior) return null;
+    if (prior.guildId !== input.guildId || prior.actorId !== input.actorId || prior.targetId !== (channelAction ? input.channelId ?? input.targetId : input.targetId) || prior.action !== input.action || prior.reason !== input.reason.trim() || prior.durationMinutes !== (input.durationMinutes ?? null) || prior.channelId !== (channelAction ? input.channelId ?? input.targetId : null) || prior.filterAuthorId !== (input.filterAuthorId ?? null) || prior.requestedCount !== (input.requestedCount ?? null) || prior.rateLimitSeconds !== (input.rateLimitSeconds ?? null)) throw new ModerationRuleError('Identifiant déjà utilisé pour une autre opération.');
+    return prior;
+  };
+  const prior = await original();
+  if (prior) return prior;
+  if (store.guildConfig && !moduleEnabled(await store.guildConfig.findUnique({ where: { guildId: input.guildId } }), moduleForAction(input.action))) throw new ModerationRuleError('Ce module est désactivé sur ce serveur.');
   const data: Record<string, unknown> = { ...input, ...(channelAction ? { channelId: input.channelId ?? input.targetId, targetId: input.channelId ?? input.targetId } : {}), id: crypto.randomUUID(), operationId: input.operationId, status: 'requested', action: input.action, reason: input.reason.trim(), ...(input.action === 'TEMPBAN' ? { expiryStatus: 'pending', banMarker: `veyro-case-${input.operationId}` } : {}) };
   const isBanDecision = input.action === 'BAN' || input.action === 'TEMPBAN' || input.action === 'UNBAN';
-  const record = isBanDecision && store.$transaction ? await store.$transaction(async tx => {
+  const saveBan = async (tx: { moderationCase: { create(args: { data: Record<string, unknown> }): Promise<ModerationCase> }; guildTargetDecision: { upsert(args: { where: Record<string, unknown>; create: Record<string, unknown>; update: Record<string, unknown> }): Promise<{ generation: number }> } }) => {
     const where = { guildId_targetId: { guildId: input.guildId, targetId: input.targetId } };
     const decision = await tx.guildTargetDecision.upsert({ where, create: { guildId: input.guildId, targetId: input.targetId, generation: 1, latestOperationId: input.operationId }, update: { generation: { increment: 1 }, latestOperationId: input.operationId } });
     return tx.moderationCase.create({ data: { ...data, banGeneration: decision.generation } });
-  }) : await store.moderationCase.create({ data });
+  };
+  let record: ModerationCase;
+  try { record = isBanDecision && store.$transaction ? await store.$transaction(saveBan) : isBanDecision && store.guildTargetDecision ? await saveBan({ moderationCase: store.moderationCase, guildTargetDecision: store.guildTargetDecision }) : await store.moderationCase.create({ data }); }
+  catch (error) {
+    if ((error as { code?: string }).code === 'P2002') {
+      const committed = await original();
+      if (committed) return committed;
+    }
+    throw error;
+  }
   // PostgreSQL is the durable outbox. Only the bot dispatcher publishes jobs,
   // applying per-guild fairness before work reaches BullMQ.
   return record;

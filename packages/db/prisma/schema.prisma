@@ -86,6 +86,7 @@ model ConfigAudit {
   changes Json
   createdAt DateTime @default(now())
   @@index([guildId, createdAt(sort: Desc)])
+  @@index([createdAt])
 }
 model GuildPresence {
   guildId String @id
@@ -97,4 +98,11 @@ model GuildPresence {
 model ShardPresence {
   shardId Int @id
   lastSeenAt DateTime @default(now())
+}
+
+model SessionGrant {
+  idHash String @id
+  expiresAt DateTime
+  revokedAt DateTime?
+  @@index([expiresAt])
 }

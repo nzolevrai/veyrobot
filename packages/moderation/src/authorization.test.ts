@@ -46,6 +46,30 @@ test('disabled module rejects a new action before a case is created', async () =
   assert.equal(writes, 0);
 });
 
+test('concurrent identical submissions keep one ban decision and reject changed payloads', { skip: process.env.RUN_POSTGRES_INTEGRATION !== '1' }, async () => {
+  const { prisma } = await import('@veyrobot/db');
+  const guildId = `9${crypto.randomUUID().replace(/\D/g, '').padEnd(17, '0').slice(0, 17)}`;
+  const targetId = '123456789012345680';
+  const actorId = '123456789012345679';
+  const operationId = `test-${crypto.randomUUID()}`;
+  const input = { guildId, actorId, targetId, action: 'BAN' as const, reason: 'test concurrent submission', operationId };
+  try {
+    await prisma.guildConfig.create({ data: { guildId, updatedBy: actorId, memberActionsEnabled: true } });
+    const [first, second] = await Promise.all([submitModerationAction(prisma, input), submitModerationAction(prisma, input)]);
+    assert.equal(first.id, second.id);
+    assert.equal(await prisma.moderationCase.count({ where: { operationId } }), 1);
+    assert.equal((await prisma.guildTargetDecision.findUnique({ where: { guildId_targetId: { guildId, targetId } } }))?.generation, 1);
+    await prisma.guildConfig.update({ where: { guildId }, data: { memberActionsEnabled: false } });
+    assert.equal((await submitModerationAction(prisma, input)).id, first.id, 'an accepted operation stays idempotent after module disable');
+    await assert.rejects(submitModerationAction(prisma, { ...input, reason: 'different' }), /déjà utilisé/);
+  } finally {
+    await prisma.moderationCase.deleteMany({ where: { guildId } });
+    await prisma.guildTargetDecision.deleteMany({ where: { guildId } });
+    await prisma.guildConfig.deleteMany({ where: { guildId } });
+    await prisma.$disconnect();
+  }
+});
+
 test('permission and hierarchy checks reject revoked permissions, equal roles, and the guild owner', () => {
   assert.equal(hasModerationPermission('KICK', PermissionFlagsBits.KickMembers), true);
   assert.equal(hasModerationPermission('KICK', PermissionFlagsBits.BanMembers), false);

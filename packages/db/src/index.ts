@@ -13,6 +13,7 @@ if (!connectionString) throw new Error('DATABASE_URL is required.');
 const adapter = new PrismaPg({ connectionString, max: Number(process.env.DATABASE_POOL_SIZE ?? 10) });
 export const prisma = new PrismaClient({ adapter, log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'] });
 export * from './guild-config.js';
+export * from './admission.js';
 
 export async function createWarningCase(input: WarningCaseInput) {
   return prisma.$transaction(async tx => {

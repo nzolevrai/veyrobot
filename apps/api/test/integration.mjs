@@ -30,6 +30,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   let child;
   let dashboard;
   let caseId;
+  let actionCaseId;
   const start = async () => {
     child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: 'ignore' });
     for (let i = 0; i < 150; i++) { try { if ((await fetch(`${base}/health`)).ok) return; } catch { /* wait for listen */ } await delay(100); }
@@ -41,13 +42,14 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await prisma.guildPresence.createMany({ data: [{ guildId: guildA, shardId: onlineShard }, { guildId: guildC, shardId: offlineShard }] });
     await prisma.shardPresence.createMany({ data: [{ shardId: onlineShard, lastSeenAt: new Date() }, { shardId: offlineShard, lastSeenAt: new Date(0) }] });
     await start();
+    assert.equal((await call('/ready')).status, 200);
     const oauthStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
     const state = new URL(oauthStart.headers.get('location')).searchParams.get('state');
     const stateCookie = oauthStart.headers.get('set-cookie').split(';', 1)[0];
     const callback = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
     assert.equal(callback.status, 302);
     assert.equal(callback.headers.get('location'), 'http://localhost:3000/dashboard/user');
-    const cookie = callback.headers.get('set-cookie').split(';', 1)[0];
+    let cookie = callback.headers.get('set-cookie').split(';', 1)[0];
     assert.equal(cookie.split('=', 1)[0], 'veyrobot_session', 'Unexpected OAuth session cookie name');
     if (process.env.RUN_DASHBOARD_ROUTE_INTEGRATION === '1') {
       const dashboardPort = await freePort();
@@ -81,6 +83,18 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       assert.equal(authorized.status, 200, `Next server must relay the OAuth cookie to the API (redirect reason: ${new URL(authorized.headers.get('location') ?? '/', direct).searchParams.get('session') ?? 'none'})`);
       const reload = await fetch(direct, { headers: { cookie }, redirect: 'manual' });
       assert.equal(reload.status, 200);
+      if (process.env.BENCH_DASHBOARD === '1') {
+        const latency = [];
+        for (let index = 0; index < 20; index++) {
+          const began = performance.now();
+          const page = await fetch(`http://localhost:${dashboardPort}/dashboard/user/profil`, { headers: { cookie }, redirect: 'manual' });
+          assert.equal(page.status, 200);
+          await page.arrayBuffer();
+          latency.push(performance.now() - began);
+        }
+        const sorted = latency.sort((a, b) => a - b);
+        console.info(JSON.stringify({ scope: 'Next server response /dashboard/user/profil with fake OAuth API; not browser render', requests: sorted.length, p50Ms: +sorted[9].toFixed(2), p95Ms: +sorted[18].toFixed(2), p99Ms: +sorted[19].toFixed(2) }));
+      }
       for (const route of [userRoute, profileRoute, `${userRoute}/security`, `${userRoute}/premium`]) {
         const page = await fetch(route, { headers: { cookie }, redirect: 'manual' });
         assert.equal(page.status, 200, `User route should open directly: ${new URL(route).pathname}`);
@@ -121,9 +135,17 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       const proxiedLogout = await fetch(`http://localhost:${dashboardPort}/api/logout`, { method: 'POST', headers: { cookie, origin: 'http://localhost:3000' } });
       assert.equal(proxiedLogout.status, 204, 'Dashboard rewrite must forward logout');
       assert.match(proxiedLogout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
+      assert.equal((await call('/me', cookie)).status, 401, 'A saved cookie must not survive logout');
       assert.equal((await fetch(`http://localhost:${dashboardPort}/api/me`)).status, 401);
+      const nextStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
+      const nextState = new URL(nextStart.headers.get('location')).searchParams.get('state');
+      const nextStateCookie = nextStart.headers.get('set-cookie').split(';', 1)[0];
+      const nextCallback = await call(`/oauth/discord/callback?code=fixture&state=${nextState}`, nextStateCookie, { redirect: 'manual' });
+      assert.equal(nextCallback.status, 302);
+      cookie = nextCallback.headers.get('set-cookie').split(';', 1)[0];
     }
     const me = await call('/me', cookie); const { csrf } = await me.json();
+    await prisma.shardPresence.update({ where: { shardId: onlineShard }, data: { lastSeenAt: new Date() } });
     const guilds = await (await call('/guilds', cookie)).json();
     assert.deepEqual(guilds.map(item => [item.botInstalled, item.botOnline]), [[true, true], [false, false], [true, false]]);
     assert.equal((await call(`/guilds/${guildB}/cases`, cookie)).status, 403);
@@ -152,6 +174,13 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal(patchResponse.status, 200);
     const patch = await patchResponse.json();
     assert.equal(patch.memberActionsEnabled, true); assert.equal(patch.embedColor, '#ABCDEF'); assert.equal(patch.language, 'en');
+    const operationId = randomUUID();
+    const actionInput = { targetId, action: 'TIMEOUT', durationMinutes: 1, reason: 'integration request only', operationId };
+    const actionResponse = await post(`/guilds/${guildA}/actions`, actionInput);
+    assert.equal(actionResponse.status, 202);
+    actionCaseId = (await actionResponse.json()).id;
+    assert.equal((await (await post(`/guilds/${guildA}/actions`, actionInput)).json()).id, actionCaseId);
+    assert.equal((await post(`/guilds/${guildA}/actions`, { ...actionInput, reason: 'changed payload' })).status, 400);
     assert.equal((await put(`/guilds/${guildA}/config`, { kind: 'patch', version: settings.version, changes: { warningsEnabled: false } })).status, 409);
     assert.equal((await put(`/guilds/${guildA}/config`, { kind: 'patch', version: patch.version, changes: { timeZone: 'Mars/Base' } })).status, 400);
     const disabled = await (await put(`/guilds/${guildA}/config`, { kind: 'module', moduleId: 'warnings', enabled: false, version: patch.version })).json();
@@ -168,10 +197,14 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
     assert.equal(logout.status, 204);
     assert.match(logout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
+    assert.equal((await call('/me', cookie)).status, 401, 'A copied cookie must be revoked server-side');
+    await stop(); await start();
+    assert.equal((await call('/me', cookie)).status, 401, 'Revocation must survive API restart');
     console.log('API integration passed: OAuth to user route, direct user and guild routes, proxied logout, outage and rate limit, guild isolation, restart persistence.');
   } finally {
     await stop();
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });
+    if (actionCaseId) await prisma.moderationCase.deleteMany({ where: { id: actionCaseId } });
     await prisma.configAudit.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildConfig.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildPresence.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });

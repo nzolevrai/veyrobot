@@ -36,6 +36,7 @@ export function DashboardProvider({ guildId, initialConfig, children }: { guildI
   const [saveMessage, setSaveMessage] = useState('');
   const [pendingInvite, setPendingInvite] = useState('');
   const lastCasesFetch = useRef(0);
+  const casesRequest = useRef<AbortController | null>(null);
   const dirtyRef = useRef(false);
   const pathRef = useRef(pathname);
   const busyRef = useRef(false);
@@ -71,22 +72,28 @@ export function DashboardProvider({ guildId, initialConfig, children }: { guildI
     return () => controller.abort();
   }, [guildId, expire, loadGuilds]);
   const refreshCases = useCallback(async () => {
+    casesRequest.current?.abort();
+    const controller = new AbortController();
+    casesRequest.current = controller;
     setCasesLoading(true);
     try {
-      const response = await fetch(`/api/guilds/${guildId}/cases?limit=25`, { credentials: 'same-origin', cache: 'no-store' });
+      const response = await fetch(`/api/guilds/${guildId}/cases?limit=25`, { signal: controller.signal, credentials: 'same-origin', cache: 'no-store' });
+      if (controller.signal.aborted) return;
       if (response.status === 401) { expire(); return; }
       if (!response.ok) { const failure = await readApiFailure(response); throw new Error(failureMessage(failure) + failureReference(failure)); }
-      setCases((await response.json() as { items: ModerationCase[] }).items);
+      const data = await response.json() as { items: ModerationCase[] };
+      if (controller.signal.aborted) return;
+      setCases(data.items);
       lastCasesFetch.current = Date.now();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Dossiers indisponibles.'); }
-    finally { lastCasesFetch.current = Date.now(); setCasesLoading(false); }
+    } catch (cause) { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Dossiers indisponibles.'); }
+    finally { if (casesRequest.current === controller) { lastCasesFetch.current = Date.now(); casesRequest.current = null; setCasesLoading(false); } }
   }, [guildId, expire]);
   // Les dossiers récents ne sont interrogés que sur les vues qui les affichent.
   useEffect(() => {
     if (!/\/(overview|warnings|member-actions|channel-actions)$/.test(pathname)) return;
     if (shouldRefreshRecentCases(pathname, lastCasesFetch.current, Date.now())) void refreshCases();
     const timer = setInterval(() => { if (document.visibilityState === 'visible' && shouldRefreshRecentCases(pathname, lastCasesFetch.current, Date.now())) void refreshCases(); }, 30_000);
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); casesRequest.current?.abort(); };
   }, [pathname, refreshCases]);
   const update = useCallback(<K extends EditableKey>(key: K, value: GuildConfig[K]) => { setDraft(current => current ? { ...current, [key]: value } : current); setSaveMessage(''); }, []);
   const reset = useCallback(() => { setDraft(saved); setSaveMessage(''); }, [saved]);
