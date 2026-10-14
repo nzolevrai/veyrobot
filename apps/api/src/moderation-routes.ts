@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { canModerateMembers } from '@veyrobot/contracts';
-import type { ModerationAction } from '@veyrobot/moderation';
+import type { ModerationAction } from '@veyrobot/moderation/service';
 import type { ApiContext } from './context.js';
 
 export const admissionTotals = { accepted: 0, refused: 0 };
