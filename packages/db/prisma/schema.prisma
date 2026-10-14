@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+datasource db {
+  provider = "postgresql"
+}
+model ModerationCase {
+  id String @id @default(cuid())
+  operationId String? @unique
+  guildId String
+  actorId String
+  targetId String
+  action String
+  reason String
+  status String @default("completed")
+  durationMinutes Int?
+  expiresAt DateTime?
+  banMarker String?
+  expiryStatus String?
+  expiryStartedAt DateTime?
+  expiryClaimToken String?
+  expiryLeaseUntil DateTime?
+  banGeneration Int?
+  channelId String?
+  filterAuthorId String?
+  requestedCount Int?
+  rateLimitSeconds Int?
+  deletedCount Int?
+  unbannedAt DateTime?
+  expiryResult String?
+  createdAt DateTime @default(now())
+  startedAt DateTime?
+  claimToken String?
+  claimLeaseUntil DateTime?
+  executionPhase String?
+  completedAt DateTime?
+  result String?
+  @@index([guildId, createdAt(sort: Desc)])
+  @@index([guildId, targetId, createdAt(sort: Desc)])
+  @@index([status, startedAt])
+  @@index([status, createdAt])
+  @@index([status, guildId, createdAt])
+  @@index([action, status, expiryStatus, expiresAt])
+  @@index([expiryStatus, expiryLeaseUntil])
+}
+model GuildTargetDecision {
+  guildId String
+  targetId String
+  generation Int @default(0)
+  latestOperationId String?
+  updatedAt DateTime @updatedAt
+  @@id([guildId, targetId])
+  @@index([guildId, updatedAt])
+}
+model ChannelLockState {
+  guildId String
+  channelId String
+  originalSendMessages String
+  active Boolean @default(true)
+  lockOperationId String
+  lockedAt DateTime @default(now())
+  unlockedAt DateTime?
+  @@id([guildId, channelId])
+  @@index([guildId, active, lockedAt])
+}
+model GuildConfig {
+  guildId String @id
+  version Int @default(1)
+  updatedAt DateTime @updatedAt
+  updatedBy String
+  logChannelId String?
+  warningsEnabled Boolean @default(false)
+  memberActionsEnabled Boolean @default(false)
+  channelActionsEnabled Boolean @default(false)
+  language String @default("fr")
+  timeZone String @default("UTC")
+  embedColor String @default("#7775F5")
+  @@index([updatedAt])
+}
+model ConfigAudit {
+  id String @id @default(cuid())
+  guildId String
+  actorId String
+  version Int
+  changes Json
+  createdAt DateTime @default(now())
+  @@index([guildId, createdAt(sort: Desc)])
+}
+model GuildPresence {
+  guildId String @id
+  lastSeenAt DateTime @default(now())
+  shardId Int
+  @@index([lastSeenAt])
+  @@index([shardId, lastSeenAt])
+}
+model ShardPresence {
+  shardId Int @id
+  lastSeenAt DateTime @default(now())
+}

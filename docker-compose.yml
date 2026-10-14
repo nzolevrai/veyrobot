@@ -1,0 +1,85 @@
+x-veyrobot-app: &veyrobot-app
+  image: veyrobot-app:local
+  build: .
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sentinelle
+      POSTGRES_PASSWORD: sentinelle_local
+      POSTGRES_DB: sentinelle
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinelle -d sentinelle"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    profiles: [app]
+    <<: *veyrobot-app
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://sentinelle:sentinelle_local@postgres:5432/sentinelle?schema=public
+    command: ["corepack", "pnpm", "db:migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    profiles: [app]
+    image: veyrobot-app:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: development
+      API_PORT: 4000
+      API_PUBLIC_URL: http://localhost:4000
+      DASHBOARD_URL: http://localhost:3000
+      DATABASE_URL: postgresql://sentinelle:sentinelle_local@postgres:5432/sentinelle?schema=public
+    ports: ["4000:4000"]
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/api", "start"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  bot:
+    profiles: [app]
+    image: veyrobot-app:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://sentinelle:sentinelle_local@postgres:5432/sentinelle?schema=public
+      REDIS_URL: redis://redis:6379
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/bot", "start"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  dashboard:
+    profiles: [app]
+    image: veyrobot-app:local
+    environment:
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:4000
+      SUPPORT_DISCORD_URL: ${SUPPORT_DISCORD_URL:-}
+    ports: ["3000:3000"]
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/dashboard", "start"]
+    depends_on: [api]
+volumes:
+  pgdata:
+  redisdata:

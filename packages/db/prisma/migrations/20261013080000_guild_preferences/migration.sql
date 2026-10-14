@@ -1,0 +1,7 @@
+ALTER TABLE "GuildConfig"
+  ADD COLUMN "warningsEnabled" BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN "memberActionsEnabled" BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN "channelActionsEnabled" BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN "language" TEXT NOT NULL DEFAULT 'fr',
+  ADD COLUMN "timeZone" TEXT NOT NULL DEFAULT 'UTC',
+  ADD COLUMN "embedColor" TEXT NOT NULL DEFAULT '#7775F5';
