@@ -11,6 +11,7 @@
     "test:csp:browser": "node tools/check-csp-browser.mjs"
   },
   "dependencies": {
+    "@veyrobot/contracts": "workspace:*",
     "@radix-ui/react-popover": "^1.3.1",
     "@radix-ui/react-select": "^2.4.1",
     "lucide-react": "^0.468.0",

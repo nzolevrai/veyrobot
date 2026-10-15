@@ -12,7 +12,7 @@ import { guildRoutes } from './guild-routes.js';
 import { moderationRoutes, admissionTotals } from './moderation-routes.js';
 import { GuildListCache } from './guild-list-cache.js';
 import { verifiedClientIp } from './client-ip.js';
-import { sanitizedErrorDetails } from './error-details.js';
+import { apiExceptionLogRecord, classifyApiError } from './error-details.js';
 
 const envSchema = z.object({
   API_PORT: z.coerce.number().default(4000),
@@ -82,14 +82,11 @@ const session = (req: import('fastify').FastifyRequest): Session | null => {
 };
 const sessionHash = (id: string) => createHash('sha256').update(id).digest('hex');
 const sendError: ApiContext['sendError'] = (request, reply, error) => {
-  const candidate = error as { statusCode?: number; code?: string; retryAfter?: string };
-  const dependencyUnavailable = ['P1000', 'P1001', 'P1002', 'P1017', 'P2024'].includes(candidate.code ?? '') || (error instanceof Error && error.name === 'PrismaClientInitializationError');
-  const status = error instanceof z.ZodError || (error instanceof Error && error.name === 'ModerationRuleError') ? 400 : candidate.statusCode ?? (candidate.code === 'P2002' || candidate.code === 'P2034' ? 409 : candidate.code === 'MODERATION_BACKLOG_LIMIT' ? 429 : dependencyUnavailable ? 503 : 500);
-  const code = error instanceof z.ZodError ? 'VALIDATION_ERROR' : candidate.code ?? (status === 401 ? 'SESSION_ABSENT' : status === 403 ? 'ACCESS_DENIED' : status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_FAILED');
-  if (candidate.retryAfter) reply.header('retry-after', candidate.retryAfter);
-  app.log.error({ requestId: request.id, status, code, ...(candidate.retryAfter ? { retryAfter: candidate.retryAfter } : {}), exception: sanitizedErrorDetails(error) }, 'API request failed');
-  const message = status === 400 ? 'Requête invalide.' : status === 401 ? 'Reconnectez votre compte.' : status === 403 ? 'Accès refusé.' : status === 409 ? 'Conflit avec une opération existante.' : status === 429 ? 'Trop de requêtes ou capacité atteinte.' : status === 503 || status === 502 ? 'Service temporairement indisponible.' : 'Erreur interne.';
-  return reply.code(status).send({ code, error: message, requestId: request.id });
+  const classified = classifyApiError(error);
+  if (classified.retryAfter) reply.header('retry-after', classified.retryAfter);
+  app.log.error({ ...apiExceptionLogRecord(request.id, classified.status, classified.code, error), ...(classified.retryAfter ? { retryAfter: classified.retryAfter } : {}) }, 'API request failed');
+  return reply.code(classified.status).send({ code: classified.code, error: classified.message, requestId: request.id });
+
 };
 app.setErrorHandler((error, request, reply) => sendError(request, reply, error));
 app.addHook('preValidation', async (req) => {
@@ -106,7 +103,8 @@ app.addHook('preValidation', async (req) => {
       return;
     }
     validatedSessionIds.set(req, current.sessionId);
-  } catch {
+  } catch (error) {
+    app.log.error(apiExceptionLogRecord(req.id, 503, 'SESSION_CHECK_UNAVAILABLE', error, 'session_grant_validation'), 'Session grant validation failed');
     sessionValidationFailures.set(req, { status: 503, code: 'SESSION_CHECK_UNAVAILABLE', message: 'Vérification de session indisponible.' });
   }
 });
@@ -191,7 +189,7 @@ await app.listen({ port: env.API_PORT, host: '0.0.0.0' });
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     void app.close().catch(error => {
-      app.log.error({ err: error }, 'API shutdown failed');
+      app.log.error(apiExceptionLogRecord('shutdown', 500, 'INTERNAL_ERROR', error, 'shutdown'), 'API shutdown failed');
       process.exitCode = 1;
     });
   });

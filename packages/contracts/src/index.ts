@@ -13,3 +13,5 @@ export function canManageGuild(owner: boolean, permissions: string): boolean {
 export function canModerateMembers(owner: boolean, permissions: string): boolean {
   return owner || hasPermissionBits(BigInt(permissions), MODERATE_MEMBERS);
 }
+export { safeDiagnosticCode, safeDiagnosticText, sanitizedErrorDetails } from './error-details.js';
+export type { SanitizedErrorDetails } from './error-details.js';

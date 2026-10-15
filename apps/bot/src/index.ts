@@ -6,6 +6,7 @@ import { createDispatcher } from './dispatcher.js';
 import { z } from 'zod';
 import { acquireSingleBotLease } from './single-instance.js';
 import { registerInteractionHandler } from './interactions.js';
+import { logBotError } from './error-log.js';
 
 const lastErrorLogAt = new Map<string, number>();
 const errorTotals = new Map<string, number>();
@@ -15,7 +16,7 @@ function logThrottled(key: string, message: string, error: unknown): void {
   if (now - (lastErrorLogAt.get(key) ?? 0) < 60_000) return;
   lastErrorLogAt.set(key, now);
   if (lastErrorLogAt.size > 32) lastErrorLogAt.delete(lastErrorLogAt.keys().next().value!);
-  console.error(message, error instanceof Error ? error.name : 'unknown error');
+  logBotError('bot_error', key, message, error);
 }
 
 const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379') });
@@ -60,7 +61,7 @@ process.on('uncaughtException', error => failProcess(error, 'uncaught-exception'
 
 client.once(Events.ClientReady, async ready => {
   console.info(`Connecté comme ${ready.user.tag}`);
-  await markInterruptedOperationsUncertain(prisma).catch(error => console.error('Could not reconcile interrupted moderation actions', error));
+  await markInterruptedOperationsUncertain(prisma).catch(error => logBotError('reconcile_failed', 'startup_reconcile', 'Could not reconcile interrupted moderation actions', error));
   const ownedShardIds = client.shard?.ids ?? [0];
   const publishPresence = async () => {
     if (!client.isReady()) return;
@@ -100,7 +101,7 @@ client.once(Events.ClientReady, async ready => {
   if (!membershipsSynced) membershipRetryTimer = setInterval(() => void syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync retry failed', error)), 30_000);
   await dispatchRequested();
   const dispatchTimer = setInterval(() => void dispatchRequested(), 1_000);
-  const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => console.error('stale moderation operation reconciliation failed', error)), 60_000);
+  const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => logBotError('reconcile_failed', 'stale_operation_reconcile', 'Stale moderation operation reconciliation failed', error)), 60_000);
   const loopDelay = monitorEventLoopDelay({ resolution: 20 });
   loopDelay.enable();
   let previousElu = performance.eventLoopUtilization();
@@ -144,5 +145,6 @@ catch (error) {
   await queue.close().catch(() => undefined);
   await prisma.$disconnect().catch(() => undefined);
   await releaseBotLease();
-  throw error;
+  logBotError('bot_start_failed', 'discord_login', 'Discord client login failed', error);
+  process.exitCode = 1;
 }

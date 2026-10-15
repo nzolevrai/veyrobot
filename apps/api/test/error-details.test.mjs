@@ -1,13 +1,73 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { sanitizedErrorDetails } from '../dist/error-details.js';
+import Fastify from 'fastify';
+import { Writable } from 'node:stream';
+import { apiExceptionLogRecord, classifyApiError, sanitizedErrorDetails } from '../dist/error-details.js';
 
-test('server exception details are useful but redact common credentials and bound output', () => {
-  const details = sanitizedErrorDetails(Object.assign(new Error('Bearer abc.def.ghi cookie=session=secret password=hunter2 postgresql://user:secret@db/app'), { code: 'P1001' }));
-  assert.equal(details.code, 'P1001');
-  assert.match(details.message, /Bearer \[redacted\]/);
-  assert.doesNotMatch(details.message, /secret|hunter2|abc\.def\.ghi/);
-  const caused = sanitizedErrorDetails(new Error('request failed', { cause: new Error('client_secret=hidden') }));
-  assert.equal(caused.cause?.message, 'client_secret=[redacted]');
-  assert.equal(sanitizedErrorDetails(new Error('x'.repeat(1000))).message.length, 500);
+test('emitted API exception log redacts every canary while retaining bounded diagnostics', async () => {
+  const canaries = [
+    'CS_CANARY_9f3a', 'SK_CANARY_7d2b', 'BEARER_CANARY_6a1c', 'COOKIE_CANARY_4e8d',
+    'PGUSER_CANARY_3b7f', 'PGPASS_CANARY_2c5a', 'NESTED_CANARY_8d1e', 'NEWLINE_CANARY_5a4c',
+    'LONG_CANARY_0f9b', 'CODE_CANARY_1e6d', 'REQUEST_CANARY_2a7c',
+  ];
+  const leaf = Object.assign(new Error(`query failed client_secret=${canaries[0]} SESSION_KEY=${canaries[1]} Authorization: Bearer ${canaries[2]} Cookie: sid=${canaries[3]} PostgreSQL URL postgresql://${canaries[4]}:${canaries[5]}@db.invalid/app\nclient_secret=${canaries[7]}${'x'.repeat(6000)}${canaries[8]}`), {
+    name: `client_secret=${canaries[0]}`,
+    code: `SESSION_KEY=${canaries[9]}`,
+    cause: Object.assign(new Error(`upstream failed refresh_token=${canaries[6]}`), { name: `SESSION_KEY=${canaries[1]}`, cause: new TypeError('socket reset', { cause: new Error('beyond depth') }) }),
+  });
+  const failure = Object.assign(new Error('database unavailable'), { name: `SESSION_KEY=${canaries[1]}`, cause: leaf, code: 'P1001' });
+  const record = apiExceptionLogRecord(`req-${canaries[10]}=secret`, 503, 'SESSION_CHECK_UNAVAILABLE', failure, `session_grant_validation\nSESSION_KEY=${canaries[1]}`);
+
+  let output = '';
+  const stream = new Writable({ write(chunk, _encoding, callback) { output += chunk.toString(); callback(); } });
+  const app = Fastify({ logger: { level: 'error', stream } });
+  try {
+    app.log.error(record, 'Session grant validation failed');
+    await app.close();
+  } finally { await app.close().catch(() => undefined); }
+
+  const emitted = JSON.parse(output.trim());
+  for (const canary of canaries) assert.equal(output.includes(canary), false, `emitted logger output leaked ${canary}`);
+  assert.equal(emitted.requestId, 'unknown');
+  assert.equal(emitted.status, 503);
+  assert.equal(emitted.code, 'SESSION_CHECK_UNAVAILABLE');
+  assert.match(emitted.phase, /session_grant_validation/);
+  assert.equal(emitted.exception.name, 'Error');
+  assert.equal(emitted.exception.code, 'P1001');
+  assert.equal(emitted.exception.message, 'database unavailable');
+  assert.equal(emitted.exception.cause.name, 'Error');
+  assert.match(emitted.exception.cause.message, /query failed/);
+  assert.equal(emitted.exception.cause.cause.name, 'Error');
+  assert.equal(emitted.exception.cause.cause.cause.message, 'socket reset');
+  assert.equal(emitted.exception.cause.cause.cause.name, 'TypeError');
+  assert.equal(emitted.exception.cause.cause.cause.cause.message, '[cause depth limit]');
+  assert.equal(emitted.exception.cause.code, undefined);
+  assert.ok(output.length < 5000, 'output remains bounded despite an oversized exception');
+});
+
+test('API classification keeps client responses generic and exposes no internal codes', () => {
+  const error = Object.assign(new Error('postgresql://user:password@db.invalid/x SESSION_KEY=classified-canary'), {
+    name: 'client_secret=classified-canary', code: 'SESSION_KEY=classified-canary', statusCode: 503,
+  });
+  const classified = classifyApiError(error);
+  const clientBody = { code: classified.code, error: classified.message, requestId: 'req-123' };
+  assert.equal(classified.status, 503);
+  assert.equal(classified.code, 'INTERNAL_ERROR');
+  assert.equal(classified.message, 'Service temporairement indisponible.');
+  assert.equal(JSON.stringify(clientBody).includes('classified-canary'), false);
+  assert.equal(JSON.stringify(clientBody).includes('postgresql'), false);
+});
+
+test('sanitizer handles circular causes, throwing getters and atypical thrown values without throwing', () => {
+  const circular = new Error('outer');
+  circular.cause = circular;
+  assert.equal(sanitizedErrorDetails(circular).cause?.message, '[circular cause]');
+  let deepCause = new Error('deepest');
+  for (let depth = 0; depth < 6; depth++) deepCause = new Error(`layer ${depth}`, { cause: deepCause });
+  const bounded = sanitizedErrorDetails(deepCause);
+  assert.equal(bounded.cause?.cause?.cause?.cause?.message, '[cause depth limit]');
+  const hostile = new Proxy({}, { get(_target, property) { if (property === 'name' || property === 'message' || property === 'code' || property === 'cause') throw new Error('getter failed'); return undefined; }, getPrototypeOf() { throw new Error('prototype trap'); } });
+  assert.doesNotThrow(() => sanitizedErrorDetails(hostile));
+  assert.doesNotThrow(() => classifyApiError(hostile));
+  assert.equal(sanitizedErrorDetails('thrown string').message, 'Non-Error thrown.');
 });

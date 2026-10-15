@@ -38,10 +38,13 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
   let dashboard;
+  let apiLogs = '';
   let caseId;
   let actionCaseId;
   const start = async () => {
-    child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: 'ignore' });
+    child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8').on('data', chunk => { apiLogs = (apiLogs + chunk).slice(-1_000_000); });
+    child.stderr.setEncoding('utf8').on('data', chunk => { apiLogs = (apiLogs + chunk).slice(-1_000_000); });
     for (let i = 0; i < 150; i++) { try { if ((await fetch(`${base}/health`)).ok) return; } catch { /* wait for listen */ } await delay(100); }
     throw new Error('API test process did not start');
   };
@@ -353,8 +356,22 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     childEnv.DATABASE_URL = 'postgresql://unavailable:unavailable@127.0.0.1:1/unavailable?connect_timeout=1';
     childEnv.API_RATE_LIMIT_MAX = '2';
     await stop(); await start();
-    const grantFailureStatuses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie).then(response => response.status)));
-    assert.deepEqual(grantFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'a grant store outage never grants a session bucket and is still bounded by the IP quota');
+    const grantFailureResponses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie)));
+    assert.deepEqual(grantFailureResponses.map(response => response.status).sort((a, b) => a - b), [429, 503, 503], 'a grant store outage never grants a session bucket and is still bounded by the IP quota');
+    for (const response of grantFailureResponses.filter(item => item.status === 503)) {
+      const body = await response.json();
+      assert.equal(body.error, 'Vérification de session indisponible.');
+      assert.equal(body.requestId, response.headers.get('x-request-id'));
+      assert.doesNotMatch(body.error, /Prisma|postgres|fixture|connect|database|P100/i);
+    }
+    await delay(50);
+    const grantFailureLog = apiLogs.split(/\r?\n/).map(line => { try { return JSON.parse(line); } catch { return null; } })
+      .find(entry => entry?.phase === 'session_grant_validation' && entry?.requestId === grantFailureResponses.find(item => item.status === 503)?.headers.get('x-request-id'));
+    assert.ok(grantFailureLog, 'grant-validation PostgreSQL failure is logged with the correlated requestId');
+    assert.equal(grantFailureLog.code, 'SESSION_CHECK_UNAVAILABLE');
+    assert.equal(grantFailureLog.status, 503);
+    assert.equal(typeof grantFailureLog.exception.message, 'string');
+    assert.doesNotMatch(JSON.stringify(grantFailureLog), /fixture_local_only|fixture:|postgresql:\/\//i);
     childEnv.API_RATE_LIMIT_MAX = '90';
     childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
     await stop(); await start();
