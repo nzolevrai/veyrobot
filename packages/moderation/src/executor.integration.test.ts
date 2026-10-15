@@ -19,7 +19,7 @@ function deferred() {
   return { promise, release };
 }
 
-const F7_BARRIER_TIMEOUT_MS = 10_000;
+const F7_BARRIER_TIMEOUT_MS = 2_000;
 async function waitForBarrier(promise: Promise<void>, name: string): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
