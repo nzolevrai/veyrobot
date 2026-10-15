@@ -54,7 +54,8 @@ const requestRateLimitKey = (req: FastifyRequest) => {
   const sessionId = validatedSessionIds.get(req);
   return sessionId ? `session:${sessionId}` : clientIpKey(req);
 };
-await app.register(rateLimit, { global: false, max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: requestRateLimitKey,
+// Route-specific limits inherit preHandler so requestRateLimitKey can use the grant validated in preValidation.
+await app.register(rateLimit, { global: false, hook: 'preHandler', max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: requestRateLimitKey,
   errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
 const checkPreAuthRateLimit = app.createRateLimit({ max: env.API_PREAUTH_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: clientIpKey });
 const checkApiRateLimit = app.createRateLimit({ max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: requestRateLimitKey });

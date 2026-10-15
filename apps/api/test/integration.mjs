@@ -29,9 +29,11 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const guildCounterFile = join(tmpdir(), `veyrobot-guild-fetch-${process.pid}-${seed}.txt`);
+  const installationCounterFile = join(tmpdir(), `veyrobot-installation-check-${process.pid}-${seed}.txt`);
   await writeFile(guildCounterFile, '');
+  await writeFile(installationCounterFile, '');
   const proxyIpSecret = 'integration-only-hmac-secret-longer-than-32-bytes';
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile };
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -254,12 +256,28 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await post(`/guilds/${guildA}/warnings`, { targetId, reason: 'after disable' })).status, 400);
     assert.ok((await (await call(`/guilds/${guildA}/cases`, cookie)).json()).items.some(item => item.id === caseId));
     childEnv.MOCK_INSTALLATION_CHECK_STATUS = '200';
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    await writeFile(installationCounterFile, '');
     await stop(); await start();
-    const installed = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
-    assert.equal(installed.botInstalled, true); assert.equal(installed.botOnline, false);
-    for (let index = 0; index < 4; index++) assert.equal((await post(`/guilds/${guildB}/installation-check`, {})).status, 200);
-    const sixthInstallationCheck = await post(`/guilds/${guildB}/installation-check`, {});
-    assert.equal(sixthInstallationCheck.status, 429, 'the existing five-per-minute installation-check route quota remains active');
+    const secondMe = await call('/me', secondCookie);
+    assert.equal(secondMe.status, 200);
+    const secondCsrf = (await secondMe.json()).csrf;
+    const installationPost = (sessionCookie, sessionCsrf, headers = {}) => call(`/guilds/${guildB}/installation-check`, sessionCookie, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://localhost:3000', ...headers },
+      body: JSON.stringify({ csrf: sessionCsrf }),
+    });
+    for (let index = 0; index < 5; index++) {
+      assert.equal((await installationPost(cookie, csrf, { 'x-forwarded-for': `198.51.100.${index + 1}`, 'x-veyrobot-client-ip': `203.0.113.${index + 1}`, 'x-veyrobot-client-ip-signature': 'f'.repeat(64) })).status, 200);
+    }
+    const sixthFirstSession = await installationPost(cookie, csrf, { 'x-forwarded-for': '203.0.113.90', 'x-veyrobot-client-ip': '203.0.113.90', 'x-veyrobot-client-ip-signature': '0'.repeat(64) });
+    assert.equal(sixthFirstSession.status, 429, 'installation-check enforces five requests for the first valid session despite forged IP headers');
+    const secondSessionFirstCall = await installationPost(secondCookie, secondCsrf);
+    assert.equal(secondSessionFirstCall.status, 200, 'exhausting one session does not block another session on the same IP');
+    for (let index = 1; index < 5; index++) assert.equal((await installationPost(secondCookie, secondCsrf)).status, 200);
+    assert.equal((await installationPost(secondCookie, secondCsrf)).status, 429, 'the second valid session has its own five-request installation-check quota');
+    assert.equal((await call('/me', cookie)).status, 200, 'exhausting the route-specific quota does not exhaust the general session quota');
+    assert.equal((await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length, 10, 'only the ten allowed installation checks reach the Discord adapter');
     const otherGuildConfig = await (await call(`/guilds/${guildB}/config`, cookie)).json();
     assert.equal(otherGuildConfig.language, 'fr'); assert.equal(otherGuildConfig.embedColor, '#7775F5'); assert.equal(otherGuildConfig.warningsEnabled, false);
     childEnv.MOCK_INSTALLATION_CHECK_STATUS = '429';
@@ -294,6 +312,12 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await stop(); await start();
     const revokedResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? secondCookie : cookie)));
     assert.deepEqual(revokedResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'revoked sessions share the same anonymous IP quota under concurrent replay');
+    const installationCountBeforeRevokedReplay = (await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length;
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const revokedInstallChecks = await Promise.all(Array.from({ length: 8 }, (_, index) => installationPost(index % 2 ? secondCookie : cookie, csrf)));
+    assert.deepEqual(revokedInstallChecks.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'revoked cookies share the IP quota and cannot reach the installation adapter');
+    assert.equal((await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length, installationCountBeforeRevokedReplay, 'revoked session requests never call the Discord adapter');
 
     await stop(); await start();
     const publicOne = await call('/public-config', cookie);
@@ -345,7 +369,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await start();
     const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
     assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
-    console.log('API integration passed: OAuth, distinct valid-session quotas, revoked/expired/incomplete session fallback, forged headers, bounded pre-auth grant checks, outage behavior, and public-route limits.');
+    console.log('API integration passed: OAuth, distinct valid-session quotas including installation-check, revoked/expired/incomplete fallback, forged headers, bounded pre-auth grant checks, outage behavior, adapter call counts, and public-route limits.');
   } finally {
     await stop();
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });
@@ -355,6 +379,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await prisma.guildPresence.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.shardPresence.deleteMany({ where: { shardId: { in: [onlineShard, offlineShard] } } });
     await import('node:fs/promises').then(({ unlink }) => unlink(guildCounterFile).catch(() => undefined));
+    await import('node:fs/promises').then(({ unlink }) => unlink(installationCounterFile).catch(() => undefined));
     await prisma.$disconnect();
   }
 }
