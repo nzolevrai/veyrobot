@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { PermissionFlagsBits, type Guild } from 'discord.js';
+import { DiscordAPIError, PermissionFlagsBits, type Guild } from 'discord.js';
 import { prisma } from '@veyrobot/db';
 import { executeModerationAction, expireTemporaryBan, markInterruptedOperationsUncertain } from './index.js';
+import { submitModerationAction } from './service.js';
 
 const integration = process.env.RUN_POSTGRES_INTEGRATION === '1';
 const guildId = '987654321012345678';
@@ -46,6 +47,76 @@ async function seed(action = 'KICK') {
 async function expireLease(id: string, expiry = false) {
   await prisma.moderationCase.update({ where: { id }, data: expiry ? { expiryLeaseUntil: new Date(0) } : { claimLeaseUntil: new Date(0) } });
   await markInterruptedOperationsUncertain(prisma);
+}
+
+function f7Pair() {
+  const digits = randomUUID().replaceAll(/\D/g, '').slice(0, 17).padEnd(17, '1');
+  return { guildId: `9${digits}`, actorId: `8${digits}`, targetId: `7${digits}` };
+}
+
+function f7Discord(pair: ReturnType<typeof f7Pair>, options: { onBan?: (reason: string) => Promise<void>; onUnban?: () => Promise<void> } = {}) {
+  let banReason: string | null = null;
+  let memberPresent = true;
+  let actorCanBan = true;
+  const calls: string[] = [];
+  const notFound = (path: string, code: number) => new DiscordAPIError({ message: 'not found' }, code, 404, 'GET', path, { body: null, files: null });
+  const actor = { id: pair.actorId, permissions: { get bitfield() { return actorCanBan ? PermissionFlagsBits.BanMembers : 0n; } }, roles: { highest: { comparePositionTo: () => 1 } } };
+  const bot = { id: '687654321012345678', permissions: { bitfield: PermissionFlagsBits.BanMembers, has: (flag: bigint) => (PermissionFlagsBits.BanMembers & flag) === flag }, roles: { highest: { comparePositionTo: () => 1 } } };
+  const target = { id: pair.targetId, roles: { highest: {} }, ban: async ({ reason }: { reason: string }) => {
+    calls.push(`BAN:${reason}`);
+    banReason = reason; // Model Discord applying the mutation before the response is observed.
+    memberPresent = false;
+    await options.onBan?.(reason);
+  } };
+  const guild = {
+    id: pair.guildId,
+    ownerId: '687654321012345679',
+    members: {
+      fetch: async ({ user }: { user: string }) => {
+        if (user === pair.actorId) return actor;
+        if (banReason || !memberPresent) throw notFound(`/guilds/${pair.guildId}/members/${pair.targetId}`, 10007);
+        return target;
+      },
+      fetchMe: async () => bot,
+      unban: async () => { calls.push('UNBAN'); await options.onUnban?.(); banReason = null; memberPresent = false; },
+    },
+    bans: { fetch: async ({ user }: { user: string }) => {
+      if (user !== pair.targetId || !banReason) throw notFound(`/guilds/${pair.guildId}/bans/${pair.targetId}`, 10026);
+      return { reason: banReason };
+    }, create: async (user: string, { reason }: { reason: string }) => {
+      calls.push(`BAN:${reason}`);
+      banReason = reason;
+      memberPresent = false;
+      await options.onBan?.(reason);
+    } },
+  } as unknown as Guild;
+  return {
+    guild, calls,
+    setActorCanBan(value: boolean) { actorCanBan = value; },
+    setMemberPresent(value: boolean) { memberPresent = value; },
+    clearBanExternally() { banReason = null; memberPresent = false; },
+  };
+}
+
+async function f7Request(pair: ReturnType<typeof f7Pair>, action: 'BAN' | 'TEMPBAN' | 'UNBAN', operationId = `f7-${randomUUID()}`) {
+  await prisma.guildConfig.upsert({ where: { guildId: pair.guildId }, create: { guildId: pair.guildId, updatedBy: pair.actorId, memberActionsEnabled: true }, update: { memberActionsEnabled: true } });
+  return submitModerationAction(prisma, {
+    guildId: pair.guildId, actorId: pair.actorId, targetId: pair.targetId, action,
+    reason: `F7 integration ${action}`, ...(action === 'TEMPBAN' ? { durationMinutes: 10 } : {}), operationId,
+  });
+}
+
+async function f7Due(id: string) {
+  await prisma.moderationCase.update({ where: { id }, data: { expiresAt: new Date(0) } });
+  return prisma.moderationCase.findUniqueOrThrow({ where: { id } });
+}
+
+async function f7Cleanup(...pairs: Array<ReturnType<typeof f7Pair>>) {
+  for (const pair of pairs) {
+    await prisma.moderationCase.deleteMany({ where: { guildId: pair.guildId, targetId: pair.targetId } });
+    await prisma.guildTargetDecision.deleteMany({ where: { guildId: pair.guildId, targetId: pair.targetId } });
+    await prisma.guildConfig.deleteMany({ where: { guildId: pair.guildId } });
+  }
 }
 
 test('production executor: interruption before Discord send prevents mutation and stale write', { skip: !integration }, async () => {
@@ -207,4 +278,156 @@ test('production BAN success advances applied generation atomically with the dos
     await prisma.moderationCase.delete({ where: { id: row.id } });
     await prisma.guildTargetDecision.deleteMany({ where: { guildId, targetId } });
   }
+});
+
+test('F7 PostgreSQL: explicit failure preserves the old expiry; later decisions advance generations without stale unban', { skip: !integration }, async () => {
+  const pair = f7Pair();
+  const discord = f7Discord(pair);
+  try {
+    const first = await f7Request(pair, 'TEMPBAN');
+    await executeModerationAction({ operationId: first.operationId!, guild: discord.guild, caseRecord: first, store: prisma });
+    const dueFirst = await f7Due(first.id);
+    discord.setActorCanBan(false);
+    const failed = await f7Request(pair, 'BAN');
+    await executeModerationAction({ operationId: failed.operationId!, guild: discord.guild, caseRecord: failed, store: prisma });
+    discord.setActorCanBan(true);
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: dueFirst, store: prisma });
+    const afterFirstExpiry = await prisma.moderationCase.findUniqueOrThrow({ where: { id: first.id } });
+    const decisionAfterFailure = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: failed.id } })).status, 'failed');
+    assert.equal(failed.banGeneration, 2);
+    assert.equal(first.banGeneration, 1);
+    assert.equal(afterFirstExpiry.expiryStatus, 'succeeded');
+    assert.equal(decisionAfterFailure.generation, 2);
+    assert.equal(decisionAfterFailure.appliedGeneration, 1);
+    assert.deepEqual(discord.calls.map(call => call.split(':')[0]), ['BAN', 'UNBAN']);
+    assert.ok(discord.calls[0]!.includes(first.banMarker!));
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: dueFirst, store: prisma });
+    assert.equal(discord.calls.filter(call => call === 'UNBAN').length, 1, 'redelivery after a completed expiry is fenced by PostgreSQL');
+
+    const second = await f7Request(pair, 'TEMPBAN');
+    discord.setMemberPresent(true); // The simulated user rejoins after the confirmed expiry.
+    await executeModerationAction({ operationId: second.operationId!, guild: discord.guild, caseRecord: second, store: prisma });
+    const dueSecond = await f7Due(second.id);
+    const permanent = await f7Request(pair, 'BAN');
+    await executeModerationAction({ operationId: permanent.operationId!, guild: discord.guild, caseRecord: permanent, store: prisma });
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: dueSecond, store: prisma });
+    const [secondExpiry, decisionAfterPermanent] = await Promise.all([
+      prisma.moderationCase.findUniqueOrThrow({ where: { id: second.id } }),
+      prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } }),
+    ]);
+    assert.equal(secondExpiry.expiryStatus, 'superseded');
+    assert.equal(decisionAfterPermanent.generation, 4);
+    assert.equal(decisionAfterPermanent.appliedGeneration, 4);
+    assert.deepEqual(discord.calls.map(call => call.split(':')[0]), ['BAN', 'UNBAN', 'BAN']);
+    assert.ok(discord.calls[2]!.includes(second.banMarker!));
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: permanent.id } })).status, 'succeeded');
+  } finally { await f7Cleanup(pair); }
+});
+
+test('F7 PostgreSQL: expiry defers across an in-flight newer decision using synchronization barriers', { skip: !integration }, async () => {
+  const pair = f7Pair();
+  const entered = deferred();
+  const release = deferred();
+  const discord = f7Discord(pair, { onUnban: async () => { entered.release(); await release.promise; } });
+  let running: Promise<void> | undefined;
+  try {
+    const first = await f7Request(pair, 'TEMPBAN');
+    await executeModerationAction({ operationId: first.operationId!, guild: discord.guild, caseRecord: first, store: prisma });
+    const due = await f7Due(first.id);
+    const newer = await f7Request(pair, 'UNBAN');
+    running = executeModerationAction({ operationId: newer.operationId!, guild: discord.guild, caseRecord: newer, store: prisma });
+    void running.catch(() => undefined);
+    await entered.promise;
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: due, store: prisma });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: first.id } })).expiryStatus, 'scheduled');
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: newer.id } })).status, 'running');
+    assert.equal(discord.calls.filter(call => call === 'UNBAN').length, 0);
+    release.release();
+    await running;
+    const decision = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } });
+    assert.equal(decision.generation, 2);
+    assert.equal(decision.appliedGeneration, 2);
+    assert.equal(newer.banGeneration, 2);
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: await f7Due(first.id), store: prisma });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: first.id } })).expiryStatus, 'superseded');
+    assert.deepEqual(discord.calls.map(call => call.split(':')[0]), ['BAN', 'UNBAN']);
+  } finally { release.release(); await running?.catch(() => undefined); await f7Cleanup(pair); }
+});
+
+test('F7 PostgreSQL: uncertain newer decision quarantines only its guild expiry and redelivery does not mutate again', { skip: !integration }, async () => {
+  const pairA = f7Pair();
+  const pairB = { ...f7Pair(), targetId: pairA.targetId };
+  const discordA = f7Discord(pairA, { onBan: async () => { throw new Error('simulated response lost after Discord applied BAN'); } });
+  const discordB = f7Discord(pairB);
+  try {
+    const oldA = await f7Request(pairA, 'TEMPBAN');
+    const oldB = await f7Request(pairB, 'TEMPBAN');
+    await executeModerationAction({ operationId: oldA.operationId!, guild: discordA.guild, caseRecord: oldA, store: prisma });
+    await executeModerationAction({ operationId: oldB.operationId!, guild: discordB.guild, caseRecord: oldB, store: prisma });
+    const dueA = await f7Due(oldA.id);
+    const dueB = await f7Due(oldB.id);
+    // Simulate an external unban and a user who has left, so the subsequent BAN exercises bans.create.
+    discordA.clearBanExternally();
+    const uncertain = await f7Request(pairA, 'BAN');
+    await executeModerationAction({ operationId: uncertain.operationId!, guild: discordA.guild, caseRecord: uncertain, store: prisma });
+    await executeModerationAction({ operationId: uncertain.operationId!, guild: discordA.guild, caseRecord: uncertain, store: prisma });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: uncertain.id } })).status, 'uncertain');
+    await expireTemporaryBan({ guild: discordA.guild, caseRecord: dueA, store: prisma });
+    await expireTemporaryBan({ guild: discordB.guild, caseRecord: dueB, store: prisma });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: oldA.id } })).expiryStatus, 'uncertain');
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: oldB.id } })).expiryStatus, 'succeeded');
+    assert.deepEqual(discordA.calls.map(call => call.split(':')[0]), ['BAN', 'BAN']);
+    assert.deepEqual(discordB.calls.map(call => call.split(':')[0]), ['BAN', 'UNBAN']);
+    assert.ok(discordA.calls[0]!.includes(oldA.banMarker!));
+    assert.ok(!discordA.calls[1]!.includes(oldA.banMarker!));
+    assert.notEqual(pairA.guildId, pairB.guildId);
+    const decisionA = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pairA.guildId, targetId: pairA.targetId } } });
+    const decisionB = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pairB.guildId, targetId: pairB.targetId } } });
+    assert.deepEqual([decisionA.generation, decisionA.appliedGeneration], [2, 1]);
+    assert.deepEqual([decisionB.generation, decisionB.appliedGeneration], [1, 1]);
+  } finally { await f7Cleanup(pairA, pairB); }
+});
+
+test('F7 PostgreSQL: Discord BAN success followed by failed final transaction reconciles uncertain without replay', { skip: !integration }, async () => {
+  const pair = f7Pair();
+  const discord = f7Discord(pair);
+  try {
+    const old = await f7Request(pair, 'TEMPBAN');
+    await executeModerationAction({ operationId: old.operationId!, guild: discord.guild, caseRecord: old, store: prisma });
+    const due = await f7Due(old.id);
+    // Simulate the ban being removed externally before a new BAN of a non-member.
+    discord.clearBanExternally();
+    const newer = await f7Request(pair, 'BAN');
+    const store = {
+      moderationCase: prisma.moderationCase,
+      guildTargetDecision: prisma.guildTargetDecision,
+      $transaction: (callback: (tx: unknown) => Promise<void>) => prisma.$transaction(async tx => callback({
+        moderationCase: { updateMany: async (args: Parameters<typeof prisma.moderationCase.updateMany>[0]) => {
+          if (args.where.id === newer.id && args.data.status === 'succeeded') throw new Error('simulated PostgreSQL failure after Discord success');
+          return tx.moderationCase.updateMany(args);
+        } },
+        guildTargetDecision: tx.guildTargetDecision,
+      }) as never),
+    };
+    await assert.rejects(executeModerationAction({ operationId: newer.operationId!, guild: discord.guild, caseRecord: newer, store: store as never }), /simulated PostgreSQL failure/);
+    assert.equal(discord.calls.filter(call => call.startsWith('BAN:')).length, 2, 'one TEMPBAN plus exactly one newer BAN request');
+    const inflight = await prisma.moderationCase.findUniqueOrThrow({ where: { id: newer.id } });
+    assert.equal(inflight.status, 'running');
+    assert.equal(inflight.executionPhase, 'discord_request_inflight');
+    const beforeRecovery = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } });
+    assert.deepEqual([beforeRecovery.generation, beforeRecovery.appliedGeneration], [2, 1]);
+    assert.ok(discord.calls[0]!.includes(old.banMarker!));
+    assert.ok(!discord.calls[1]!.includes(old.banMarker!));
+    await expireLease(newer.id);
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: newer.id } })).status, 'uncertain');
+    const afterRecovery = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } });
+    assert.deepEqual([afterRecovery.generation, afterRecovery.appliedGeneration], [2, 1]);
+    await executeModerationAction({ operationId: newer.operationId!, guild: discord.guild, caseRecord: newer, store: prisma });
+    await expireTemporaryBan({ guild: discord.guild, caseRecord: due, store: prisma });
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: old.id } })).expiryStatus, 'uncertain');
+    assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: newer.id } })).status, 'uncertain');
+    assert.equal(discord.calls.filter(call => call.startsWith('BAN:')).length, 2, 'restart reconciliation and redelivery must not repeat the ambiguous mutation');
+    assert.equal(discord.calls.filter(call => call === 'UNBAN').length, 0);
+  } finally { await f7Cleanup(pair); }
 });
