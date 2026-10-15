@@ -31,7 +31,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const guildCounterFile = join(tmpdir(), `veyrobot-guild-fetch-${process.pid}-${seed}.txt`);
   await writeFile(guildCounterFile, '');
   const proxyIpSecret = 'integration-only-hmac-secret-longer-than-32-bytes';
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile };
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -62,6 +62,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await oauthStart(signed('203.0.113.11'))).status, 302, 'distinct signed anonymous clients retain separate buckets');
     await stop();
     childEnv.API_RATE_LIMIT_MAX = '90';
+    delete childEnv.API_PREAUTH_RATE_LIMIT_MAX;
     await start();
     const oauthStartResponse = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
     const state = new URL(oauthStartResponse.headers.get('location')).searchParams.get('state');
@@ -256,6 +257,9 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await stop(); await start();
     const installed = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
     assert.equal(installed.botInstalled, true); assert.equal(installed.botOnline, false);
+    for (let index = 0; index < 4; index++) assert.equal((await post(`/guilds/${guildB}/installation-check`, {})).status, 200);
+    const sixthInstallationCheck = await post(`/guilds/${guildB}/installation-check`, {});
+    assert.equal(sixthInstallationCheck.status, 429, 'the existing five-per-minute installation-check route quota remains active');
     const otherGuildConfig = await (await call(`/guilds/${guildB}/config`, cookie)).json();
     assert.equal(otherGuildConfig.language, 'fr'); assert.equal(otherGuildConfig.embedColor, '#7775F5'); assert.equal(otherGuildConfig.warningsEnabled, false);
     childEnv.MOCK_INSTALLATION_CHECK_STATUS = '429';
@@ -274,14 +278,74 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await call('/me', cookie, { headers: { 'x-forwarded-for': '203.0.113.99' } })).status, 200);
     assert.equal((await call('/me', cookie, { headers: { 'x-forwarded-for': '192.0.2.42' } })).status, 429, 'Forged forwarding headers must not bypass the session limit');
     assert.equal((await call('/me', secondCookie, { headers: { 'x-forwarded-for': '198.51.100.1' } })).status, 200, 'A second session must have a separate rate limit bucket');
+    assert.equal((await call('/me', secondCookie)).status, 200);
+    assert.equal((await call('/me', secondCookie)).status, 429, 'The second valid session has its own complete quota');
     await stop(); delete childEnv.API_RATE_LIMIT_MAX; await start();
     const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
     assert.equal(logout.status, 204);
     assert.match(logout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
     assert.equal((await call('/me', cookie)).status, 401, 'A copied cookie must be revoked server-side');
+    const logoutSecond = await call('/logout', secondCookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
+    assert.equal(logoutSecond.status, 204);
     await stop(); await start();
     assert.equal((await call('/me', cookie)).status, 401, 'Revocation must survive API restart');
-    console.log('API integration passed: OAuth to user route, direct user and guild routes, proxied logout, outage and rate limit, guild isolation, restart persistence.');
+
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const revokedResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? secondCookie : cookie)));
+    assert.deepEqual(revokedResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'revoked sessions share the same anonymous IP quota under concurrent replay');
+
+    await stop(); await start();
+    const publicOne = await call('/public-config', cookie);
+    const publicTwo = await call('/public-config', secondCookie);
+    const publicThree = await call('/public-config', cookie);
+    assert.deepEqual([publicOne.status, publicTwo.status, publicThree.status], [200, 200, 429], 'public routes use IP quota even when a stale authenticated cookie is present');
+
+    await stop(); await start();
+    const incompleteResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? secondStateCookie : stateCookie)));
+    assert.deepEqual(incompleteResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'OAuth state cookies without a complete session share the anonymous IP quota');
+
+    await stop(); childEnv.API_RATE_LIMIT_MAX = '90'; await start();
+    const createSessionCookie = async () => {
+      const startResponse = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
+      const state = new URL(startResponse.headers.get('location')).searchParams.get('state');
+      const stateCookie = startResponse.headers.get('set-cookie').split(';', 1)[0];
+      const callbackResponse = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
+      assert.equal(callbackResponse.status, 302);
+      return callbackResponse.headers.get('set-cookie').split(';', 1)[0];
+    };
+    const grantsBeforeExpiry = new Set((await prisma.sessionGrant.findMany({ select: { idHash: true } })).map(grant => grant.idHash));
+    const expiredCookieA = await createSessionCookie();
+    const expiredCookieB = await createSessionCookie();
+    const newGrantHashes = (await prisma.sessionGrant.findMany({ select: { idHash: true } })).map(grant => grant.idHash).filter(hash => !grantsBeforeExpiry.has(hash));
+    assert.equal(newGrantHashes.length, 2);
+    await prisma.sessionGrant.updateMany({ where: { idHash: { in: newGrantHashes } }, data: { expiresAt: new Date(Date.now() - 1_000) } });
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const expiredResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? expiredCookieB : expiredCookieA)));
+    assert.deepEqual(expiredResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'expired sessions share the anonymous IP quota under concurrent replay');
+
+    const savedDatabaseUrl = childEnv.DATABASE_URL;
+    childEnv.DATABASE_URL = 'postgresql://unavailable:unavailable@127.0.0.1:1/unavailable?connect_timeout=1';
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const grantFailureStatuses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie).then(response => response.status)));
+    assert.deepEqual(grantFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'a grant store outage never grants a session bucket and is still bounded by the IP quota');
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const preAuthFailureStatuses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie).then(response => response.status)));
+    assert.deepEqual(preAuthFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'the pre-auth IP limit caps database grant lookups even if the database is unavailable');
+    childEnv.DATABASE_URL = savedDatabaseUrl;
+    await stop();
+
+    childEnv.DATABASE_URL = savedDatabaseUrl;
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
+    await start();
+    const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
+    assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
+    console.log('API integration passed: OAuth, distinct valid-session quotas, revoked/expired/incomplete session fallback, forged headers, bounded pre-auth grant checks, outage behavior, and public-route limits.');
   } finally {
     await stop();
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });

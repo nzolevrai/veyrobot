@@ -17,6 +17,7 @@ import { sanitizedErrorDetails } from './error-details.js';
 const envSchema = z.object({
   API_PORT: z.coerce.number().default(4000),
   API_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(90),
+  API_PREAUTH_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(180),
   API_PUBLIC_URL: z.string().url(),
   DASHBOARD_URL: z.string().url(),
   DATABASE_URL: z.string().min(1),
@@ -41,13 +42,36 @@ const { prisma } = db;
 const trustedProxies = env.API_TRUSTED_PROXIES.split(',').map(value => value.trim()).filter(Boolean);
 const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.method, path: req.url?.split('?')[0] }) } }, trustProxy: trustedProxies.length ? trustedProxies : false, bodyLimit: 16_384 });
 app.addHook('onRequest', async (req, reply) => { reply.header('x-request-id', req.id); });
-await app.register(rateLimit, { hook: 'preHandler', max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: req => {
-  const auth = (req.session as { get(key: string): unknown } | undefined)?.get('auth') as Partial<Session> | undefined;
-  if (auth?.sessionId) return `session:${auth.sessionId}`;
+await app.register(secureSession, { key: Buffer.from(env.SESSION_KEY, 'hex'), cookieName: 'veyrobot_session', cookie: { path: '/', httpOnly: true, sameSite: 'lax', secure: env.NODE_ENV === 'production', maxAge: 60 * 60 * 8 } });
+
+const validatedSessionIds = new WeakMap<FastifyRequest, string>();
+const sessionValidationFailures = new WeakMap<FastifyRequest, { status: 401 | 503; code: string; message: string }>();
+const clientIpKey = (req: FastifyRequest) => {
   const signedIp = env.API_PROXY_CLIENT_IP_SECRET ? verifiedClientIp(req.headers, env.API_PROXY_CLIENT_IP_SECRET) : null;
   return `ip:${signedIp ?? req.ip}`;
-}, errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
-await app.register(secureSession, { key: Buffer.from(env.SESSION_KEY, 'hex'), cookieName: 'veyrobot_session', cookie: { path: '/', httpOnly: true, sameSite: 'lax', secure: env.NODE_ENV === 'production', maxAge: 60 * 60 * 8 } });
+};
+const requestRateLimitKey = (req: FastifyRequest) => {
+  const sessionId = validatedSessionIds.get(req);
+  return sessionId ? `session:${sessionId}` : clientIpKey(req);
+};
+await app.register(rateLimit, { global: false, max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: requestRateLimitKey,
+  errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
+const checkPreAuthRateLimit = app.createRateLimit({ max: env.API_PREAUTH_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: clientIpKey });
+const checkApiRateLimit = app.createRateLimit({ max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: requestRateLimitKey });
+function rejectRateLimited(req: FastifyRequest, reply: import('fastify').FastifyReply, limit: Awaited<ReturnType<typeof checkApiRateLimit>>) {
+  if (limit.isAllowed || !limit.isExceeded) return null;
+  reply.header('retry-after', String(limit.ttlInSeconds));
+  reply.header('x-ratelimit-limit', String(limit.max));
+  reply.header('x-ratelimit-remaining', '0');
+  reply.header('x-ratelimit-reset', String(limit.ttlInSeconds));
+  return reply.code(429).send({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id });
+}
+app.addHook('onRequest', async (req, reply) => {
+  const path = req.url.split('?')[0];
+  if (path === '/health' || path === '/ready') return;
+  const denied = rejectRateLimited(req, reply, await checkPreAuthRateLimit(req));
+  if (denied) return denied;
+});
 
 const api = 'https://discord.com/api/v10';
 const session = (req: import('fastify').FastifyRequest): Session | null => {
@@ -67,21 +91,31 @@ const sendError: ApiContext['sendError'] = (request, reply, error) => {
   return reply.code(status).send({ code, error: message, requestId: request.id });
 };
 app.setErrorHandler((error, request, reply) => sendError(request, reply, error));
-app.addHook('preHandler', async (req, reply) => {
+app.addHook('preValidation', async (req) => {
   const path = req.url.split('?')[0];
   if (path === '/health' || path === '/ready' || path === '/public-config' || path === '/oauth/discord/start' || path === '/oauth/discord/callback') return;
   const current = session(req);
   if (!current?.user) return;
-  if (!current.sessionId) { req.session.delete(); return reply.code(401).send({ code: 'SESSION_ABSENT', error: 'Reconnectez votre compte.', requestId: req.id }); }
+  if (!current.sessionId) { req.session.delete(); sessionValidationFailures.set(req, { status: 401, code: 'SESSION_ABSENT', message: 'Reconnectez votre compte.' }); return; }
   try {
     const grant = await prisma.sessionGrant.findUnique({ where: { idHash: sessionHash(current.sessionId) }, select: { expiresAt: true, revokedAt: true } });
     if (!grant || grant.revokedAt || grant.expiresAt <= new Date()) {
       req.session.delete();
-      return reply.code(401).send({ code: 'SESSION_ABSENT', error: 'Session expirée ou révoquée.', requestId: req.id });
+      sessionValidationFailures.set(req, { status: 401, code: 'SESSION_ABSENT', message: 'Session expirée ou révoquée.' });
+      return;
     }
+    validatedSessionIds.set(req, current.sessionId);
   } catch {
-    return reply.code(503).send({ code: 'SESSION_CHECK_UNAVAILABLE', error: 'Vérification de session indisponible.', requestId: req.id });
+    sessionValidationFailures.set(req, { status: 503, code: 'SESSION_CHECK_UNAVAILABLE', message: 'Vérification de session indisponible.' });
   }
+});
+app.addHook('preHandler', async (req, reply) => {
+  const path = req.url.split('?')[0];
+  if (path === '/health' || path === '/ready') return;
+  const denied = rejectRateLimited(req, reply, await checkApiRateLimit(req));
+  if (denied) return denied;
+  const failure = sessionValidationFailures.get(req);
+  if (failure) return reply.code(failure.status).send({ code: failure.code, error: failure.message, requestId: req.id });
 });
 async function getGuilds(s: Session): Promise<DGuild[]> {
   let response: Response;
