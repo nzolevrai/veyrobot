@@ -1,6 +1,6 @@
 # Guide de revue indépendante
 
-Ce guide décrit les preuves disponibles pour la PR [#1](https://github.com/nzolevrai/veyrobot/pull/1). **Commit de code et tests à examiner : `d60786a12426f8501b4e027a8367de2f7823348f`** (`Use Discord-free moderation types in API`). Il comprend le correctif de sous-chemin API découvert pendant la CI. Le commit qui ajoute cette mise à jour du guide est documentaire; examiner la tête de PR pour le dépôt complet et vérifier les checks CI sur cette tête. La PR reste en brouillon et ne doit pas être fusionnée automatiquement.
+Ce guide décrit les preuves disponibles pour la PR [#1](https://github.com/nzolevrai/veyrobot/pull/1). **Commit de code et tests à examiner : `bb021d4066c28d3af00f9517d183c7d0aa95e3c6`**, comparé au précédent commit relu `5219f2f99f2a1eb0446bb7aacf18c589d4f90528`. Les tests PostgreSQL F7 passent sur ce commit dans les runs [push](https://github.com/nzolevrai/veyrobot/actions/runs/38686299290) et [PR](https://github.com/nzolevrai/veyrobot/actions/runs/38686303138). La tête de PR peut ensuite inclure ce commit documentaire; vérifier aussi les checks attachés à cette tête exacte. La PR reste en brouillon et ne doit pas être fusionnée automatiquement.
 
 ChatGPT, Claude et Gemini peuvent utiliser le même SHA et les commandes ci-dessous, mais doivent examiner le code eux-mêmes. Rapporter chaque constat avec chemin/ligne, scénario reproductible, gravité et impact; signaler aussi les zones non vérifiables depuis le dépôt. Ne pas inférer une garantie à partir d’un test simulé.
 
@@ -35,11 +35,19 @@ corepack pnpm typecheck
 corepack pnpm lint
 corepack pnpm build
 $env:RUN_POSTGRES_INTEGRATION = '1'
+$env:RUN_REDIS_INTEGRATION = '1'
+$env:REDIS_URL = 'redis://127.0.0.1:6379'
 $env:RUN_DASHBOARD_ROUTE_INTEGRATION = '1'
 corepack pnpm test
 ```
 
-Utiliser une base locale jetable/sauvegardée, jamais une base de production. CI doit définir explicitement les deux drapeaux d’intégration; si l’un manque, les suites signalent qu’elles ont été ignorées et les résultats ne satisfont pas la revue. Le banc de charge dédié exige une base isolée nommée `veyrobot_arch_bench` et Redis DB 9; son protocole et ses paramètres sont dans `RELIABILITY-VERIFICATION-2026-10-14.md`.
+Utiliser une base locale jetable/sauvegardée, jamais une base de production. CI doit définir explicitement `RUN_POSTGRES_INTEGRATION`, `RUN_REDIS_INTEGRATION` et `RUN_DASHBOARD_ROUTE_INTEGRATION`; si l’un manque, les suites concernées signalent qu’elles ont été ignorées et les résultats ne satisfont pas la revue. Le banc de charge dédié exige une base isolée nommée `veyrobot_arch_bench` et Redis DB 9; son protocole et ses paramètres sont dans `RELIABILITY-VERIFICATION-2026-10-14.md`.
+
+### Preuves F7 ajoutées au commit `bb021d4`
+
+`packages/moderation/src/executor.integration.test.ts` ajoute quatre tests PostgreSQL activés par `RUN_POSTGRES_INTEGRATION=1`. Ils passent par `submitModerationAction` et l’exécuteur/expiration de production; seul l’adaptateur Discord est contrôlé. Les barrières imposent l’entrelacement d’un UNBAN en vol et d’une expiration sans temporisation arbitraire. Les scénarios couvrent l’échec explicite d’une demande plus récente, la décision active, le résultat incertain, l’échec de la transaction finale après réponse Discord simulée, la rediffusion/réconciliation, plusieurs générations, les expirations de deux frontières, et l’isolation de deux guildes partageant le même utilisateur. Les assertions contrôlent les dossiers, générations demandées/appliquées, états d’échéance et nombre/ordre des mutations simulées.
+
+CI sur `bb021d4` a exécuté les quatre nouveaux scénarios sans les ignorer; ils ont réussi en 228 ms cumulées environ dans la suite moderation (35/35 tests, 12,75 s). Les runs CI ont également exécuté les services PostgreSQL 17 et Redis 7, les migrations et la comparaison schéma/migrations, le flux API intégré, BullMQ/worker réel avec Discord contrôlé, ainsi que les tests Dashboard/proxy. Le poste Windows n’a pas de PostgreSQL, Redis ou Docker : localement, la suite moderation a obtenu 22 réussites et 13 intégrations ignorées. Le simulateur n’atteste pas le comportement REST Discord réel.
 
 ## Preuves et lacunes par axe
 
@@ -59,14 +67,23 @@ La relecture des autres chemins ne produit pas à elle seule une preuve exhausti
 | Reprise après panne | Tests PostgreSQL/BullMQ, processus enfant interrompu, fencing, restauration isolée et quarantaine | Essai de restauration dans l’environnement d’exploitation et observation des preuves Discord avant réactivation |
 | Architecture et maintenabilité | `tools/check-boundaries.mjs`, lint, TypeScript, revue des points d’entrée et du flux PostgreSQL→dispatcher→worker | Avis indépendants sur les frontières métier/Discord et les décisions de configuration |
 | Performance et ressources | Campagne corrigée : 9 300 offres, 8 500 acceptées, 800 refus, 0 échec/incertitude; p95 total calme 3,960 s, dominante 22,185 s (sérialisation 22,168 s), échéances 1,195 s; RSS 245,9→113,8 Mo après drainage/repos. Détails et protocole dans `RELIABILITY-VERIFICATION-2026-10-14.md`. | Aucun chiffre de simulation ne démontre une capacité Gateway/REST Discord ou un nombre de serveurs en production; pools/attente maximaux ne sont pas des percentiles |
-| Tests et reproductibilité | `typecheck`, `lint`, `build` réussis; `test` complet avec les deux drapeaux d’intégration sur PostgreSQL 17 neuf. Résultats : db10, contracts3, moderation25 (dont interruptions réelles contre PostgreSQL), API cache3+smoke+intégration, bot2, dashboard13. Le serveur Next construit a exécuté l’intégration OAuth/proxy lente. La CI doit définir `RUN_POSTGRES_INTEGRATION=1` et `RUN_DASHBOARD_ROUTE_INTEGRATION=1`; vérifier le check attaché à la tête PR. | Validation visuelle navigateur absente; environnement Linux CI et poste Windows peuvent différer |
+| Tests et reproductibilité | Sur `bb021d4`, CI a réussi migrations et diff schéma, `typecheck`, `build`, `lint` et tous les tests sans saut : db 10/10, contracts 4/4, moderation 35/35, API cache 3/3 + smoke/intégration, bot 5/5 dont Redis/BullMQ, Dashboard 13/13 et scénario proxy construit. Les runs push et PR sont verts. | La tête documentaire doit encore avoir son propre run CI; validation visuelle navigateur et Discord réel absentes |
 | Exploitation et observabilité | snapshots agrégés RSS/heap/boucle, files/âges, pool et états incertains; runbook de restauration | Alertes, sauvegarde planifiée et restauration éprouvée par l’exploitant |
 
 ## Critères de fusion
 
 Recommander la fusion uniquement si la CI est verte sur le SHA examiné, si l’intégration PostgreSQL et le serveur Next sont exécutés, et si chaque défaut de sécurité, perte de données ou rejeu dangereux est corrigé ou explicitement bloquant. Les évaluateurs peuvent conclure qu’un axe nécessite des corrections; cette grille ne prédéfinit aucune note.
 
-Le socle mesuré est un monolithe modulaire mono-processus bot avec API séparée, admission bornée et exécuteur simulé. Le déploiement massif n’est pas validé. Ne pas activer plusieurs processus avec le même token avant propriété/routage des shards, coordination REST globale entre API et bot, démarrage progressif et reprise multi-instance. Une revue ou validation navigateur/Discord ne doit effectuer aucune sanction ni suppression réelle.
+Le socle mesuré est un monolithe modulaire avec un processus bot, une API séparée, admission bornée et tests de l’exécuteur de production contre un adaptateur Discord contrôlé. Le déploiement massif n’est pas validé. Ne pas activer plusieurs processus avec le même token avant propriété/routage des shards, coordination REST globale entre API et bot, démarrage progressif et reprise multi-instance. Une revue ou validation navigateur/Discord ne doit effectuer aucune sanction ni suppression réelle.
+
+## Limites restantes avant production
+
+- Le rate limit des routes publiques reste partagé selon l’adresse que l’infrastructure transmet à Fastify; le proxy Next ne garantit pas une IP cliente attestée dans tous les hébergements.
+- Aucun parcours visuel complet n’a été validé dans un navigateur.
+- Aucun appel Discord réel n’a été exécuté; permissions, latences et résultats REST sont simulés dans ces tests.
+- La mémoire Gateway par serveur et l’effet réel des caches discord.js restent à mesurer avec un bot connecté et des guildes représentatives.
+- La restauration est testée isolément, mais la procédure doit être répétée par l’exploitant sur son environnement et inclure la réconciliation manuelle avant reprise des mutations.
+- La CSP conserve `unsafe-inline`; son durcissement doit être testé contre le rendu Next avant activation.
 
 ## Revue guidée manuelle
 
