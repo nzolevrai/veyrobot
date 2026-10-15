@@ -201,14 +201,27 @@ export async function executeModerationAction(input: {
   const data = { status: finalStatus, completedAt: new Date(), result: finalResult, ...finalExpiryData };
   const banAction = caseRecord.action === 'BAN' || caseRecord.action === 'TEMPBAN' || caseRecord.action === 'UNBAN';
   if (banAction && finalStatus === 'succeeded' && caseRecord.banGeneration != null && store.$transaction && store.guildTargetDecision) {
+    const appliedGeneration = caseRecord.banGeneration;
     await store.$transaction(async tx => {
       const completed = await tx.moderationCase.updateMany({ where, data });
       if (completed.count !== 1) throw new Error('Moderation claim expired before durable completion.');
       const applied = await tx.guildTargetDecision!.updateMany({
-        where: { guildId: caseRecord.guildId, targetId: caseRecord.targetId, generation: caseRecord.banGeneration },
-        data: { appliedGeneration: caseRecord.banGeneration, appliedOperationId: caseRecord.operationId },
+        // A request may advance `generation` while Discord is processing this
+        // operation. Record this confirmed application only while no equal or
+        // newer generation has already been durably applied. Keep the newer
+        // requested generation and never move appliedGeneration backwards.
+        where: { guildId: caseRecord.guildId, targetId: caseRecord.targetId, generation: { gte: appliedGeneration }, appliedGeneration: { lt: appliedGeneration } },
+        data: { appliedGeneration, appliedOperationId: caseRecord.operationId },
       });
-      if (applied.count !== 1) throw new Error('Ban decision generation changed before durable completion.');
+      if (applied.count !== 1) {
+        const currentDecision = await tx.guildTargetDecision!.findUnique({ where: { guildId_targetId: { guildId: caseRecord.guildId, targetId: caseRecord.targetId } } });
+        // An already-applied newer decision owns the current target state. The
+        // case still records Discord's acknowledged result, but cannot replace
+        // that newer applied-generation pointer.
+        if (!currentDecision || currentDecision.generation < appliedGeneration || (currentDecision.appliedGeneration ?? 0) < appliedGeneration) {
+          throw new Error('Ban decision generation changed before durable completion.');
+        }
+      }
     });
   } else await store.moderationCase.updateMany({ where, data });
 }
