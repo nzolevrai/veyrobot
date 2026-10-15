@@ -342,7 +342,7 @@ test('F7 PostgreSQL: expiry defers across an in-flight newer decision using sync
     await expireTemporaryBan({ guild: discord.guild, caseRecord: due, store: prisma });
     assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: first.id } })).expiryStatus, 'scheduled');
     assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: newer.id } })).status, 'running');
-    assert.equal(discord.calls.filter(call => call === 'UNBAN').length, 0);
+    assert.equal(discord.calls.filter(call => call === 'UNBAN').length, 1, 'only the newer UNBAN call is in flight; expiry has not issued another');
     release.release();
     await running;
     const decision = await prisma.guildTargetDecision.findUniqueOrThrow({ where: { guildId_targetId: { guildId: pair.guildId, targetId: pair.targetId } } });
@@ -358,7 +358,8 @@ test('F7 PostgreSQL: expiry defers across an in-flight newer decision using sync
 test('F7 PostgreSQL: uncertain newer decision quarantines only its guild expiry and redelivery does not mutate again', { skip: !integration }, async () => {
   const pairA = f7Pair();
   const pairB = { ...f7Pair(), targetId: pairA.targetId };
-  const discordA = f7Discord(pairA, { onBan: async () => { throw new Error('simulated response lost after Discord applied BAN'); } });
+  let loseNewBanResponse = false;
+  const discordA = f7Discord(pairA, { onBan: async () => { if (loseNewBanResponse) throw new Error('simulated response lost after Discord applied BAN'); } });
   const discordB = f7Discord(pairB);
   try {
     const oldA = await f7Request(pairA, 'TEMPBAN');
@@ -370,6 +371,7 @@ test('F7 PostgreSQL: uncertain newer decision quarantines only its guild expiry 
     // Simulate an external unban and a user who has left, so the subsequent BAN exercises bans.create.
     discordA.clearBanExternally();
     const uncertain = await f7Request(pairA, 'BAN');
+    loseNewBanResponse = true;
     await executeModerationAction({ operationId: uncertain.operationId!, guild: discordA.guild, caseRecord: uncertain, store: prisma });
     await executeModerationAction({ operationId: uncertain.operationId!, guild: discordA.guild, caseRecord: uncertain, store: prisma });
     assert.equal((await prisma.moderationCase.findUniqueOrThrow({ where: { id: uncertain.id } })).status, 'uncertain');
