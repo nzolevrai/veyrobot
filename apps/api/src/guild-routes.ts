@@ -22,7 +22,7 @@ app.get('/guilds', async (req, reply) => {
     const failure = cause as ApiFailure;
     const status = failure.statusCode ?? 503;
     if (failure.retryAfter) reply.header('retry-after', failure.retryAfter);
-    app.log.warn({ requestId: req.id, endpoint: '/guilds', status, code: failure.code ?? 'INTERNAL_ERROR' }, 'guild list failed');
+    app.log.warn({ requestId: req.id, endpoint: '/guilds', status, code: failure.code ?? 'INTERNAL_ERROR', ...(failure.retryAfter ? { retryAfter: failure.retryAfter } : {}) }, 'guild list failed');
     return reply.code(status).send({ code: failure.code ?? 'INTERNAL_ERROR', error: failure.statusCode ? failure.message : 'Impossible de lire les serveurs actuellement.', requestId: req.id });
   }
 });

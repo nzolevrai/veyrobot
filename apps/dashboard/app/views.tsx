@@ -1,8 +1,10 @@
 'use client';
 
 import { ArrowRight, ChevronLeft, ChevronRight, Gavel, LoaderCircle, MessageSquareWarning, Search, SlidersHorizontal, Wifi, WifiOff } from 'lucide-react';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { CaseTable, ConfirmDialog, GuildIcon, Notice, PageHeader, statusLabels } from './components';
+import { createWarningThenRefresh } from './warning-submission';
+import { failureReference, historyFailureMessage, readApiFailure, retryAfterDelayMs } from './api-failure';
 import type { Guild, ModerationCase, View } from './dashboard-types';
 
 export function OverviewView({ guild, cases, loading, onView }: { guild: Guild; cases: ModerationCase[]; loading: boolean; onView: (view: View) => void }) {
@@ -36,18 +38,38 @@ export function CasesView({ guild, onUnauthorized }: { guild: Guild; onUnauthori
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
+  const [retryUntil, setRetryUntil] = useState(0);
+  const retryUntilRef = useRef(0);
+  useEffect(() => {
+    const delay = retryUntil - Date.now();
+    if (delay <= 0) return;
+    const timer = setTimeout(() => setRetryUntil(0), delay);
+    return () => clearTimeout(timer);
+  }, [retryUntil]);
 
   useEffect(() => {
     const controller = new AbortController();
+    if (Date.now() < retryUntilRef.current) { setLoading(false); return () => controller.abort(); }
     const params = new URLSearchParams({ limit: '25' });
     if (cursor) params.set('cursor', cursor);
     if (targetFilter) params.set('targetId', targetFilter);
-    fetch(`/api/guilds/${guild.id}/cases?${params}`, { signal: controller.signal }).then(async response => {
-      if (response.status === 401) { onUnauthorized(); return; }
-      if (!response.ok) { setItems([]); setNextCursor(null); throw new Error(response.status === 403 ? 'Vous n’avez plus accès aux dossiers de ce serveur.' : 'Impossible de charger les dossiers de ce serveur.'); }
-      const data = await response.json() as { items: ModerationCase[]; nextCursor: string | null };
-      setItems(data.items); setNextCursor(data.nextCursor); setError('');
-    }).catch(cause => { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Erreur de chargement.'); }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    void (async () => {
+      try {
+        const response = await fetch(`/api/guilds/${guild.id}/cases?${params}`, { signal: controller.signal });
+        if (response.status === 401) { onUnauthorized(); return; }
+        if (!response.ok) {
+          const failure = await readApiFailure(response);
+          const delay = retryAfterDelayMs(failure.retryAfter);
+          if (delay !== undefined && delay > 0) { const until = Date.now() + delay; retryUntilRef.current = until; setRetryUntil(until); }
+          setError(`${historyFailureMessage(failure)}${failureReference(failure)}`);
+          return;
+        }
+        const data = await response.json() as { items: ModerationCase[]; nextCursor: string | null };
+        if (controller.signal.aborted) return;
+        setItems(data.items); setNextCursor(data.nextCursor); setError(''); retryUntilRef.current = 0; setRetryUntil(0);
+      } catch (cause) { if (!controller.signal.aborted) setError(`Historique temporairement impossible à actualiser. Les dossiers affichés sont conservés. ${cause instanceof Error ? cause.message : 'Erreur de chargement.'}`); }
+      finally { if (!controller.signal.aborted) setLoading(false); }
+    })();
     return () => controller.abort();
   }, [guild.id, cursor, targetFilter, revision, onUnauthorized]);
 
@@ -62,13 +84,24 @@ export function CasesView({ guild, onUnauthorized }: { guild: Guild; onUnauthori
     <PageHeader title="Dossiers et historique" description="Recherchez les décisions enregistrées pour ce serveur." />
     <section className="surface section-panel"><div className="section-heading"><div><h2>Rechercher un dossier</h2><p>Filtrez par membre sur toutes les pages, puis affinez la page affichée.</p></div></div><form className="case-search-form" onSubmit={applyTarget}><label className="field"><span>ID utilisateur Discord</span><input className="text-input" value={targetInput} onChange={event => setTargetInput(event.target.value)} inputMode="numeric" placeholder="Tous les membres" /></label><button className="button button-secondary" type="submit">Rechercher</button></form><div className="case-local-filters"><label className="search-field"><Search size={16} aria-hidden="true" /><span className="sr-only">Chercher dans la page affichée</span><input value={localQuery} onChange={event => setLocalQuery(event.target.value)} placeholder="Dans cette page : raison, ID…" /></label><label className="sr-label"><span className="sr-only">Action</span><select value={actionFilter} onChange={event => setActionFilter(event.target.value)}><option>Toutes</option><option value="WARN">Avertissement</option><option value="TIMEOUT">Timeout</option><option value="KICK">Expulsion</option><option value="BAN">Bannissement</option><option value="TEMPBAN">Ban temporaire</option><option value="UNBAN">Débannissement</option><option value="PURGE_MESSAGES">Suppression</option><option value="SLOWMODE">Slowmode</option><option value="LOCK_CHANNEL">Verrouillage</option><option value="UNLOCK_CHANNEL">Restauration</option></select></label><label className="sr-label"><span className="sr-only">État</span><select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option>Tous</option><option value="requested">Demandé</option><option value="running">En cours</option><option value="completed">Enregistré</option><option value="succeeded">Réussi</option><option value="failed">Échoué</option><option value="uncertain">À vérifier</option></select></label></div></section>
     {error && <Notice tone="error">{error}</Notice>}
-    <section className="surface section-panel history-panel"><div className="section-heading"><div><h2>Historique</h2><p>Page {history.length + 1} · {items.length} dossier(s) chargé(s)</p></div><button className="text-button" type="button" onClick={() => { setLoading(true); setRevision(value => value + 1); }}>Actualiser</button></div>{loading ? <div className="loading-row"><LoaderCircle className="spin" size={18} /> Chargement des dossiers…</div> : <CaseTable items={displayed} emptyText="Aucun dossier ne correspond aux filtres de cette page." />}<div className="pagination"><button className="button button-secondary" type="button" disabled={!history.length || loading} onClick={() => { const previous = history.at(-1) ?? null; setHistory(old => old.slice(0, -1)); setCursor(previous); setLoading(true); }}><ChevronLeft size={16} /> Précédent</button><span>Page {history.length + 1}</span><button className="button button-secondary" type="button" disabled={!nextCursor || loading} onClick={() => { setHistory(old => [...old, cursor]); setCursor(nextCursor); setLoading(true); }}>Suivant <ChevronRight size={16} /></button></div></section>
+    <section className="surface section-panel history-panel"><div className="section-heading"><div><h2>Historique</h2><p>Page {history.length + 1} · {items.length} dossier(s) chargé(s)</p></div><button className="text-button" type="button" disabled={loading || retryUntil > Date.now()} onClick={() => { if (Date.now() < retryUntilRef.current) return; setLoading(true); setRevision(value => value + 1); }}>{retryUntil > Date.now() ? 'Attente de Retry-After…' : 'Actualiser'}</button></div>{error && <Notice tone="warning">{error}</Notice>}{loading ? <div className="loading-row"><LoaderCircle className="spin" size={18} /> Chargement des dossiers…</div> : <CaseTable items={displayed} emptyText="Aucun dossier ne correspond aux filtres de cette page." />}<div className="pagination"><button className="button button-secondary" type="button" disabled={!history.length || loading} onClick={() => { const previous = history.at(-1) ?? null; setHistory(old => old.slice(0, -1)); setCursor(previous); setLoading(true); }}><ChevronLeft size={16} /> Précédent</button><span>Page {history.length + 1}</span><button className="button button-secondary" type="button" disabled={!nextCursor || loading} onClick={() => { setHistory(old => [...old, cursor]); setCursor(nextCursor); setLoading(true); }}>Suivant <ChevronRight size={16} /></button></div></section>
   </>;
 }
 
-export function WarningsView({ guild, enabled, csrf, recentCases, loading, onCreated, onUnauthorized, hideHeader = false }: { guild: Guild; enabled: boolean; csrf: string; recentCases: ModerationCase[]; loading: boolean; onCreated: () => Promise<void>; onUnauthorized: () => void; hideHeader?: boolean }) {
+export function WarningsView({ guild, enabled, csrf, recentCases, loading, onCreated, onUnauthorized, hideHeader = false }: { guild: Guild; enabled: boolean; csrf: string; recentCases: ModerationCase[]; loading: boolean; onCreated: () => Promise<boolean>; onUnauthorized: () => void; hideHeader?: boolean }) {
   const [target, setTarget] = useState(''); const [reason, setReason] = useState(''); const [busy, setBusy] = useState(false); const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
-  const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); setBusy(true); setNotice(null); try { const response = await fetch(`/api/guilds/${guild.id}/warnings`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetId: target, reason, csrf }) }); if (response.status === 401) { onUnauthorized(); return; } const data = await response.json() as { id?: string; error?: string }; if (!response.ok) throw new Error(data.error ?? 'Impossible d’enregistrer cet avertissement.'); setTarget(''); setReason(''); setNotice({ tone: 'success', text: `Avertissement enregistré dans le dossier ${data.id}.` }); await onCreated(); } catch (cause) { setNotice({ tone: 'error', text: cause instanceof Error ? cause.message : 'Erreur de connexion.' }); } finally { setBusy(false); } };
+  const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); setBusy(true); setNotice(null); try {
+    const result = await createWarningThenRefresh(async () => {
+      const response = await fetch(`/api/guilds/${guild.id}/warnings`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetId: target, reason, csrf }) });
+      if (response.status === 401) { onUnauthorized(); return null; }
+      const data = await response.json() as { id?: string; error?: string };
+      if (!response.ok || !data.id) throw new Error(data.error ?? 'Impossible d’enregistrer cet avertissement.');
+      return data;
+    }, onCreated);
+    if (!result.created) return;
+    setTarget(''); setReason('');
+    setNotice({ tone: 'success', text: `Avertissement enregistré dans le dossier ${result.created.id}.` });
+  } catch (cause) { setNotice({ tone: 'error', text: cause instanceof Error ? cause.message : 'Erreur de connexion.' }); } finally { setBusy(false); } };
   return <>{!hideHeader && <PageHeader title="Avertissements" description="Ajoutez un avertissement et consultez les derniers dossiers concernés." />}<div className="form-layout"><section className="surface section-panel form-panel"><div className="section-heading"><div><h2>Nouvel avertissement</h2><p>Un avertissement crée une note dans le dossier du membre.</p></div></div>{guild.botOnline && enabled ? <form onSubmit={event => void submit(event)}><label className="field"><span>ID utilisateur Discord</span><input className="text-input" value={target} onChange={event => setTarget(event.target.value)} inputMode="numeric" pattern="[0-9]{17,20}" minLength={17} maxLength={20} required placeholder="123456789012345678" /></label><label className="field"><span>Raison</span><textarea className="text-input textarea-input" value={reason} onChange={event => setReason(event.target.value)} required maxLength={500} placeholder="Décrivez les faits observés" /></label><div className="form-footer"><span>{reason.length}/500 caractères</span><button className="button button-primary" disabled={busy} type="submit">{busy ? <><LoaderCircle className="spin" size={17} /> Enregistrement…</> : <><MessageSquareWarning size={17} /> Enregistrer</>}</button></div></form> : <Notice tone="warning">Activez le module Avertissements et attendez que le bot soit en ligne pour créer un avertissement.</Notice>}{notice && <Notice tone={notice.tone}>{notice.text}</Notice>}</section><section className="surface section-panel"><div className="section-heading"><div><h2>Avertissements récents</h2><p>Cette liste montre les avertissements parmi les 25 derniers dossiers.</p></div></div>{loading && !recentCases.length ? <div className="loading-row"><LoaderCircle className="spin" size={18} /> Chargement…</div> : <CaseTable items={recentCases.filter(item => item.action === 'WARN')} emptyText="Aucun avertissement parmi les dossiers récents." />}</section></div></>;
 }
 
@@ -77,7 +110,7 @@ const memberActions: { value: ActionKind; label: string }[] = [{ value: 'TIMEOUT
 const channelActions: { value: ActionKind; label: string }[] = [{ value: 'PURGE_MESSAGES', label: 'Supprimer des messages' }, { value: 'SLOWMODE', label: 'Configurer le slowmode' }, { value: 'LOCK_CHANNEL', label: 'Verrouiller un salon' }, { value: 'UNLOCK_CHANNEL', label: 'Restaurer un salon' }];
 const destructiveActions: ActionKind[] = ['KICK', 'BAN', 'TEMPBAN', 'UNBAN', 'PURGE_MESSAGES', 'LOCK_CHANNEL', 'UNLOCK_CHANNEL'];
 
-export function ActionsView({ guild, enabledMembers, enabledChannels, csrf, initialGroup, recentCases, onCreated, onUnauthorized, onGroupChange, hideHeader = false }: { guild: Guild; enabledMembers: boolean; enabledChannels: boolean; csrf: string; initialGroup: 'members' | 'channels'; onGroupChange?: (group: 'members' | 'channels') => void; hideHeader?: boolean; recentCases: ModerationCase[]; onCreated: () => Promise<void>; onUnauthorized: () => void }) {
+export function ActionsView({ guild, enabledMembers, enabledChannels, csrf, initialGroup, recentCases, onCreated, onUnauthorized, onGroupChange, hideHeader = false }: { guild: Guild; enabledMembers: boolean; enabledChannels: boolean; csrf: string; initialGroup: 'members' | 'channels'; onGroupChange?: (group: 'members' | 'channels') => void; hideHeader?: boolean; recentCases: ModerationCase[]; onCreated: () => Promise<boolean>; onUnauthorized: () => void }) {
   const [group, setGroup] = useState(initialGroup);
   const [action, setAction] = useState<ActionKind>(initialGroup === 'members' ? 'TIMEOUT' : 'PURGE_MESSAGES');
   const [target, setTarget] = useState(''); const [reason, setReason] = useState(''); const [duration, setDuration] = useState('60'); const [count, setCount] = useState('50'); const [author, setAuthor] = useState(''); const [slowmode, setSlowmode] = useState('5');

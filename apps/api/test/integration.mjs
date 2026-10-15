@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
@@ -24,7 +27,9 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const offlineShard = onlineShard + 1;
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC };
+  const guildCounterFile = join(tmpdir(), `veyrobot-guild-fetch-${process.pid}-${seed}.txt`);
+  await writeFile(guildCounterFile, '');
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -195,6 +200,21 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await put(`/guilds/${guildA}/config`, { kind: 'module', moduleId: 'warnings', enabled: false, version: 0 })).status, 409);
     const warning = await post(`/guilds/${guildA}/warnings`, { targetId, reason: 'API integration warning' });
     assert.equal(warning.status, 201); caseId = (await warning.json()).id;
+    const guildFetchesAfterWarning = (await readFile(guildCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length;
+    const casesAfterWarning = await call(`/guilds/${guildA}/cases`, cookie);
+    assert.equal(casesAfterWarning.status, 200, 'A successful fresh mutation authorization must warm the cache for its immediate history refresh');
+    assert.ok((await casesAfterWarning.json()).items.some(item => item.id === caseId));
+    assert.equal((await readFile(guildCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length, guildFetchesAfterWarning, 'The post-write history read must not issue a redundant OAuth guild-list call');
+    childEnv.MOCK_GUILDS_STATUS = '429';
+    await stop(); await start();
+    const limitedReads = await Promise.all(Array.from({ length: 8 }, () => call(`/guilds/${guildA}/cases`, cookie)));
+    assert.ok(limitedReads.every(response => response.status === 429), 'A post-write history read may be rate limited without changing the saved warning');
+    assert.ok(limitedReads.every(response => response.headers.get('retry-after') === '2'), 'Discord Retry-After must be returned unchanged');
+    const guildFetchesAfterLimit = (await readFile(guildCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length;
+    assert.equal(guildFetchesAfterLimit - guildFetchesAfterWarning, 1, 'Concurrent reads and immediate retries must share one OAuth guild request during Retry-After');
+    assert.equal((await call('/me', cookie)).status, 200, 'A Discord 429 must not destroy the authenticated session');
+    assert.equal(await prisma.moderationCase.count({ where: { id: caseId, guildId: guildA, action: 'WARN' } }), 1, 'The successful warning must remain stored exactly once after history refresh fails');
+    await stop(); delete childEnv.MOCK_GUILDS_STATUS; await start();
     assert.ok((await (await call(`/guilds/${guildA}/cases`, cookie)).json()).items.some(item => item.id === caseId));
     assert.ok(!(await (await call(`/guilds/${guildC}/cases`, cookie)).json()).items.some(item => item.id === caseId));
     const saved = await put(`/guilds/${guildA}/config`, { kind: 'settings', version: enabled.version, settings: { language: 'en', timeZone: 'Europe/Paris', embedColor: '#123ABC' } });
@@ -217,6 +237,8 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal(disabled.warningsEnabled, false);
     assert.equal((await post(`/guilds/${guildA}/warnings`, { targetId, reason: 'after disable' })).status, 400);
     assert.ok((await (await call(`/guilds/${guildA}/cases`, cookie)).json()).items.some(item => item.id === caseId));
+    childEnv.MOCK_INSTALLATION_CHECK_STATUS = '200';
+    await stop(); await start();
     const installed = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
     assert.equal(installed.botInstalled, true); assert.equal(installed.botOnline, false);
     const otherGuildConfig = await (await call(`/guilds/${guildB}/config`, cookie)).json();
@@ -247,6 +269,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await prisma.guildConfig.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildPresence.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.shardPresence.deleteMany({ where: { shardId: { in: [onlineShard, offlineShard] } } });
+    await import('node:fs/promises').then(({ unlink }) => unlink(guildCounterFile).catch(() => undefined));
     await prisma.$disconnect();
   }
 }

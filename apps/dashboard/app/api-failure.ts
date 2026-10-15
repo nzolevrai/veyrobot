@@ -11,6 +11,17 @@ export function failureMessage(failure: ApiFailure): string {
     default: return failure.status >= 500 ? 'Le service est temporairement indisponible. Votre session est conservée.' : 'La requête a été refusée.';
   }
 }
+export function retryAfterDelayMs(value: string | undefined, now = Date.now()): number | undefined {
+  if (value === undefined) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
+}
+export function historyFailureMessage(failure: ApiFailure): string {
+  if (failure.code === 'DISCORD_RATE_LIMIT') return 'Historique temporairement impossible à actualiser : Discord limite la vérification des serveurs. Les dossiers déjà affichés sont conservés.';
+  return `Historique temporairement impossible à actualiser. Les dossiers déjà affichés sont conservés. ${failureMessage(failure)}`;
+}
 export async function readApiFailure(response: Response): Promise<ApiFailure> {
   let body: { code?: unknown; requestId?: unknown } = {};
   try { body = await response.json() as typeof body; } catch { /* réponse non JSON */ }

@@ -57,7 +57,7 @@ const sendError: ApiContext['sendError'] = (request, reply, error) => {
   const status = error instanceof z.ZodError || (error instanceof Error && error.name === 'ModerationRuleError') ? 400 : candidate.statusCode ?? (candidate.code === 'P2002' || candidate.code === 'P2034' ? 409 : candidate.code === 'MODERATION_BACKLOG_LIMIT' ? 429 : dependencyUnavailable ? 503 : 500);
   const code = error instanceof z.ZodError ? 'VALIDATION_ERROR' : candidate.code ?? (status === 401 ? 'SESSION_ABSENT' : status === 403 ? 'ACCESS_DENIED' : status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_FAILED');
   if (candidate.retryAfter) reply.header('retry-after', candidate.retryAfter);
-  app.log.warn({ requestId: request.id, status, code, errorName: error instanceof Error ? error.name : 'unknown' }, 'API request failed');
+  app.log.warn({ requestId: request.id, status, code, ...(candidate.retryAfter ? { retryAfter: candidate.retryAfter } : {}), errorName: error instanceof Error ? error.name : 'unknown' }, 'API request failed');
   const message = status === 400 ? 'Requête invalide.' : status === 401 ? 'Reconnectez votre compte.' : status === 403 ? 'Accès refusé.' : status === 409 ? 'Conflit avec une opération existante.' : status === 429 ? 'Trop de requêtes ou capacité atteinte.' : status === 503 || status === 502 ? 'Service temporairement indisponible.' : 'Erreur interne.';
   return reply.code(status).send({ code, error: message, requestId: request.id });
 };
@@ -89,14 +89,17 @@ async function getGuilds(s: Session): Promise<DGuild[]> {
 }
 const guildListCache = new GuildListCache<DGuild[]>();
 async function getCachedGuilds(s: Session): Promise<DGuild[]> {
-  const key = createHash('sha256').update(`${s.user.id}:${s.accessToken}`).digest('hex');
-  return guildListCache.get(key, () => getGuilds(s));
+  return guildListCache.get(guildListCacheKey(s), () => getGuilds(s));
 }
+async function getFreshGuilds(s: Session): Promise<DGuild[]> {
+  return guildListCache.refresh(guildListCacheKey(s), () => getGuilds(s));
+}
+function guildListCacheKey(s: Session): string { return createHash('sha256').update(`${s.user.id}:${s.accessToken}`).digest('hex'); }
 async function authorizeGuild(req: FastifyRequest, guildId: string, fresh = false): Promise<{ session: Session; guild: DGuild }> {
   const s = session(req);
   if (!s) throw Object.assign(new Error('Connexion Discord requise.'), { statusCode: 401, code: 'SESSION_ABSENT' });
   if (!/^\d{17,20}$/.test(guildId)) throw Object.assign(new Error('Identifiant de serveur invalide.'), { statusCode: 400, code: 'INVALID_GUILD_ID' });
-  const guild = (await (fresh ? getGuilds(s) : getCachedGuilds(s))).find(g => g.id === guildId);
+  const guild = (await (fresh ? getFreshGuilds(s) : getCachedGuilds(s))).find(g => g.id === guildId);
   if (!guild || !canManageGuild(guild.owner, guild.permissions)) throw Object.assign(new Error('Vous devez être propriétaire du serveur ou disposer de Gérer le serveur.'), { statusCode: 403, code: 'ACCESS_DENIED' });
   return { session: s, guild };
 }

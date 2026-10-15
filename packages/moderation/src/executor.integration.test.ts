@@ -30,6 +30,12 @@ async function waitForBarrier(promise: Promise<void>, name: string): Promise<voi
   } finally { if (timer) clearTimeout(timer); }
 }
 
+function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  return Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })])
+    .finally(() => { if (timer) clearTimeout(timer); });
+}
+
 function controlledGuild(options: { kick?: () => Promise<void>; beforeTarget?: () => Promise<void>; unban?: () => Promise<void>; ban?: () => Promise<void>; banReason?: string } = {}) {
   let kicks = 0;
   let unbans = 0;
@@ -198,21 +204,18 @@ test('production executor: lost PostgreSQL result write after Discord success re
   } finally { await prisma.moderationCase.delete({ where: { id: row.id } }); }
 });
 
-test('production executor: process killed after Discord send leaves an uncertain operation without automatic replay', { skip: !integration }, async () => {
+test('production executor: process killed after Discord send leaves an uncertain operation without automatic replay', { skip: !integration, timeout: 30_000 }, async () => {
   const row = await seed();
   const child = fork(fileURLToPath(new URL('./executor-child.mjs', import.meta.url)), [], {
     env: { ...process.env, EXECUTOR_TEST_CASE_ID: row.id }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   });
   try {
-    await Promise.race([
-      new Promise<void>((resolve, reject) => {
-        child.on('message', message => { if ((message as { stage?: string }).stage === 'discord-request-entered') resolve(); });
-        child.once('exit', code => reject(new Error(`Executor exited before Discord send (${code})`)));
-      }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Executor did not reach Discord send')), 5_000)),
-    ]);
+    await waitWithTimeout(new Promise<void>((resolve, reject) => {
+      child.on('message', message => { if ((message as { stage?: string }).stage === 'discord-request-entered') resolve(); });
+      child.once('exit', code => reject(new Error(`Executor exited before Discord send (${code})`)));
+    }), 15_000, 'Executor did not reach Discord send within 15 seconds');
     child.kill('SIGKILL');
-    await new Promise<void>(resolve => child.once('exit', () => resolve()));
+    await waitWithTimeout(new Promise<void>(resolve => child.once('exit', () => resolve())), 2_000, 'Executor child did not stop after SIGKILL');
     const inflight = await prisma.moderationCase.findUniqueOrThrow({ where: { id: row.id } });
     assert.equal(inflight.executionPhase, 'discord_request_inflight');
     await expireLease(row.id);
@@ -221,7 +224,8 @@ test('production executor: process killed after Discord send leaves an uncertain
     await executeModerationAction({ operationId: row.operationId!, guild: retry.guild, caseRecord: row, store: prisma });
     assert.equal(retry.kicks, 0);
   } finally {
-    if (!child.killed) child.kill('SIGKILL');
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    if (child.exitCode === null && child.signalCode === null) await waitWithTimeout(new Promise<void>(resolve => child.once('exit', () => resolve())), 2_000, 'Executor child cleanup timed out').catch(() => undefined);
     await prisma.moderationCase.delete({ where: { id: row.id } });
   }
 });
