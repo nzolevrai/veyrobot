@@ -26,17 +26,22 @@ app.get('/guilds', async (req, reply) => {
     return reply.code(status).send({ code: failure.code ?? 'INTERNAL_ERROR', error: failure.statusCode ? failure.message : 'Impossible de lire les serveurs actuellement.', requestId: req.id });
   }
 });
-app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/installation-check', async (req, reply) => {
+app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/installation-check', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (req, reply) => {
   try {
     const { session: s } = await authorizeGuild(req, req.params.guildId, true);
     const input = z.object({ csrf: z.string() }).parse(req.body);
     if (!validMutation(req, s, input.csrf)) return reply.code(403).send({ error: 'Vérification CSRF refusée.' });
-    const response = await fetch(`${api}/guilds/${req.params.guildId}`, { headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }, signal: AbortSignal.timeout(5_000) });
+    let response: Response;
+    try { response = await fetch(`${api}/guilds/${req.params.guildId}`, { headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }, signal: AbortSignal.timeout(5_000) }); }
+    catch (cause) { throw Object.assign(new Error('Discord installation check is unavailable.', { cause }), { statusCode: 503, code: 'DISCORD_UNAVAILABLE' }); }
     if (response.status === 403 || response.status === 404) {
       await prisma.guildPresence.deleteMany({ where: { guildId: req.params.guildId } });
       return { botInstalled: false, botOnline: false };
     }
-    if (!response.ok) return reply.code(503).send({ error: 'La vérification Discord est temporairement indisponible. Réessayez plus tard.' });
+    if (!response.ok) {
+      if (response.status === 429 && response.headers.has('retry-after')) reply.header('retry-after', response.headers.get('retry-after'));
+      return reply.code(503).send({ error: 'La vérification Discord est temporairement indisponible. Réessayez plus tard.', requestId: req.id });
+    }
     await prisma.guildPresence.upsert({ where: { guildId: req.params.guildId }, create: { guildId: req.params.guildId, shardId: -1 }, update: {} });
     return { botInstalled: true, botOnline: await isBotOnlineInGuild(req.params.guildId) };
   } catch (e) { return sendError(req, reply, e); }

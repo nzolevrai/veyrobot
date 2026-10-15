@@ -1,0 +1,140 @@
+name: veyrobot
+
+x-application: &application
+  image: veyrobot-app:${VEYROBOT_IMAGE_TAG:?set an immutable image tag}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in the external environment}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in the external environment}
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/run/secrets/redis.conf"]
+    secrets:
+      - redis_config
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(sed -n 's/^requirepass //p' /run/secrets/redis.conf)\" redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *application
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
+    command: ["corepack", "pnpm", "db:migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *application
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/api", "start"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      API_PORT: "4000"
+      API_PUBLIC_URL: ${API_PUBLIC_URL:?set API_PUBLIC_URL in the external environment}
+      DASHBOARD_URL: ${DASHBOARD_URL:?set DASHBOARD_URL in the external environment}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      API_RATE_LIMIT_MAX: ${API_RATE_LIMIT_MAX:-90}
+      API_TRUSTED_PROXIES: ""
+      API_PROXY_CLIENT_IP_SECRET: ${API_PROXY_CLIENT_IP_SECRET:?set API_PROXY_CLIENT_IP_SECRET in the external environment}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:?set DISCORD_CLIENT_ID in the external environment}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:?set DISCORD_CLIENT_SECRET in the external environment}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in the external environment}
+      SESSION_KEY: ${SESSION_KEY:?set SESSION_KEY in the external environment}
+      MAX_PENDING_GLOBAL: ${MAX_PENDING_GLOBAL:-5000}
+      MAX_PENDING_PER_GUILD: ${MAX_PENDING_PER_GUILD:-100}
+    expose: ["4000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  bot:
+    <<: *application
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/bot", "start"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in the external environment}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:?set DISCORD_CLIENT_ID in the external environment}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in the external environment}
+      MAX_PENDING_GLOBAL: ${MAX_PENDING_GLOBAL:-5000}
+      MAX_PENDING_PER_GUILD: ${MAX_PENDING_PER_GUILD:-100}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    <<: *application
+    command: ["corepack", "pnpm", "--filter", "@veyrobot/dashboard", "start"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      API_INTERNAL_URL: http://api:4000
+      NODE_ENV: production
+      DASHBOARD_TRUSTED_CLIENT_IP_HEADER: x-real-ip
+      API_PROXY_CLIENT_IP_SECRET: ${API_PROXY_CLIENT_IP_SECRET:?set API_PROXY_CLIENT_IP_SECRET in the external environment}
+      SUPPORT_DISCORD_URL: ${SUPPORT_DISCORD_URL:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
+
+secrets:
+  postgres_password:
+    file: ../.secrets/postgres_password
+  redis_config:
+    file: ../.secrets/redis.conf

@@ -1,0 +1,5 @@
+# Copy to .secrets/redis.conf on the deployment host, set requirepass to the
+# same URL-encoded password used in REDIS_URL, and keep the host file untracked.
+requirepass replace_with_random_password
+appendonly yes
+maxmemory-policy noeviction

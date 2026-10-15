@@ -11,6 +11,8 @@ import { oauthRoutes } from './oauth-routes.js';
 import { guildRoutes } from './guild-routes.js';
 import { moderationRoutes, admissionTotals } from './moderation-routes.js';
 import { GuildListCache } from './guild-list-cache.js';
+import { verifiedClientIp } from './client-ip.js';
+import { sanitizedErrorDetails } from './error-details.js';
 
 const envSchema = z.object({
   API_PORT: z.coerce.number().default(4000),
@@ -23,6 +25,7 @@ const envSchema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1),
   SESSION_KEY: z.string().regex(/^[a-f\d]{64}$/i),
   API_TRUSTED_PROXIES: z.string().default(''),
+  API_PROXY_CLIENT_IP_SECRET: z.string().refine(secret => secret === '' || Buffer.byteLength(secret) >= 32, 'Must be empty or at least 32 bytes').default(''),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 });
 const envResult = envSchema.safeParse(process.env);
@@ -40,7 +43,9 @@ const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.meth
 app.addHook('onRequest', async (req, reply) => { reply.header('x-request-id', req.id); });
 await app.register(rateLimit, { hook: 'preHandler', max: env.API_RATE_LIMIT_MAX, timeWindow: '1 minute', keyGenerator: req => {
   const auth = (req.session as { get(key: string): unknown } | undefined)?.get('auth') as Partial<Session> | undefined;
-  return auth?.sessionId ? `session:${auth.sessionId}` : `ip:${req.ip}`;
+  if (auth?.sessionId) return `session:${auth.sessionId}`;
+  const signedIp = env.API_PROXY_CLIENT_IP_SECRET ? verifiedClientIp(req.headers, env.API_PROXY_CLIENT_IP_SECRET) : null;
+  return `ip:${signedIp ?? req.ip}`;
 }, errorResponseBuilder: (req) => ({ statusCode: 429, code: 'API_RATE_LIMIT', error: 'Trop de requêtes. Réessayez après le délai indiqué.', requestId: req.id }) });
 await app.register(secureSession, { key: Buffer.from(env.SESSION_KEY, 'hex'), cookieName: 'veyrobot_session', cookie: { path: '/', httpOnly: true, sameSite: 'lax', secure: env.NODE_ENV === 'production', maxAge: 60 * 60 * 8 } });
 
@@ -57,7 +62,7 @@ const sendError: ApiContext['sendError'] = (request, reply, error) => {
   const status = error instanceof z.ZodError || (error instanceof Error && error.name === 'ModerationRuleError') ? 400 : candidate.statusCode ?? (candidate.code === 'P2002' || candidate.code === 'P2034' ? 409 : candidate.code === 'MODERATION_BACKLOG_LIMIT' ? 429 : dependencyUnavailable ? 503 : 500);
   const code = error instanceof z.ZodError ? 'VALIDATION_ERROR' : candidate.code ?? (status === 401 ? 'SESSION_ABSENT' : status === 403 ? 'ACCESS_DENIED' : status === 429 ? 'RATE_LIMITED' : status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_FAILED');
   if (candidate.retryAfter) reply.header('retry-after', candidate.retryAfter);
-  app.log.warn({ requestId: request.id, status, code, ...(candidate.retryAfter ? { retryAfter: candidate.retryAfter } : {}), errorName: error instanceof Error ? error.name : 'unknown' }, 'API request failed');
+  app.log.error({ requestId: request.id, status, code, ...(candidate.retryAfter ? { retryAfter: candidate.retryAfter } : {}), exception: sanitizedErrorDetails(error) }, 'API request failed');
   const message = status === 400 ? 'Requête invalide.' : status === 401 ? 'Reconnectez votre compte.' : status === 403 ? 'Accès refusé.' : status === 409 ? 'Conflit avec une opération existante.' : status === 429 ? 'Trop de requêtes ou capacité atteinte.' : status === 503 || status === 502 ? 'Service temporairement indisponible.' : 'Erreur interne.';
   return reply.code(status).send({ code, error: message, requestId: request.id });
 };

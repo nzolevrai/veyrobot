@@ -1,8 +1,16 @@
 # Roadmap, décisions et reprise
 
+## Validation utilisateur et qualité du socle — 15 octobre 2026
+
+Le propriétaire confirme avoir testé en réel sur son serveur privé : OAuth, navigation, actualisation et déconnexion; refus d'accès après déconnexion; persistance des paramètres et activation/désactivation; avertissements depuis le Dashboard et `/warn`; timeout et retrait immédiat; slowmode et restauration. Ce sont des validations manuelles rapportées par le propriétaire, non rejouées par la CI ni reproduites dans cette tranche. Les autres actions Discord, notamment kick, ban, unban, ban temporaire et purge, restent non validées en réel.
+
+Un contrôle automatisé Chrome headless a testé le dashboard construit avec la CSP nonce (réponse HTTP 200, nonce transmis aux scripts Next, pas de `unsafe-inline` dans `script-src`, aucune violation CSP signalée pendant le chargement). La revue visuelle desktop/mobile reste manquante. Une campagne de 30 minutes du pipeline réel (dispatcher/worker/exécuteur, Discord simulé), avec trois serveurs dominants, échéances et repos, est maintenant consignée dans `PERFORMANCE-BASELINE.md`; elle ne valide ni Discord réel ni capacité maximale.
+
+Les limites consolidées et leur classification figurent dans [FOUNDATION-QUALITY-REVIEW-2026-10-15.md](FOUNDATION-QUALITY-REVIEW-2026-10-15.md). La production est préparée par une topologie de référence, mais aucun service n'est provisionné ni déployé.
+
 ## Étape 1 — socle et premier parcours
 
-Monorepo TypeScript strict, PostgreSQL/Prisma, Redis/BullMQ, API Fastify, Dashboard Next, bot Gateway séparé, OAuth Discord, sélection des serveurs, avertissements et dossiers paginés sont livrés. Les migrations locales PostgreSQL ont été appliquées et les tests d'intégration du dossier ont déjà été exécutés sur le service local. L'utilisateur a précédemment validé OAuth, la sélection et `/warn` sur son serveur privé ; les changements de la tranche navigation et configuration ne sont pas encore revalidés en direct.
+Monorepo TypeScript strict, PostgreSQL/Prisma, Redis/BullMQ, API Fastify, Dashboard Next, bot Gateway séparé, OAuth Discord, sélection des serveurs, avertissements et dossiers paginés sont livrés. Les migrations locales PostgreSQL ont été appliquées et les tests d'intégration du dossier ont déjà été exécutés sur le service local. Les validations manuelles actuelles du propriétaire sont listées dans la section de statut ci-dessus; l'historique ci-dessous ne remplace pas cette liste.
 
 ## Étape 2 — modération manuelle (en cours)
 
@@ -12,7 +20,7 @@ Le worker utilise PostgreSQL comme outbox, dispatch équitable une opération pa
 
 ## Interface du Dashboard
 
-Nouvelle identité anthracite et indigo, en-tête de 64 px, navigation stable de 240 px, menu mobile repliable, registre typé des modules réellement disponibles, formulaires de modération séparés et confirmation intégrée pour les demandes sensibles. Les anciennes polices et captures ne sont plus utilisées. Les interrupteurs persistants des trois modules d'action et les préférences de langue, fuseau et couleur sont livrés ; les réglages métier détaillés par module restent à faire. Voir [DASHBOARD-DESIGN.md](DASHBOARD-DESIGN.md). Une revue visuelle dans le navigateur reste nécessaire car son ouverture automatisée a échoué lors de la dernière tentative documentée.
+Nouvelle identité anthracite et indigo, en-tête de 64 px, navigation stable de 240 px, menu mobile repliable, registre typé des modules réellement disponibles, formulaires de modération séparés et confirmation intégrée pour les demandes sensibles. Les anciennes polices et captures ne sont plus utilisées. Les interrupteurs persistants des trois modules d'action et les préférences de langue, fuseau et couleur sont livrés ; les réglages métier détaillés par module restent à faire. Voir [DASHBOARD-DESIGN.md](DASHBOARD-DESIGN.md). Le contrôle headless de CSP est réussi; la revue visuelle en plusieurs tailles d'écran reste nécessaire.
 
 ## Étape 3 — règles et AutoMod
 

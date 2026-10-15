@@ -23,7 +23,7 @@ globalThis.fetch = async (input, init) => {
   if (path === `/guilds/${process.env.TEST_GUILD_B}`) {
     if (process.env.MOCK_INSTALLATION_CHECK_STATUS) {
       const status = Number(process.env.MOCK_INSTALLATION_CHECK_STATUS);
-      return status === 200 ? Response.json({ id: process.env.TEST_GUILD_B }) : Response.json({ message: 'Unknown Guild' }, { status });
+      return status === 200 ? Response.json({ id: process.env.TEST_GUILD_B }) : Response.json({ message: 'Simulated installation check failure' }, { status, ...(status === 429 ? { headers: { 'retry-after': '7' } } : {}) });
     }
     installationChecks++;
     return installationChecks === 1 ? Response.json({ message: 'Unknown Guild' }, { status: 404 }) : Response.json({ id: process.env.TEST_GUILD_B });

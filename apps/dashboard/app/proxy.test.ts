@@ -39,6 +39,29 @@ test('forwards a bounded body without Content-Length and filters hop headers in 
   assert.equal(response.headers.getSetCookie().length, 2);
 });
 
+test('forwards client identity only from the configured ingress header and signs it', async () => {
+  const priorHeader = process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
+  const priorSecret = process.env.API_PROXY_CLIENT_IP_SECRET;
+  process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = 'x-real-ip';
+  process.env.API_PROXY_CLIENT_IP_SECRET = 'test-only-signing-secret-32-bytes';
+  try {
+    const upstream: typeof fetch = async (_url, init) => {
+      const headers = init?.headers as Headers;
+      assert.equal(headers.get('x-veyrobot-client-ip'), '203.0.113.9');
+      assert.match(headers.get('x-veyrobot-client-ip-signature') ?? '', /^[a-f\d]{64}$/);
+      assert.equal(headers.get('x-forwarded-for'), null);
+      return new Response('ok');
+    };
+    await proxyRequest(new Request('http://localhost/api/test', { headers: {
+      'x-real-ip': '203.0.113.9', 'x-veyrobot-client-ip': '198.51.100.1',
+      'x-veyrobot-client-ip-signature': 'forged', 'x-forwarded-for': '192.0.2.2',
+    } }), ['test'], '', upstream);
+  } finally {
+    if (priorHeader === undefined) delete process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER; else process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = priorHeader;
+    if (priorSecret === undefined) delete process.env.API_PROXY_CLIENT_IP_SECRET; else process.env.API_PROXY_CLIENT_IP_SECRET = priorSecret;
+  }
+});
+
 test('distinguishes body read errors, client cancellation, upstream outage and timeout', async () => {
   let sent = 0;
   const upstream: typeof fetch = async () => { sent++; throw new Error('network unavailable'); };
