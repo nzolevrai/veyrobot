@@ -42,6 +42,8 @@ model ModerationCase {
   @@index([status, createdAt])
   @@index([status, guildId, createdAt])
   @@index([action, status, expiryStatus, expiresAt])
+  @@index([action, expiryStatus, expiryStartedAt])
+  @@index([expiryStatus, expiresAt])
   @@index([expiryStatus, expiryLeaseUntil])
 }
 model GuildTargetDecision {
@@ -49,6 +51,8 @@ model GuildTargetDecision {
   targetId String
   generation Int @default(0)
   latestOperationId String?
+  appliedGeneration Int @default(0)
+  appliedOperationId String?
   updatedAt DateTime @updatedAt
   @@id([guildId, targetId])
   @@index([guildId, updatedAt])
@@ -86,6 +90,7 @@ model ConfigAudit {
   changes Json
   createdAt DateTime @default(now())
   @@index([guildId, createdAt(sort: Desc)])
+  @@index([createdAt])
 }
 model GuildPresence {
   guildId String @id
@@ -97,4 +102,11 @@ model GuildPresence {
 model ShardPresence {
   shardId Int @id
   lastSeenAt DateTime @default(now())
+}
+
+model SessionGrant {
+  idHash String @id
+  expiresAt DateTime
+  revokedAt DateTime?
+  @@index([expiresAt])
 }

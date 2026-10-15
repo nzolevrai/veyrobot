@@ -4,7 +4,13 @@ globalThis.fetch = async (input, init) => {
   const url = String(input);
   if (!url.startsWith('https://discord.com/api/v10/')) return nativeFetch(input, init);
   const path = new URL(url).pathname.replace('/api/v10', '');
-  if (path === '/oauth2/token') return Response.json({ access_token: 'local-test-oauth-token', token_type: 'Bearer', expires_in: 3600 });
+  if (path === '/oauth2/token') {
+    if (process.env.MOCK_OAUTH_TOKEN_DELAY_MS) await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, Number(process.env.MOCK_OAUTH_TOKEN_DELAY_MS));
+      init?.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
+    });
+    return Response.json({ access_token: 'local-test-oauth-token', token_type: 'Bearer', expires_in: 3600 });
+  }
   if (path === '/users/@me') return Response.json({ id: process.env.TEST_USER_ID, username: 'TestMod', avatar: null });
   if (path === '/users/@me/guilds') {
     const status = Number(process.env.MOCK_GUILDS_STATUS ?? 200);

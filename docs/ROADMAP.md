@@ -36,11 +36,11 @@ Délégations d'équipe révocables, droits/quota centralisés, configuration d'
 - Les baux sont renouvelés toutes les 20 s, durée 120 s. Le reaper toutes les 60 s marque un appel en cours incertain ou une préparation sans appel échouée. Toute écriture de résultat est conditionnée au jeton de claim.
 - Ban temp: le marqueur de raison est un indice, pas un verrou atomique. Les générations internes protègent les décisions antérieures au contrôle final; une modification externe ou une action externe concurrente pendant l'appel Discord reste ambiguë.
 - La présence par shard évite le balayage permanent des guildes, mais chaque objet Guild Discord.js et ses salons/rôles restent en mémoire et croissent avec le nombre de serveurs.
-- La rétention des dossiers et journaux de configuration reste à définir et implémenter. Ils grandissent actuellement sans purge automatique.
+- Une rétention manuelle par lots existe pour sessions anciennes, audits et avertissements terminés. Les dossiers d'action gardent leur `operationId` et continuent de croître ; planification, export et politique de tombstones restent à définir.
 
 ## Validation réalisée dans cette étape
 
-- Dix migrations au total présentes dans le dépôt et confirmées appliquées en local; les deux dernières ajoutent les préférences par serveur et l’index de réconciliation des appartenances.
+- Douze migrations présentes dans le dépôt et appliquées dans la base de test isolée ; les deux plus récentes ajoutent la révocation des sessions et l'index de rétention des audits. Les migrations antérieures conservent les préférences et la présence par serveur.
 - Tests doubles des permissions retirées, claims concurrents, fencing après échéance, génération tempban changée entre les lectures, ban marqueur modifié, échéance dupliquée, redémarrage/ambiguïté, purge bornée/filtrée, restauration de verrou. Aucun test ne contacte Discord.
 - Build TypeScript vérifié pour packages DB/modération et applications bot/API; build de Dashboard effectué après l'ajout des formulaires.
 - Mesure de charge reproducible : voir [PERFORMANCE-BASELINE.md](PERFORMANCE-BASELINE.md). Aucune mesure n'est une promesse de capacité Discord.
@@ -56,6 +56,18 @@ Délégations d'équipe révocables, droits/quota centralisés, configuration d'
 - Suites : config métier détaillée par module, diagnostics de permissions du bot dans l’interface, coordination REST entre processus avant réplication de l’API, rétention et autres modules de la roadmap.
 
 La prochaine vérification en direct doit activer Avertissements sur sa page dédiée, sauvegarder, relancer `/warn` sur le serveur privé puis désactiver le module et constater le refus, sans sanction ni suppression. Vérifier ensuite la persistance des paramètres et le rendu visuel en navigateur. Ne pas essayer les actions destructrices avant qu’une cible ou un salon de test soit explicitement désigné.
+
+## Reprise après la revue du 14 octobre 2026
+
+Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime sont livrés sur la branche d'architecture. Les validations locales, les coupures isolées Redis/PostgreSQL et les performances avec leurs incertitudes figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les prochaines priorités sont des pannes pendant l'exécution Discord et charge prolongée, des métriques corrélées, un essai de restauration, la politique de croissance des dossiers d'action et la validation navigateur/Discord réel sans sanction. Aucun déploiement multi-processus n'est autorisé par le code actuel.
+
+Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interruption sur l'exécuteur réel, quarantaine à la restauration, banc PostgreSQL/BullMQ/worker de 30 minutes, attente du pool et admission sont consignés dans [RELIABILITY-VERIFICATION-2026-10-14.md](RELIABILITY-VERIFICATION-2026-10-14.md). Les dossiers d'action ne sont pas purgés : ils croissent jusqu'à une conception et un test de course des tombstones; suivre la taille de `ModerationCase` avant saturation. Avant mise en production, valider le rendu dans un navigateur et les parcours Discord autorisés sans sanction destructive. Les résultats simulés ne prouvent pas les limites de Discord réel. La PR reste en brouillon.
+
+### Tâches restantes, priorisées
+
+1. Pour cette PR : vérifier la CI sur la tête exacte et recueillir les revues indépendantes via [le guide de revue](REVIEW-GUIDE.md). Pour mise en production : contrôle visuel navigateur et vérifications Discord autorisées; aucune sanction réelle n'est requise pour la fusion des correctifs backend.
+2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
+3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
 
 ### Navigation routée et édition commune — 13 octobre 2026
 

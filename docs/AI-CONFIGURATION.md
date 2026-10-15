@@ -6,7 +6,7 @@ La configuration Codex accessible sur cette machine est globale. L'audit s'est l
 
 ## État et suites
 
-- Revue de cette session avec Node 24.21.0 : `corepack pnpm typecheck`, `lint` et `build` passent. `corepack pnpm test` passe avec une `DATABASE_URL` factice et `RUN_POSTGRES_INTEGRATION=0` ; les cas PostgreSQL réels sont donc ignorés. Sans `DATABASE_URL`, deux fichiers de tests DB échouent dès l'import. Le moteur Docker était arrêté ; aucune nouvelle intégration PostgreSQL n'a été exécutée.
+- La revue de fiabilité du 14 octobre utilise Node 24.21.0 et une base PostgreSQL isolée `veyrobot_arch_bench` avec migrations appliquées ; les tests d'intégration PostgreSQL sont activés par `RUN_POSTGRES_INTEGRATION=1`. Les validations exactes et limites figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Sans `DATABASE_URL`, les tests qui importent le package DB échouent dès l'import.
 - Les tests avec doubles et l'intégration locale décrits dans la roadmap ne prouvent pas les actions Discord en direct. Les nouveaux réglages et l'interface routée doivent encore être vérifiés sur le serveur de test et dans un navigateur à 100 % de zoom. Voir `ROADMAP.md` et `DASHBOARD-DESIGN.md`.
 - La présente revue n'a pas changé la configuration globale de l'assistant. Si des réglages propres au projet deviennent nécessaires, proposer d'abord un exemple nettoyé dans le dépôt et expliquer les effets sur les autres projets avant toute modification globale.
-- Les limites de débit et de mémoire restent celles du banc PostgreSQL local ; une mesure Gateway/Discord et une stratégie de réplication sont encore nécessaires avant d'annoncer une capacité en serveurs.
+- Le banc PostgreSQL a été complété par un pipeline local PostgreSQL/BullMQ/HTTP simulé et un essai d'objets discord.js synthétiques. Une mesure Gateway/Discord réelle et une stratégie de réplication sont encore nécessaires avant d'annoncer une capacité en serveurs.
