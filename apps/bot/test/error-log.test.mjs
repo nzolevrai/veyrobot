@@ -20,6 +20,29 @@ test('bot error logger emits sanitized structured details rather than raw except
   assert.equal(record.message, 'Discord action failed');
   assert.equal(record.exception.name, 'Error');
   assert.equal(record.exception.cause.name, 'Error');
-  assert.equal(emitted.includes('forged log line'), true, 'line breaks are normalized into a single safe message');
+  assert.equal(record.exception.message, 'Exception text omitted.');
+  assert.equal(emitted.includes('forged log line'), false, 'raw exception text is not collected');
+  assert.equal(record.message, 'Discord action failed', 'bounded static context remains useful for diagnosis');
   assert.equal(emitted.split('\n').length, 1);
+});
+
+test('bot logger omits exception text containing quoted JSON, spaced values, long URLs and raw JWTs', () => {
+  const canaries = ['CANARY_JSON', 'CANARY valeur avec espaces', 'CANARY_URL_PASSWORD', 'CANARY_JWT_PAYLOAD'];
+  const jwt = `eyJ${'a'.repeat(28)}.${'b'.repeat(28)}.${'c'.repeat(28)}`;
+  const error = new Error([
+    `{"client_secret":"${canaries[0]}"}`,
+    `SESSION_KEY="${canaries[1]}"`,
+    `postgresql://user:${canaries[2]}${'x'.repeat(5000)}@db.invalid/app`,
+    jwt,
+  ].join('\n'));
+  let emitted = '';
+  const original = console.error;
+  console.error = value => { emitted = String(value); };
+  try { logBotError('worker_failed', 'worker', 'Moderation operation failed', error); }
+  finally { console.error = original; }
+
+  for (const canary of canaries) assert.equal(emitted.includes(canary), false, `bot emitted ${canary}`);
+  assert.equal(emitted.includes(jwt), false, 'bot emitted a raw JWT');
+  const record = JSON.parse(emitted);
+  assert.equal(record.exception.message, 'Exception text omitted.');
 });

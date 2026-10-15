@@ -21,6 +21,12 @@ const safeCodes = new Set([
   'ERR_INVALID_ARG_TYPE', 'ERR_SOCKET_CLOSED', 'ERR_HTTP_HEADERS_SENT',
 ]);
 
+const diagnosticTextBudget = 4096;
+const omittedLongText = '[diagnostic text omitted: input limit exceeded]';
+const omittedExceptionText = 'Exception text omitted.';
+const sensitiveAssignment = /("?(?:client[_-]?secret|session[_-]?key|access[_-]?token|refresh[_-]?token|password|api[_-]?key|token|secret)"?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]*)/gi;
+const rawJwt = /\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g;
+
 function read(value: unknown, property: string): unknown {
   if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
   try { return Reflect.get(value, property); } catch { return undefined; }
@@ -34,15 +40,16 @@ export function safeDiagnosticCode(value: unknown): string | undefined {
 
 export function safeDiagnosticText(value: unknown, maxLength = 160): string | undefined {
   if (typeof value !== 'string' || maxLength < 1) return undefined;
-  let text = value.slice(0, 4096);
+  if (value.length > diagnosticTextBudget) return omittedLongText.slice(0, maxLength);
+  let text = value;
   text = text
     .replace(/\b(postgres(?:ql)?|redis|mysql|mongodb(?:\+srv)?):\/\/[^\s/@]+@/gi, '$1://[redacted]@')
     .replace(/\b([a-z][a-z\d+.-]*:\/\/)[^\s/@]+:[^\s/@]*@/gi, '$1[redacted]@')
     .replace(/\b(authorization\s*[:=]\s*)(?:(?:Bearer|Basic)\s+)?[^\s,;]+/gi, '$1[redacted]')
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, '[redacted-authorization]')
     .replace(/\b(set-cookie|cookie)\s*[:=]\s*[^\r\n]*/gi, '$1=[redacted]')
-    .replace(/\b(client[_-]?secret|session[_-]?key|access[_-]?token|refresh[_-]?token|password|api[_-]?key|token|secret)\b\s*[:=]\s*["']?[^\s&,;"'}]+/gi, '$1=[redacted]')
-    .replace(/\b(a|b)\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g, '[redacted-token]')
+    .replace(sensitiveAssignment, '$1[redacted]')
+    .replace(rawJwt, '[redacted-token]')
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -59,21 +66,20 @@ function summarize(value: unknown, depth: number, seen: Set<object>): SanitizedE
   if (seen.has(value)) return { name: 'Error', message: '[circular cause]' };
   seen.add(value);
 
-  const rawMessage = read(value, 'message');
   const rawCode = read(value, 'code');
   const rawCause = read(value, 'cause');
   const code = safeDiagnosticCode(rawCode);
   const result: SanitizedErrorDetails = {
     name: errorName(value),
     ...(code ? { code } : {}),
-    message: safeDiagnosticText(typeof rawMessage === 'string' ? rawMessage : 'Error details unavailable.', 500) ?? 'Error details unavailable.',
+    message: omittedExceptionText,
   };
 
   if (rawCause !== undefined) {
     if (depth >= 3) result.cause = { name: 'Error', message: '[cause depth limit]' };
     else result.cause = summarize(rawCause, depth + 1, seen) ?? {
       name: 'Error',
-      message: safeDiagnosticText(typeof rawCause === 'string' ? rawCause : 'Cause details unavailable.', 500) ?? 'Cause details unavailable.',
+      message: 'Cause text omitted.',
     };
   }
   return result;

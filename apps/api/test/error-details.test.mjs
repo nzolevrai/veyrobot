@@ -34,15 +34,41 @@ test('emitted API exception log redacts every canary while retaining bounded dia
   assert.match(emitted.phase, /session_grant_validation/);
   assert.equal(emitted.exception.name, 'Error');
   assert.equal(emitted.exception.code, 'P1001');
-  assert.equal(emitted.exception.message, 'database unavailable');
+  assert.equal(emitted.exception.message, 'Exception text omitted.');
   assert.equal(emitted.exception.cause.name, 'Error');
-  assert.match(emitted.exception.cause.message, /query failed/);
+  assert.equal(emitted.exception.cause.message, 'Exception text omitted.');
   assert.equal(emitted.exception.cause.cause.name, 'Error');
-  assert.equal(emitted.exception.cause.cause.cause.message, 'socket reset');
+  assert.equal(emitted.exception.cause.cause.cause.message, 'Exception text omitted.');
   assert.equal(emitted.exception.cause.cause.cause.name, 'TypeError');
   assert.equal(emitted.exception.cause.cause.cause.cause.message, '[cause depth limit]');
   assert.equal(emitted.exception.cause.code, undefined);
   assert.ok(output.length < 5000, 'output remains bounded despite an oversized exception');
+});
+
+test('emitted API logs omit unsafe exception text in common secret formats and beyond the input budget', async () => {
+  const canaries = ['CANARY_JSON', 'CANARY valeur avec espaces', 'CANARY_URL_PASSWORD', 'CANARY_JWT_PAYLOAD'];
+  const jwt = `eyJ${'a'.repeat(28)}.${'b'.repeat(28)}.${'c'.repeat(28)}`;
+  const longCredentialUrl = `database failed postgresql://user:${canaries[2]}${'x'.repeat(5000)}@db.invalid/app`;
+  const error = new Error([
+    `{"client_secret":"${canaries[0]}"}`,
+    `SESSION_KEY="${canaries[1]}"`,
+    longCredentialUrl,
+    jwt,
+  ].join('\n'));
+  const stream = new Writable({ write(chunk, _encoding, callback) { output += chunk.toString(); callback(); } });
+  let output = '';
+  const app = Fastify({ logger: { level: 'error', stream } });
+  try {
+    app.log.error(apiExceptionLogRecord('req-safe-1', 500, 'INTERNAL_ERROR', error), 'API request failed');
+    await app.close();
+  } finally { await app.close().catch(() => undefined); }
+
+  for (const canary of canaries) assert.equal(output.includes(canary), false, `API emitted ${canary}`);
+  assert.equal(output.includes(jwt), false, 'API emitted a raw JWT');
+  const record = JSON.parse(output.trim());
+  assert.equal(record.requestId, 'req-safe-1');
+  assert.equal(record.exception.message, 'Exception text omitted.');
+  assert.equal(record.exception.code, undefined);
 });
 
 test('API classification keeps client responses generic and exposes no internal codes', () => {
@@ -70,4 +96,13 @@ test('sanitizer handles circular causes, throwing getters and atypical thrown va
   assert.doesNotThrow(() => sanitizedErrorDetails(hostile));
   assert.doesNotThrow(() => classifyApiError(hostile));
   assert.equal(sanitizedErrorDetails('thrown string').message, 'Non-Error thrown.');
+});
+
+test('safe diagnostic text preserves short benign context and fails closed for oversized input', async () => {
+  const { safeDiagnosticText } = await import('../dist/error-details.js');
+  assert.equal(safeDiagnosticText('database pool exhausted during session_grant_validation'), 'database pool exhausted during session_grant_validation');
+  assert.equal(safeDiagnosticText('x'.repeat(5000)), '[diagnostic text omitted: input limit exceeded]');
+  assert.equal(safeDiagnosticText('SESSION_KEY="CANARY valeur avec espaces"'), 'SESSION_KEY=[redacted]');
+  assert.equal(safeDiagnosticText('{"CLIENT_SECRET":"CANARY_JSON"}'), '{"CLIENT_SECRET":[redacted]}');
+  assert.equal(safeDiagnosticText('eyJ' + 'a'.repeat(28) + '.' + 'b'.repeat(28) + '.' + 'c'.repeat(28)), '[redacted-token]');
 });
