@@ -1,6 +1,6 @@
 import type { PrismaClient } from './generated/prisma/client.js';
 
-/** Call once against an isolated restored database before any API or bot starts. */
+/** Call once against an isolated restored database before API/bot startup; quarantine work and revoke restored sessions. */
 export async function quarantineRestoredWork(client: PrismaClient, now = new Date()) {
   return client.$transaction(async tx => {
     const actions = await tx.moderationCase.updateMany({
@@ -22,6 +22,7 @@ export async function quarantineRestoredWork(client: PrismaClient, now = new Dat
       where: { action: 'TEMPBAN', expiryStatus: 'running' },
       data: { expiryStatus: 'uncertain', expiryResult: 'Restauration ancienne : un débannissement a pu être exécuté après le snapshot. Réconciliation humaine requise; aucun rejeu automatique.' },
     });
-    return { actionsQuarantined: actions.count, temporaryActionsQuarantined: temporaryActionRows.count, scheduledExpiriesQuarantined: scheduled.count, runningExpiriesQuarantined: runningExpiries.count };
+    const sessionsRevoked = await tx.sessionGrant.updateMany({ where: { revokedAt: null }, data: { revokedAt: now } });
+    return { actionsQuarantined: actions.count, temporaryActionsQuarantined: temporaryActionRows.count, scheduledExpiriesQuarantined: scheduled.count, runningExpiriesQuarantined: runningExpiries.count, sessionsRevoked: sessionsRevoked.count };
   });
 }

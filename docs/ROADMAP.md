@@ -77,6 +77,12 @@ Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interr
 2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
 3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
 
+### Sauvegarde/restauration — 15 octobre 2026
+
+Le script `deploy/backup-postgres.ps1` publie maintenant uniquement une archive PostgreSQL 17 relue par `pg_restore --list`, avec un sidecar SHA-256 publié en dernier comme marqueur de complétude, permissions privées et noms concurrents uniques. Le test Compose isolé a restauré configurations, dossier WARN, décision TEMPBAN, génération et échéance, puis exécuté la quarantaine avant de vérifier que le dispatcher de production publie zéro opération et que les sessions restaurées sont révoquées. L'API et le bot ne sont pas démarrés pendant cet essai.
+
+La procédure de restauration et ses commandes sont dans [BACKUP-RESTORE-VERIFICATION-2026-10-15.md](BACKUP-RESTORE-VERIFICATION-2026-10-15.md). Restent à éprouver : planification/copie vers stockage distant chiffré, surveillance de la capacité/rétention, contrôle de l'accès à ce stockage et exercice à la taille réelle de la base. Les durées locales mesurées ne constituent pas des objectifs RPO/RTO.
+
 ### Navigation routée et édition commune — 13 octobre 2026
 
 - Livré dans le code : routes Next.js par module, layout partagé avec vérification d’accès initiale, rail et catégories réorganisés, page Premium honnête, activation dans chaque page métier, réglages avec Radix Select et couleur locale, barre de brouillon avec sauvegarde groupée et conflit optimiste.

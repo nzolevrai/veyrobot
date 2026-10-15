@@ -24,25 +24,18 @@ Une erreur `Client` non récupérable, une rejection non gérée ou une exceptio
 
 ## Sauvegarde, restauration, rétention
 
-Sauvegarder PostgreSQL avant migration et à une fréquence compatible avec la perte de données acceptée. Un exemple de développement avec le service Compose, en conservant le fichier **hors dépôt** :
+Sauvegarder PostgreSQL avant migration et à une fréquence compatible avec la perte de données acceptée. Utiliser le [script de sauvegarde vérifiée et la procédure de restauration](BACKUP-RESTORE-VERIFICATION-2026-10-15.md). Une sauvegarde est disponible seulement si son archive et son sidecar SHA-256 sont présents et concordants :
 
 ```powershell
-New-Item -ItemType Directory -Force backups | Out-Null
-docker compose exec -T postgres pg_dump -U sentinelle -Fc -f /tmp/veyrobot.backup sentinelle
-docker cp "$(docker compose ps -q postgres):/tmp/veyrobot.backup" backups/veyrobot.backup
+$env:VEYROBOT_BACKUP_DIR = 'D:\private\veyrobot-backups'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy/backup-postgres.ps1
 ```
 
-Tester la restauration vers une base **distincte et isolée**, jamais au-dessus de la base active :
-
-```powershell
-docker compose exec -T postgres createdb -U sentinelle veyrobot_restore_test
-docker cp backups/veyrobot.backup "$(docker compose ps -q postgres):/tmp/veyrobot.restore.backup"
-docker compose exec -T postgres pg_restore -U sentinelle -d veyrobot_restore_test --no-owner /tmp/veyrobot.restore.backup
-```
-
-Un essai a été réalisé le 14 octobre 2026 : source isolée `veyrobot_arch_bench`, archive `pg_dump -Fc`, cible nouvelle `veyrobot_restore_proof_20261014`, `pg_restore --no-owner`. La ligne de preuve restaurée contient version de configuration 7, module membre activé, génération 4, `operationId` conservé, statut `succeeded` et échéance `scheduled` future ; les mêmes valeurs ont été lues à la source. Aucun bot ne pointait vers la cible. Cet essai vérifie ces données représentatives, pas la restauration de chaque table ni le temps de reprise d'une base de production. Les fichiers `*.backup`, `*.dump` et `backups/` sont exclus de Git. Un retour à l'ancien binaire ne défait pas une migration destructive : concevoir les changements de schéma en deux phases compatibles, garder un plan de restauration et ne supprimer une colonne qu'après transition vérifiée.
+Tester la restauration vers une base distincte et isolée, jamais au-dessus de la base active; utiliser les commandes et contrôles décrits dans le guide ci-dessus. Les archives, sidecars et fichiers partiels locaux sont exclus de Git. Un retour à l'ancien binaire ne défait pas une migration destructive : concevoir les changements de schéma en deux phases compatibles, garder un plan de restauration et ne supprimer une colonne qu'après transition vérifiée.
 
 Après restauration d'une archive ancienne, **ne démarrer ni l'API ni le bot** avant quarantaine. Une demande `requested`/`running` peut avoir été exécutée après la sauvegarde ; l'absence de preuve externe reste `uncertain`, jamais un droit de rejouer. Étapes exactes dans PowerShell : (1) arrêter l'API, le bot et tout dispatcher; (2) restaurer vers une base distincte; (3) pointer `DATABASE_URL` uniquement vers cette cible isolée avec les identifiants de déploiement déjà provisionnés; (4) exécuter `$env:RESTORE_QUARANTINE_CONFIRM='1'` puis `corepack pnpm --filter @veyrobot/db exec tsx src/restore-quarantine-cli.ts`; (5) vérifier le résumé et les lignes `uncertain`; (6) comparer les actions avec Discord et les journaux externes, puis décider manuellement dossier par dossier; (7) laisser les dossiers non prouvés en `uncertain`, vérifier les bans temporaires et leurs marqueurs/générations, et ne remettre en file qu'une nouvelle décision humaine après réconciliation; (8) rétablir l'URL d'exploitation, démarrer d'abord l'API puis un bot unique. Le CLI met en quarantaine les opérations `requested`/`running`, les expirations `running` et **toutes les échéances TEMPBAN encore `scheduled`**, même futures : une décision permanente ou une expiration externe postérieure à la sauvegarde peut avoir changé l'état Discord sans apparaître dans l'archive. La procédure `node apps/bot/tools/restore-quarantine-proof.mjs` vérifie aussi une expiration en cours au snapshot, simule les états Discord postérieurs, restaure l'état ancien sans démarrer de bot, et contrôle que le dispatcher ne publie aucun job après quarantaine.
+
+La restauration invalide aussi tous les grants OAuth actifs présents dans le snapshot. Les utilisateurs doivent se reconnecter après remise en service; cela évite qu'un cookie de session antérieur à l'instant du snapshot redevienne valide.
 
 La rétention s'exécute séparément des requêtes : `corepack pnpm --filter @veyrobot/db maintenance:retention`. Délais et lots sont dans `.env.example`. Elle ne supprime pas les dossiers de modération. La purge des dossiers et toute tâche automatisée correspondante restent désactivées tant que des tombstones transactionnels ne protègent pas l'idempotence. Suivre le volume avec `SELECT pg_size_pretty(pg_total_relation_size('"ModerationCase"'));` et les nombres par statut; définir des alertes avant saturation disque. Les opérations incertaines, en cours, les `operationId` et les échéances actives doivent rester reconnaissables sans limite avant toute réduction de détails.
 

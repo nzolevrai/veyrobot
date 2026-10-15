@@ -1,6 +1,13 @@
 name: CI
 on: [push, pull_request]
 jobs:
+  backup-script:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test backup publication failure handling with mocked Docker
+        shell: powershell
+        run: .\deploy\test-backup-postgres.ps1
   validate:
     runs-on: ubuntu-latest
     services:
