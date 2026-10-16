@@ -76,7 +76,7 @@ jobs:
           RUN_DASHBOARD_ROUTE_INTEGRATION: '1'
       - name: Verify a real PostgreSQL 17 backup, restore and recovery gate
         run: node deploy/backup-restore.integration.mjs
-      - name: Verify Redis maxmemory refusal and cgroup OOM recovery with production worker
+      - name: Verify Redis refusals and OOM recovery with live production BullMQ clients
         run: node deploy/redis-saturation.integration.mjs
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public

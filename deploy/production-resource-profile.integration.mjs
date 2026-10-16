@@ -191,7 +191,26 @@ try {
   const containers = Object.fromEntries(['postgres', 'redis', 'migrate', 'api', 'bot', 'dashboard'].map(service => [service, containerId(service)]));
   const appliedLimits = Object.fromEntries(Object.entries(containers).map(([service, id]) => [service, Number(inspect(id, '{{.HostConfig.Memory}}'))]));
   for (const [service, expected] of Object.entries(expectedMemory)) assert.equal(appliedLimits[service], expected, `${service} actual Compose container cgroup limit`);
-  console.info(JSON.stringify({ event: 'resource_profile_cgroup_limits_verified', actualContainerLimitsBytes: appliedLimits }));
+  const redisHostConfig = JSON.parse(inspect(containers.redis, '{{json .HostConfig}}'));
+  assert.equal(redisHostConfig.MemorySwap, appliedLimits.redis, 'Redis has no swap allowance beyond its cgroup memory limit');
+  const redisBootstrapTools = docker(['exec', containers.redis, 'sh', '-ec', 'command -v cp >/dev/null && command -v chown >/dev/null && command -v chmod >/dev/null && test -x /usr/bin/setpriv && printf ready']).stdout;
+  assert.equal(redisBootstrapTools, 'ready', 'Redis image includes the tools required by the secret-copy and privilege-drop bootstrap');
+  const [redisUidText, redisGidText, processUidText, copiedSecretStat] = [
+    docker(['exec', containers.redis, 'id', '-u', 'redis']).stdout,
+    docker(['exec', containers.redis, 'id', '-g', 'redis']).stdout,
+    docker(['exec', containers.redis, 'sh', '-ec', "awk '/^Uid:/{print $2}' /proc/1/status"]).stdout,
+    docker(['exec', containers.redis, 'stat', '-c', '%u:%g:%a', '/tmp/redis.conf']).stdout,
+  ];
+  const redisUid = Number(redisUidText);
+  const redisGid = Number(redisGidText);
+  assert.ok(Number.isInteger(redisUid) && redisUid > 0, 'Redis service account is non-root');
+  assert.equal(Number(processUidText), redisUid, 'the actual Redis PID 1 runs as the redis user');
+  assert.equal(copiedSecretStat, `${redisUid}:${redisGid}:400`, 'the in-container config copy is owned by redis and mode 0400');
+  console.info(JSON.stringify({
+    event: 'resource_profile_cgroup_limits_verified',
+    actualContainerLimitsBytes: appliedLimits,
+    redisBootstrap: { memorySwapBytes: redisHostConfig.MemorySwap, effectiveUid: redisUid, effectiveGid: redisGid, copiedSecretMode: '0400', requiredToolsPresent: true },
+  }));
 
   const apiPort = mappedPort('api', 4000);
   const dashboardPort = mappedPort('dashboard', 3000);
@@ -305,7 +324,7 @@ const ratePerSecond = 2;
     const output = {
       event: 'production_resource_profile_passed',
       scope: 'real production Compose images and cgroup limits; direct PostgreSQL admission; production dispatcher/worker/executor with controlled Discord adapter; API health and dashboard GET only; no OAuth or real Discord',
-      runtime: { node: process.version, docker: docker(['info', '--format', '{{.ServerVersion}}']).stdout, loadGenerator: 'host process, outside service cgroups', totalServicesCapBytes: Object.values(expectedMemory).filter((_, index) => index !== 2).reduce((sum, value) => sum + value, 0) },
+      runtime: { node: process.version, docker: docker(['info', '--format', '{{.ServerVersion}}']).stdout, loadGenerator: 'host process, outside service cgroups', botProcess: 'production dispatcher/worker harness; no discord.js Client or Gateway', totalPermanentServiceCapsBytes: Object.values(expectedMemory).filter((_, index) => index !== 2).reduce((sum, value) => sum + value, 0), oneShotMigrationCapBytes: expectedMemory.migrate },
       actualContainerLimitsBytes: appliedLimits,
       workload: { seconds: arrivalSeconds, offered: operations.length, accepted: rows.length, terminal: rows.filter(row => row.status === 'succeeded').length, fakeDiscordKickCalls: rows.length, fakeMutationDelayMs: 50, guilds: guildIds.length, admissionPath: 'production DB use case, no HTTP/OAuth' },
       latencyMs: Object.fromEntries(['admissionMs', 'acceptToStartMs', 'acceptToFinishMs'].map(key => [key, { p50: percentile(latency.map(item => item[key]), .5), p95: percentile(latency.map(item => item[key]), .95), p99: percentile(latency.map(item => item[key]), .99) }])),

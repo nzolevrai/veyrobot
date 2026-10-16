@@ -38,11 +38,12 @@ try {
   }
   const redisCommand = config.services.redis.command.join(' ');
   assert.deepEqual(config.services.redis.entrypoint, ['/bin/sh', '-ec']);
-  assert.match(redisCommand, /cp \/run\/secrets\/redis\.conf \/tmp\/redis\.conf.*chown redis:redis.*chmod 0400.*setpriv --reuid redis --regid redis --clear-groups redis-server \/tmp\/redis\.conf/);
+  assert.match(redisCommand, /umask 077.*cp \/run\/secrets\/redis\.conf \/tmp\/redis\.conf.*chown redis:redis.*chmod 0400.*setpriv --reuid redis --regid redis --clear-groups redis-server \/tmp\/redis\.conf/);
   assert.equal(config.services.redis.secrets[0]?.target, 'redis.conf', 'Redis config secret is mounted at the path used by redis-server and its healthcheck');
   const redisMaxMemory = parseByteSize(redisCommand.match(/--maxmemory\s+(\S+)/)?.[1]);
   const redisContainerLimit = config.services.redis.deploy.resources.limits.memory;
-  assert.ok(redisContainerLimit - redisMaxMemory >= 256 * 1024 ** 2, 'Redis leaves a 256 MiB cgroup budget above maxmemory for AOF file cache, COW, clients and native allocations');
+  assert.equal(redisContainerLimit - redisMaxMemory, 256 * 1024 ** 2, 'reference Redis container provides a configurable 256 MiB difference above maxmemory');
+  assert.equal(config.services.redis.memswap_limit, config.services.redis.deploy.resources.limits.memory, 'Redis memory and memory+swap caps are equal, disabling swap for the container');
   for (const service of ['api', 'bot', 'dashboard', 'migrate']) {
     const heap = Number(config.services[service].environment.NODE_OPTIONS.match(/max-old-space-size=(\d+)/)?.[1]);
     assert.ok(heap > 0 && heap * 1024 ** 2 <= config.services[service].deploy.resources.limits.memory * 0.75, `${service} heap leaves native/buffer/cgroup headroom`);

@@ -39,6 +39,7 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
+        umask 077 &&
         cp /run/secrets/redis.conf /tmp/redis.conf &&
         chown redis:redis /tmp/redis.conf &&
         chmod 0400 /tmp/redis.conf &&
@@ -48,6 +49,9 @@ services:
       resources:
         limits:
           memory: ${REDIS_MEMORY_LIMIT:-512M}
+    # Equal memory and swap limits disable container swap for Redis. This keeps
+    # its OOM behavior explicit; PostgreSQL remains the durable source of work.
+    memswap_limit: ${REDIS_MEMORY_LIMIT:-512M}
     secrets:
       - source: redis_config
         target: redis.conf

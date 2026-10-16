@@ -87,6 +87,7 @@ try {
     docker(['exec', aof, 'redis-cli', 'INFO', 'server']).stdout.match(/redis_version:([^\r\n]+)/)?.[1],
   ];
   assert.equal(hostConfig.Memory, 512 * 1024 ** 2);
+  assert.equal(hostConfig.MemorySwap, 512 * 1024 ** 2, 'Redis rewrite container has no swap allowance beyond its cgroup memory limit');
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory']).stdout.split(/\r?\n/)[1], '268435456');
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory-policy']).stdout.split(/\r?\n/)[1], 'noeviction');
   let seedInput = '';
@@ -133,9 +134,17 @@ try {
   docker(['run', '-d', '--name', oom, '--memory=48m', '--memory-swap=48m', '-v', `${oomVolume}:/data`, 'redis:7-alpine', 'redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec', '--save', '', '--dir', '/data']);
   cleanups.push(() => docker(['rm', '-f', oom], { allowFailure: true }));
   await sleep(1_000);
-  assert.equal(JSON.parse(docker(['inspect', oom, '--format', '{{json .HostConfig}}']).stdout).Memory, 48 * 1024 ** 2, 'low cgroup limit for the OOM scenario was applied');
+  const oomHostConfig = JSON.parse(docker(['inspect', oom, '--format', '{{json .HostConfig}}']).stdout);
+  assert.equal(oomHostConfig.Memory, 48 * 1024 ** 2, 'low cgroup limit for the OOM scenario was applied');
+  assert.equal(oomHostConfig.MemorySwap, 48 * 1024 ** 2, 'OOM scenario disables swap so Docker reports a cgroup OOM');
   assert.equal(docker(['exec', oom, 'redis-cli', 'CONFIG', 'GET', 'maxmemory']).stdout.split(/\r?\n/)[1], '0', 'OOM scenario disables Redis maxmemory so it tests cgroup OOM, not maxmemory rejection');
+  docker(['exec', oom, 'redis-cli', 'CONFIG', 'SET', 'appendfsync', 'always']);
   docker(['exec', oom, 'redis-cli', 'SET', 'durable:probe', 'before-oom']);
+  const preOomPersistence = docker(['exec', oom, 'redis-cli', 'INFO', 'persistence']).stdout;
+  assert.match(preOomPersistence, /aof_last_write_status:ok/);
+  assert.match(preOomPersistence, /aof_pending_bio_fsync:0/);
+  docker(['exec', oom, 'redis-cli', 'CONFIG', 'SET', 'appendonly', 'no']);
+  await waitFor('AOF disabled before synthetic OOM writes', () => /aof_enabled:0/.test(docker(['exec', oom, 'redis-cli', 'INFO', 'persistence']).stdout));
   const block = 'z'.repeat(1024 * 1024);
   let oomInput = '';
   for (let i = 0; i < 96; i++) oomInput += `*3\r\n$3\r\nSET\r\n$${String(`oom:${i}`).length}\r\noom:${i}\r\n$${block.length}\r\n${block}\r\n`;
@@ -146,11 +155,12 @@ try {
   docker(['start', oom]);
   await waitFor('Redis AOF recovery after OOM', () => docker(['exec', oom, 'redis-cli', 'PING'], { allowFailure: true }).stdout === 'PONG', 30_000);
   const recovered = docker(['exec', oom, 'redis-cli', 'GET', 'durable:probe']).stdout;
+  assert.equal(recovered, 'before-oom', 'the probe was fsynced before the OOM filler and recovered from AOF');
   console.info(JSON.stringify({
     event: 'redis_memory_integration_passed',
     redisVersion,
     aofRewrite: { cgroupLimitBytes: hostConfig.Memory, redisMaxmemoryBytes: 256 * 1024 ** 2, configuredHeadroomBytes: hostConfig.Memory - 256 * 1024 ** 2, peakCgroupBytes: aofPeakCgroupBytes, peakDockerStatsWorkingSetBytes: aofPeakRssBytes, redisMaxima: redisMetricsMax, dataKeysAfterRewrite: dbsize, concurrentWriteBatchSize: concurrentWrites, completion: 'aof_last_bgrewrite_status=ok' },
-    oom: { cgroupLimitBytes: 48 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, recoveredAofProbe: recovered || '<absent after abrupt-kill window>', restarted: true },
+    oom: { cgroupLimitBytes: 48 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, recoveredAofProbe: 'before-oom (fsync confirmed before incident)', restarted: true },
     limitation: 'Standalone Redis process evidence only; PostgreSQL durable operation and production worker recovery during cgroup OOM are covered only by separate maxmemory-saturation integration, not by this OOM scenario.',
   }));
 } finally {

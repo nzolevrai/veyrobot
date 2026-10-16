@@ -1,12 +1,12 @@
 import { DiscordAPIError, type Client } from 'discord.js';
-import { Worker, type ConnectionOptions } from 'bullmq';
+import { Worker, type ConnectionOptions, type WorkerOptions } from 'bullmq';
 
 type Store = typeof import('@veyrobot/db').prisma;
 type Services = typeof import('@veyrobot/moderation');
 export type WorkerAttempt = { operationId: string; guildId: string; kind: 'action' | 'expiry'; createdAt: Date; scheduledAt?: Date };
 export type WorkerTelemetry = { onAttemptStarted?: (attempt: WorkerAttempt) => void; onAttemptFinished?: (guildId: string, operationId: string) => void; onGuildBusySkip?: (guildId: string, operationId: string) => void };
 
-export function createModerationWorker(client: Client, connection: ConnectionOptions, prisma: Store, moderation: Services, rejectPendingAfterDisable: typeof import('@veyrobot/db').rejectPendingAfterDisable, onDrained: () => void, telemetry?: WorkerTelemetry, queueName = 'veyrobot-moderation'): Worker {
+export function createModerationWorker(client: Client, connection: ConnectionOptions, prisma: Store, moderation: Services, rejectPendingAfterDisable: typeof import('@veyrobot/db').rejectPendingAfterDisable, onDrained: () => void, telemetry?: WorkerTelemetry, queueName = 'veyrobot-moderation', recoveryTiming?: Pick<WorkerOptions, 'lockDuration' | 'stalledInterval'>): Worker {
   const { executeModerationAction, expireTemporaryBan } = moderation;
 const activeGuilds = new Set<string>();
   return new Worker(queueName, async job => {
@@ -69,6 +69,8 @@ const activeGuilds = new Set<string>();
     activeGuilds.delete(guildId);
     onDrained();
   }
-}, { connection, concurrency: 4, autorun: true });
+// Production leaves BullMQ recovery timings at its defaults. The integration
+// harness may shorten only these detection intervals to keep failure tests bounded.
+}, { connection, concurrency: 4, autorun: true, ...recoveryTiming });
 
 }
