@@ -145,7 +145,10 @@ if ($CleanupStaleTemporaries) {
     try {
       $leasePath = Join-Path $candidate.FullName '.active'
       if (Test-Path -LiteralPath $leasePath -PathType Leaf) {
-        try { $lease = [System.IO.File]::Open($leasePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+        try {
+          $lease = [System.IO.File]::Open($leasePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+          $lease.Lock(0, 1)
+        }
         catch [System.IO.IOException] { continue }
       }
       $remoteStaleDirectory = '/tmp/.veyrobot-backup-' + $match.Groups[1].Value
@@ -181,7 +184,8 @@ try {
   else { New-PrivateUnixDirectory $localWorkDirectory }
   $leasePath = Join-Path $localWorkDirectory '.active'
   New-PrivateFile $leasePath
-  $localLease = [System.IO.File]::Open($leasePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+  $localLease = [System.IO.File]::Open($leasePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+  $localLease.Lock(0, 1)
   Assert-NoReparsePath $localWorkDirectory
   Assert-PrivatePermissions $localWorkDirectory $true
   Assert-PrivatePermissions (Join-Path $localWorkDirectory '.active') $false
