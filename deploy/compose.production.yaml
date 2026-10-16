@@ -42,7 +42,8 @@ services:
         limits:
           memory: ${REDIS_MEMORY_LIMIT:-384M}
     secrets:
-      - redis_config
+      - source: redis_config
+        target: redis.conf
     volumes:
       - redis-data:/data
     healthcheck:

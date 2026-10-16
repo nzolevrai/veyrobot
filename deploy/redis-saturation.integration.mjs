@@ -200,7 +200,7 @@ try {
     moderationCase: prisma.moderationCase,
   };
   const dispatch = createDispatcher(dispatchStore, queue, () => true, (key, message, error) => {
-    dispatchErrors.push({ key, message, errorName: error instanceof Error ? error.name : 'unknown' });
+    dispatchErrors.push({ key, message, errorName: error instanceof Error ? error.name : 'unknown', errorMessage: error instanceof Error ? error.message : String(error) });
   });
   await delay(20); // let the dispatcher's initial Redis-ready promise settle
 
@@ -235,13 +235,19 @@ try {
   assert.equal(dispatchErrors[0].key, 'moderation-queue-dispatch');
   assert.match(dispatchErrors[0].message, /PostgreSQL request remains durable/);
   assert.match(dispatchErrors[0].errorName, /Error/);
+  assert.match(dispatchErrors[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
   assert.equal((await row(pendingOperationId)).status, 'requested', 'failed Redis enqueue does not lose accepted PostgreSQL work');
   assert.equal((await prisma.moderationCase.findUnique({ where: { id: expiryCaseId } })).expiryStatus, 'scheduled', 'due expiry remains durable');
   assert.equal(activeKickCount, 1, 'the already active controlled Discord operation was not repeated');
 
+  const outboxQueriesBeforeCooldownWakes = dispatcherQueryCount;
+  const errorsBeforeCooldownWakes = dispatchErrors.length;
   for (let i = 0; i < 8; i++) await dispatch();
+  const dispatcherOutboxQueriesDuringBackoff = dispatcherQueryCount - outboxQueriesBeforeCooldownWakes;
+  const dispatcherErrorsDuringBackoff = dispatchErrors.length - errorsBeforeCooldownWakes;
   assert.equal(dispatchErrors.length, 1, 'repeated wakes are held by exponential cooldown rather than log/retry storm');
-  assert.equal(dispatcherQueryCount, 1, 'cooldown avoids repeated PostgreSQL outbox scans');
+  assert.equal(dispatcherOutboxQueriesDuringBackoff, 0, 'cooldown avoids repeated PostgreSQL outbox scans');
+  assert.equal(dispatcherErrorsDuringBackoff, 0, 'cooldown emits no additional diagnostics');
 
   kickRelease();
   await until('active action durable completion while Redis is saturated', async () => (await row(activeOperationId))?.status === 'succeeded');
@@ -275,7 +281,7 @@ try {
   console.info(JSON.stringify({
     event: 'redis_saturation_integration_passed', redisVersion, oomRejectedWrites, usedMemoryBytes, maxMemoryBytes,
     acceptedRows: 2, actionsAfterRecovery: activeKickCount + pendingKickCount, expiriesAfterRecovery: unbanCount,
-    dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringBackoff: dispatcherQueryCount,
+    dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringBackoff, dispatcherErrorsDuringBackoff,
     workerRedisErrors: workerErrors.length,
   }));
 } finally {

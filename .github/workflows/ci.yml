@@ -83,3 +83,12 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           RUN_REDIS_SATURATION_INTEGRATION: '1'
           VEYROBOT_ISOLATED_INTEGRATION: '1'
+      - name: Rewrite a representative Redis AOF and verify a cgroup OOM restart
+        run: node deploy/redis-memory.integration.mjs
+        env:
+          RUN_REDIS_MEMORY_INTEGRATION: '1'
+      - name: Run production images under Compose memory caps with controlled Discord adapter
+        run: node deploy/production-resource-profile.integration.mjs
+        env:
+          CI: 'true'
+          RUN_PRODUCTION_RESOURCE_PROFILE: '1'

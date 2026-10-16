@@ -37,6 +37,7 @@ try {
     assert.equal(Number(config.services[service]?.deploy?.resources?.limits?.memory), limit, `${service} rendered memory cap`);
   }
   assert.equal(config.services.redis.command.at(-2), '--maxmemory');
+  assert.equal(config.services.redis.secrets[0]?.target, 'redis.conf', 'Redis config secret is mounted at the path used by redis-server and its healthcheck');
   const redisMaxMemory = parseByteSize(config.services.redis.command.at(-1));
   const redisContainerLimit = config.services.redis.deploy.resources.limits.memory;
   assert.ok(redisMaxMemory <= redisContainerLimit * 0.75, 'Redis leaves at least 25% of its container limit outside maxmemory');
