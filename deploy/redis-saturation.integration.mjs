@@ -206,11 +206,11 @@ try {
   port = await reserveLoopbackPort();
   oomVolume = `veyrobot-pressure-aof-${suffix.slice(0, 12)}`;
   docker(['volume', 'create', oomVolume]);
-  const redisRun = docker(['run', '--detach', '--memory=128m', '--memory-swap=128m', '--name', container, '-p', `127.0.0.1:${port}:6379`, '-v', `${oomVolume}:/data`, 'redis:7-alpine', 'redis-server', '--dir', '/data', '--save', '', '--appendonly', 'yes', '--appendfsync', 'everysec', '--maxmemory', '24mb', '--maxmemory-policy', 'noeviction']);
+  const redisRun = docker(['run', '--detach', '--memory=64m', '--memory-swap=64m', '--name', container, '-p', `127.0.0.1:${port}:6379`, '-v', `${oomVolume}:/data`, 'redis:7-alpine', 'redis-server', '--dir', '/data', '--save', '', '--appendonly', 'yes', '--appendfsync', 'everysec', '--maxmemory', '24mb', '--maxmemory-policy', 'noeviction']);
   assert.ok(redisRun.stdout, 'isolated Redis 7 container started');
   const saturationHostConfig = JSON.parse(docker(['inspect', container, '--format', '{{json .HostConfig}}']).stdout);
-  assert.equal(saturationHostConfig.Memory, 128 * 1024 ** 2, 'the Redis integration container receives the bounded cgroup limit');
-  assert.equal(saturationHostConfig.MemorySwap, 128 * 1024 ** 2, 'maxmemory/OOM scenarios do not silently use container swap');
+  assert.equal(saturationHostConfig.Memory, 64 * 1024 ** 2, 'the Redis integration container receives the bounded cgroup limit');
+  assert.equal(saturationHostConfig.MemorySwap, 64 * 1024 ** 2, 'maxmemory/OOM scenarios do not silently use container swap');
   rawRedis = await connectRedis(port);
   await until('Redis PONG', async () => (await rawRedis.command(['PING'])) === 'PONG');
   const serverInfo = await rawRedis.command(['INFO', 'server']);
@@ -329,7 +329,7 @@ try {
   assert.equal(unbanCount, 1, 'a later reconciliation does not repeat a completed expiry');
 
   // Separate cgroup OOM test: disable Redis maxmemory only after the maxmemory refusal assertions above.
-  // PostgreSQL remains the durable outbox while Redis itself is killed under a bounded 128 MiB cgroup.
+  // PostgreSQL remains the durable outbox while Redis itself is killed under a bounded 64 MiB cgroup.
   await prisma.guildConfig.createMany({ data: [oomPendingGuildId, oomExpiryGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })) });
   createGuild(activeGuildId, activeTargetId, { oomHoldKick: true });
   createGuild(oomPendingGuildId, oomPendingTargetId);
@@ -365,7 +365,7 @@ try {
     const result = docker(['inspect', container, '--format', '{{json .State}}'], true);
     try { return JSON.parse(result.stdout).OOMKilled === true; } catch { return false; }
   }, 30_000);
-  console.info(JSON.stringify({ event: 'redis_cgroup_oom_confirmed', containerLimitBytes: 128 * 1024 ** 2 }));
+  console.info(JSON.stringify({ event: 'redis_cgroup_oom_confirmed', containerLimitBytes: 64 * 1024 ** 2 }));
   const oomState = JSON.parse(docker(['inspect', container, '--format', '{{json .State}}']).stdout);
   assert.equal(oomState.OOMKilled, true, 'Docker confirms the Redis process was cgroup OOM-killed');
   const outageStartedAt = Date.now();
@@ -440,7 +440,7 @@ try {
     acceptedRows: 2, actionsAfterRecovery: activeKickCount + pendingKickCount, expiriesAfterRecovery: unbanCount,
     dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringBackoff, dispatcherErrorsDuringBackoff,
     workerRedisErrors: workerErrors.length, queueRedisErrors: queueErrors.length, oomQueueDeliveries,
-    cgroupOom: { containerLimitBytes: 128 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, oomWriterStopped: oomWriterStatus === 1, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
+    cgroupOom: { containerLimitBytes: 64 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, oomWriterStopped: oomWriterStatus === 1, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
   }));
 } finally {
   kickRelease?.();
