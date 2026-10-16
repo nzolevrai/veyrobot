@@ -92,7 +92,7 @@ function createGuild(guildId, targetId, { holdKick = false, banReason } = {}) {
 function parseResp(buffer) {
   const end = buffer.indexOf('\r\n');
   if (end < 0) return undefined;
-  const marker = buffer[0];
+  const marker = String.fromCharCode(buffer[0]);
   const line = buffer.subarray(1, end).toString();
   if (marker === '$') {
     const length = Number(line);
