@@ -60,7 +60,7 @@ function pipeRedis(name, count) {
       clearTimeout(timer);
       if (timedOut) reject(new Error('Redis pipeline exceeded its 90 second test bound.'));
       else if (status === 0) resolve(JSON.parse(stdout));
-      else reject(new Error(`Redis pipeline exited ${status}.`));
+      else reject(new Error(`Redis pipeline exited ${status}: ${stderr.slice(0, 1000) || stdout.slice(-1000) || 'no output from redis-cli'}`));
     });
   });
 }
@@ -90,6 +90,7 @@ try {
   assert.equal(hostConfig.MemorySwap, 512 * 1024 ** 2, 'Redis rewrite container has no swap allowance beyond its cgroup memory limit');
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory']).stdout.split(/\r?\n/)[1], '268435456');
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory-policy']).stdout.split(/\r?\n/)[1], 'noeviction');
+  assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'SET', 'auto-aof-rewrite-percentage', '0']).stdout, 'OK', 'automatic AOF rewrite is disabled so the measured rewrite is the explicit test operation');
   let seedInput = '';
   for (let i = 0; i < 60_000; i++) {
     const key = `seed:${i}`;
@@ -98,6 +99,7 @@ try {
   }
   const seeded = spawnSync('docker', ['exec', '-i', aof, 'redis-cli', '--pipe'], { input: seedInput, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
   assert.equal(seeded.status, 0, `representative AOF data written (${seeded.stderr?.slice(0, 300) ?? 'no stderr'})`);
+  await waitFor('Redis is idle after fixture seeding', () => /aof_rewrite_in_progress:0\r?\n/.test(docker(['exec', aof, 'redis-cli', 'INFO', 'persistence']).stdout));
   const concurrentWrites = 1_000;
   const writer = pipeRedis(aof, concurrentWrites);
   const memorySamples = [];
