@@ -211,7 +211,7 @@ await prisma.$disconnect();`;
   await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; await prisma.recoveryGate.create({data:{id:'unexpected-row',epochHash:'${alternateGateHash}'}}); await prisma.$disconnect();`], freshEnv);
   const alternateGateInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', freshInitEnv);
   assertCliFailure(alternateGateInit, 'initialization refuses any existing recovery gate row, not only the singleton id');
-  const alternateGateRead = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const rows=await prisma.recoveryGate.findMany(); await prisma.$disconnect(); console.log(JSON.stringify(rows));`], freshEnv);
+  const alternateGateRead = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const rows=await prisma.recoveryGate.findMany({select:{id:true,epochHash:true}}); await prisma.$disconnect(); console.log(JSON.stringify(rows));`], freshEnv);
   assert.deepEqual(JSON.parse(alternateGateRead.trim()), [{ id: 'unexpected-row', epochHash: alternateGateHash }], 'refusing init leaves an unexpected gate row unchanged');
   await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; await prisma.recoveryGate.delete({where:{id:'unexpected-row'}}); await prisma.$disconnect();`], freshEnv);
   const freshInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', freshInitEnv);
