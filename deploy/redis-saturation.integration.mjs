@@ -340,7 +340,7 @@ try {
   await until('AOF disabled before non-durable OOM filler', async () => /aof_enabled:0/.test(await rawRedis.command(['INFO', 'persistence'])));
   const configured = await rawRedis.command(['CONFIG', 'SET', 'maxmemory', '0']);
   assert.equal(configured, 'OK', 'cgroup OOM phase disables Redis maxmemory so it cannot be confused with a noeviction refusal');
-  assert.equal((await rawRedis.command(['CONFIG', 'GET', 'maxmemory'])).split(/\r?\n/)[1], '0', 'cgroup test confirms logical Redis maxmemory is disabled');
+  assert.match(await rawRedis.command(['INFO', 'memory']), /^maxmemory:0$/m, 'cgroup test confirms logical Redis maxmemory is disabled');
   const oomBlock = 'q'.repeat(1024 * 1024);
   let oomWriterStatus = 0;
   for (let i = 0; i < 256; i++) {
