@@ -159,14 +159,22 @@ try {
 
   compose(['up', '-d', 'postgres', 'redis']);
   let dependencyHealthPolls = 0;
-  await until('PostgreSQL and Redis health', () => {
-    const states = Object.fromEntries(['postgres', 'redis'].map(service => {
-      const state = JSON.parse(inspect(containerId(service), '{{json .State}}'));
-      return [service, { running: state.Running, health: state.Health?.Status ?? 'none', exitCode: state.ExitCode, restarts: Number(inspect(containerId(service), '{{.RestartCount}}')) }];
-    }));
-    if (++dependencyHealthPolls % 10 === 0) console.info(JSON.stringify({ event: 'resource_profile_dependency_health', states }));
-    return Object.values(states).every(state => state.health === 'healthy');
-  });
+  try {
+    await until('PostgreSQL and Redis health', () => {
+      const states = Object.fromEntries(['postgres', 'redis'].map(service => {
+        const state = JSON.parse(inspect(containerId(service), '{{json .State}}'));
+        return [service, { running: state.Running, health: state.Health?.Status ?? 'none', exitCode: state.ExitCode, restarts: Number(inspect(containerId(service), '{{.RestartCount}}')) }];
+      }));
+      if (++dependencyHealthPolls % 10 === 0) console.info(JSON.stringify({ event: 'resource_profile_dependency_health', states }));
+      return Object.values(states).every(state => state.health === 'healthy');
+    });
+  } catch (error) {
+    const redisLogs = docker(['logs', '--tail', '30', containerId('redis')], { allowFailure: true }).stdout
+      .split(/\r?\n/)
+      .filter(line => /fatal|error|permission|denied|config file|restart/i.test(line) && !/requirepass/i.test(line))
+      .map(line => line.replaceAll(redisPassword, '[redacted]'));
+    throw new Error(`${error instanceof Error ? error.message : 'Redis dependency did not become healthy'} Redis diagnostic lines: ${redisLogs.join(' | ') || '(no matching lines)'}`);
+  }
   compose(['up', '--build', 'migrate']);
   const migrationId = containerId('migrate');
   assert.equal(Number(inspect(migrationId, '{{.State.ExitCode}}')), 0, 'production migration image completed successfully');

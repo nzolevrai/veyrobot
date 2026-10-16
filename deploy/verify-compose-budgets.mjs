@@ -36,9 +36,11 @@ try {
   for (const [service, limit] of Object.entries(expected)) {
     assert.equal(Number(config.services[service]?.deploy?.resources?.limits?.memory), limit, `${service} rendered memory cap`);
   }
-  assert.equal(config.services.redis.command.at(-2), '--maxmemory');
+  const redisCommand = config.services.redis.command.join(' ');
+  assert.deepEqual(config.services.redis.entrypoint, ['/bin/sh', '-ec']);
+  assert.match(redisCommand, /cp \/run\/secrets\/redis\.conf \/tmp\/redis\.conf.*chown redis:redis.*chmod 0400.*setpriv --reuid redis --regid redis --clear-groups redis-server \/tmp\/redis\.conf/);
   assert.equal(config.services.redis.secrets[0]?.target, 'redis.conf', 'Redis config secret is mounted at the path used by redis-server and its healthcheck');
-  const redisMaxMemory = parseByteSize(config.services.redis.command.at(-1));
+  const redisMaxMemory = parseByteSize(redisCommand.match(/--maxmemory\s+(\S+)/)?.[1]);
   const redisContainerLimit = config.services.redis.deploy.resources.limits.memory;
   assert.ok(redisMaxMemory <= redisContainerLimit * 0.75, 'Redis leaves at least 25% of its container limit outside maxmemory');
   for (const service of ['api', 'bot', 'dashboard', 'migrate']) {

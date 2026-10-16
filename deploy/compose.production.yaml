@@ -36,7 +36,14 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "/run/secrets/redis.conf", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        cp /run/secrets/redis.conf /tmp/redis.conf &&
+        chown redis:redis /tmp/redis.conf &&
+        chmod 0400 /tmp/redis.conf &&
+        exec /usr/bin/setpriv --reuid redis --regid redis --clear-groups
+        redis-server /tmp/redis.conf --maxmemory ${REDIS_MAXMEMORY:-256mb}
     deploy:
       resources:
         limits:
