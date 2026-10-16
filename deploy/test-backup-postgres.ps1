@@ -180,7 +180,7 @@ function docker {
       Assert-True ($workMode -eq '700' -and $archiveMode -eq '600' -and $leaseMode -eq '600') 'interrupted Linux temporaries are private from their creation'
     }
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $backupDirectory ($interruptedTemp.Name -replace '\.tmp$','')))) 'temporary archive is not published as a completed backup'
-    $interruptedWork.LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-2)
+    [System.IO.Directory]::SetLastWriteTimeUtc($interruptedWork.FullName, [DateTime]::UtcNow.AddHours(-2))
     Invoke-FakeBackup 'cleanup-active' -CleanupStaleTemporaries -StaleAfterHours 1 | Out-Null
     Assert-True (Test-Path -LiteralPath $interruptedWork.FullName) 'cleanup skips a directory whose exclusive lease is held by another process'
   } finally {
@@ -190,15 +190,15 @@ function docker {
   Assert-True (-not (Test-Path -LiteralPath $interruptedWork.FullName)) 'bounded cleanup removes the abandoned temporary only after its lease is released'
 
   $otherStaleId = [guid]::NewGuid().ToString('N')
-  $otherStaleName = '.veyrobot-' + [DateTime]::UtcNow.AddHours(-3).ToString('yyyyMMddTHHmmssfffZ') + '-' + $otherStaleId + '.work'
+  $otherStaleName = '.veyrobot-' + [DateTime]::UtcNow.AddHours(-3).ToString("yyyyMMdd'T'HHmmssfff'Z'") + '-' + $otherStaleId + '.work'
   $otherStalePath = Join-Path $backupDirectory $otherStaleName
-  New-Item -ItemType Directory -Path $otherStalePath | Out-Null
+  [void][System.IO.Directory]::CreateDirectory($otherStalePath)
   [System.IO.File]::WriteAllText((Join-Path $otherStalePath 'private.tmp'), 'other run')
-  (Get-Item -LiteralPath $otherStalePath).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-2)
-  $secondStalePath = Join-Path $backupDirectory ('.veyrobot-' + [DateTime]::UtcNow.AddHours(-4).ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N') + '.work')
-  New-Item -ItemType Directory -Path $secondStalePath | Out-Null
+  [System.IO.Directory]::SetLastWriteTimeUtc($otherStalePath, [DateTime]::UtcNow.AddHours(-2))
+  $secondStalePath = Join-Path $backupDirectory ('.veyrobot-' + [DateTime]::UtcNow.AddHours(-4).ToString("yyyyMMdd'T'HHmmssfff'Z'") + '-' + [guid]::NewGuid().ToString('N') + '.work')
+  [void][System.IO.Directory]::CreateDirectory($secondStalePath)
   [System.IO.File]::WriteAllText((Join-Path $secondStalePath 'private.tmp'), 'another run')
-  (Get-Item -LiteralPath $secondStalePath).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-3)
+  [System.IO.Directory]::SetLastWriteTimeUtc($secondStalePath, [DateTime]::UtcNow.AddHours(-3))
   Invoke-FakeBackup 'cleanup-stale' -CleanupStaleTemporaries -StaleAfterHours 1 -MaxCleanupItems 1 | Out-Null
   Assert-True ((Test-Path -LiteralPath $otherStalePath) -or (Test-Path -LiteralPath $secondStalePath)) 'cleanup batch limit leaves excess stale work for a later run'
 
