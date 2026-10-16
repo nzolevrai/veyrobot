@@ -18,6 +18,12 @@ function logThrottled(key: string, message: string, error: unknown): void {
   if (lastErrorLogAt.size > 32) lastErrorLogAt.delete(lastErrorLogAt.keys().next().value!);
   logBotError('bot_error', key, message, error);
 }
+function redisInfoNumber(info: string, key: string, field?: string): number {
+  const line = info.split(/\r?\n/).find(value => value.startsWith(`${key}:`));
+  if (!field) return Number(line?.slice(key.length + 1).split(',')[0] ?? 0) || 0;
+  const match = line?.match(new RegExp(`(?:^|,)${field}=(\\d+)(?:,|$)`));
+  return match ? Number(match[1]) : 0;
+}
 
 const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379'), VEYROBOT_RECOVERY_EPOCH: z.string().min(32).max(256) });
 const envResult = envSchema.safeParse(process.env);
@@ -114,7 +120,7 @@ client.once(Events.ClientReady, async ready => {
   loopDelay.enable();
   let previousElu = performance.eventLoopUtilization();
   const metricsTimer = setInterval(() => { void (async () => {
-    const [rows, queueCounts, connections] = await Promise.all([
+    const [rows, queueCounts, connections, redisInfo] = await Promise.all([
       prisma.$queryRaw<Array<{ requested: bigint; running: bigint; uncertainActions: bigint; uncertainExpiries: bigint; oldestRequestedSeconds: number | null; overdueExpiries: bigint; oldestExpirySeconds: number | null }>>`
         SELECT
           (SELECT COUNT(*) FROM "ModerationCase" WHERE status = 'requested') AS requested,
@@ -126,11 +132,15 @@ client.once(Events.ClientReady, async ready => {
           (SELECT EXTRACT(EPOCH FROM now() - MIN("expiresAt"))::float8 FROM "ModerationCase" WHERE action = 'TEMPBAN' AND status = 'succeeded' AND "expiryStatus" = 'scheduled' AND "expiresAt" < now()) AS "oldestExpirySeconds"`,
       queue.getJobCounts('waiting', 'active', 'delayed', 'failed'),
       prisma.$queryRaw<Array<{ count: number; lockWaiters: number }>>`SELECT COUNT(*)::integer AS count, COUNT(*) FILTER (WHERE wait_event_type = 'Lock')::integer AS "lockWaiters" FROM pg_stat_activity WHERE datname = current_database()`,
+      queue.getBackend().client.then(client => client.info()),
     ]);
     const memory = process.memoryUsage();
     const elu = performance.eventLoopUtilization(previousElu);
     previousElu = performance.eventLoopUtilization();
-    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
+    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, redis: {
+      usedMemoryBytes: redisInfoNumber(redisInfo, 'used_memory'), maxMemoryBytes: redisInfoNumber(redisInfo, 'maxmemory'),
+      connectedClients: redisInfoNumber(redisInfo, 'connected_clients'), oomErrors: redisInfoNumber(redisInfo, 'errorstat_OOM', 'count'),
+    }, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
       errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
       eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, (_key, value) => typeof value === 'bigint' ? Number(value) : value));
     loopDelay.reset();

@@ -20,6 +20,8 @@ Si Redis est indisponible, l'API peut garder les nouvelles demandes en PostgreSQ
 
 Le producteur Redis et le Worker ont des politiques de reconnexion distinctes ; le Worker attend la reprise, le dispatcher évite une publication pendant une déconnexion. Une réponse 429 Discord doit respecter `Retry-After` et les en-têtes de bucket via discord.js. Une erreur explicite et une réponse ambiguë n'autorisent pas la même reprise. Ne lancer aucune sanction de diagnostic sur un serveur réel.
 
+Le dispatcher arrête une passe à la première erreur de publication BullMQ et réessaie après un backoff exponentiel de 1 à 30 s; un succès réinitialise le délai. Les demandes et échéances restent dans PostgreSQL. Redis utilise `noeviction` : surveiller `redis.usedMemoryBytes / redis.maxMemoryBytes`, `redis.oomErrors`, `queue.waiting/active/delayed/failed` et l'âge SQL des opérations. Les valeurs de budget, la marge Redis, la procédure de saturation CI et les seuils initiaux sont décrits dans [MEMORY-REDIS-BUDGETS-2026-10-16.md](MEMORY-REDIS-BUDGETS-2026-10-16.md). Les métriques sont émises en logs JSON uniquement; les seuils ne sont pas configurés dans un système d'alerte déployé. Utiliser `docker stats`/`docker inspect` pour RSS, limites cgroup et `OOMKilled`; `INFO errorstats` et les logs ne remplacent pas une supervision persistante.
+
 Une erreur `Client` non récupérable, une rejection non gérée ou une exception non capturée ferme le bot puis termine le processus avec un code non nul. Le superviseur de production doit le relancer avec temporisation et alerte, en respectant le verrou d'instance PostgreSQL. Le Compose de développement utilise `restart: on-failure`; ce réglage n'est pas un plan de supervision production.
 
 ## Sauvegarde, restauration, rétention

@@ -8,6 +8,8 @@ Un contrôle automatisé Chrome headless a testé le dashboard construit avec la
 
 Les limites consolidées et leur classification figurent dans [FOUNDATION-QUALITY-REVIEW-2026-10-15.md](FOUNDATION-QUALITY-REVIEW-2026-10-15.md). La production est préparée par une topologie de référence, mais aucun service n'est provisionné ni déployé.
 
+Les premiers budgets mémoire Compose, `maxmemory` Redis/noeviction, backoff de publication et intégration de saturation sont décrits dans [MEMORY-REDIS-BUDGETS-2026-10-16.md](MEMORY-REDIS-BUDGETS-2026-10-16.md). Les chiffres de référence viennent de campagnes antérieures sans ces caps; le comportement des processus sous plafonds et l'alerting en hébergement restent à mesurer/déployer.
+
 ## Étape 1 — socle et premier parcours
 
 Monorepo TypeScript strict, PostgreSQL/Prisma, Redis/BullMQ, API Fastify, Dashboard Next, bot Gateway séparé, OAuth Discord, sélection des serveurs, avertissements et dossiers paginés sont livrés. Les migrations locales PostgreSQL ont été appliquées et les tests d'intégration du dossier ont déjà été exécutés sur le service local. Les validations manuelles actuelles du propriétaire sont listées dans la section de statut ci-dessus; l'historique ci-dessous ne remplace pas cette liste.

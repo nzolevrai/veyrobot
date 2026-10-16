@@ -15,6 +15,10 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-1G}
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in the external environment}
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
@@ -32,7 +36,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "/run/secrets/redis.conf"]
+    command: ["redis-server", "/run/secrets/redis.conf", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}"]
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-384M}
     secrets:
       - redis_config
     volumes:
@@ -47,9 +55,14 @@ services:
     <<: *application
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=${MIGRATE_NODE_HEAP_MB:-256}
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
     command: ["corepack", "pnpm", "db:migrate"]
     restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: ${MIGRATE_MEMORY_LIMIT:-512M}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,6 +73,7 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=${API_NODE_HEAP_MB:-256}
       API_PORT: "4000"
       API_PUBLIC_URL: ${API_PUBLIC_URL:?set API_PUBLIC_URL in the external environment}
       DASHBOARD_URL: ${DASHBOARD_URL:?set DASHBOARD_URL in the external environment}
@@ -77,6 +91,10 @@ services:
       MAX_PENDING_GLOBAL: ${MAX_PENDING_GLOBAL:-5000}
       MAX_PENDING_PER_GUILD: ${MAX_PENDING_PER_GUILD:-100}
     expose: ["4000"]
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY_LIMIT:-512M}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -94,8 +112,13 @@ services:
     command: ["corepack", "pnpm", "--filter", "@veyrobot/bot", "start"]
     restart: unless-stopped
     stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: ${BOT_MEMORY_LIMIT:-768M}
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=${BOT_NODE_HEAP_MB:-384}
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       VEYROBOT_RECOVERY_EPOCH: ${VEYROBOT_RECOVERY_EPOCH:?set external recovery epoch}
@@ -116,9 +139,14 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
+    deploy:
+      resources:
+        limits:
+          memory: ${DASHBOARD_MEMORY_LIMIT:-512M}
     environment:
       API_INTERNAL_URL: http://api:4000
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=${DASHBOARD_NODE_HEAP_MB:-256}
       DASHBOARD_TRUSTED_CLIENT_IP_HEADER: x-real-ip
       API_PROXY_CLIENT_IP_SECRET: ${API_PROXY_CLIENT_IP_SECRET:?set API_PROXY_CLIENT_IP_SECRET in the external environment}
       SUPPORT_DISCORD_URL: ${SUPPORT_DISCORD_URL:-}

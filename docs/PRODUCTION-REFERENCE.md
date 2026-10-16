@@ -22,6 +22,12 @@ docker compose --env-file .env.production -f deploy/compose.production.yaml up -
 
 Ne lancer ces commandes que sur l'hôte d'exploitation choisi. Avant une mise à jour, sauvegarder PostgreSQL, vérifier les migrations additives, exécuter `migrate` avec la nouvelle image et observer `/ready` avant de reprendre le trafic. La configuration ne fournit pas de stockage de sauvegarde externe, de TLS, de WAF ni de supervision gérée.
 
+## Budgets de ressources
+
+Les limites cgroup Compose, heaps Node et leur justification figurent dans [MEMORY-REDIS-BUDGETS-2026-10-16.md](MEMORY-REDIS-BUDGETS-2026-10-16.md). Valeurs initiales : API 512 MiB/heap old-space 256 MiB; Dashboard 512/256; bot 768/384; PostgreSQL 1 GiB; Redis 384 MiB conteneur et 256 MiB `maxmemory`; migration 512/256. Configurer les limites via les variables documentées et garder la marge Redis de 128 MiB. Les 3,125 GiB de caps de services persistants laissent au moins 1,5 GiB pour OS/Docker/pointes; 5 GiB hôte est un plancher de configuration, pas une capacité mesurée. Vérifier avec `docker compose config` et `docker inspect`; la CI exécute un probe de limite cgroup.
+
+Redis reste sur AOF avec `appendfsync everysec`, RDB périodique désactivé et `noeviction`. PostgreSQL garde les opérations durables. En saturation, le dispatcher utilise un backoff exponentiel plafonné à 30 s et reprend la lecture de l'outbox après succès. Cette configuration réduit la fréquence de tentatives; elle n'ajoute ni stockage métrique ni alertes gérées.
+
 ## Chaîne de confiance de l'adresse client
 
 Le frontal TLS doit écouter sur 443, appliquer sa limite publique et **remplacer**, jamais concaténer, `X-Real-IP` par l'adresse source qu'il a lui-même observée. Il transmet `Host` et `X-Forwarded-Proto: https` et n'expose pas directement le port 3000 sur Internet. Par exemple, pour Nginx sur le même hôte :
