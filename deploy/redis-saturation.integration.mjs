@@ -385,9 +385,13 @@ try {
   await until('Redis reconnect after AOF restart', async () => (await rawRedis.command(['PING']).catch(() => '')) === 'PONG', 30_000);
   assert.equal(await rawRedis.command(['GET', `oom-aof-sentinel:${suffix}`]), suffix, 'the AOF volume restores a key fsynced before the OOM');
   // A supervised bot restart is the supported recovery path after Redis process
-  // OOM. Rebuild production BullMQ consumers against the restored Redis endpoint.
+  // OOM. Drop only this disposable queue's stale transport keys after recording
+  // the AOF sentinel, then replay a completed job to check idempotence and let
+  // the production dispatcher republish rows that remain requested in PostgreSQL.
   queue = new Queue(queueName, { connection: moderation.redisConnection(redisUrl, true) });
   await queue.waitUntilReady();
+  await queue.obliterate({ force: true });
+  await queue.add('moderation-action', { guildId: activeGuildId, operationId: oomOperationId }, { jobId: oomOperationId, attempts: 1, removeOnComplete: true, removeOnFail: true });
   const recoveredConsumerConnection = moderation.redisConnection(redisUrl);
   worker = createModerationWorker(client, recoveredConsumerConnection, prisma, moderation, rejectPendingAfterDisable, () => {
     if (dispatch) setImmediate(() => void dispatch());
@@ -408,11 +412,11 @@ try {
     const [pending, expiry] = await Promise.all([row(oomPendingOperationId), prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })]);
     return pending?.status === 'succeeded' && expiry?.expiryStatus === 'succeeded';
   }, 60_000);
-  await until('BullMQ safely settles OOM interrupted delivery', async () => {
+  await until('BullMQ settles explicit redelivery and reconciled jobs after Redis OOM', async () => {
+    await dispatch();
     const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed').catch(() => null);
     return counts && Object.values(counts).every(count => count === 0);
-  }, 60_000);
-  await dispatch();
+  }, 30_000);
   assert.equal((await row(oomOperationId)).status, 'succeeded');
   assert.equal((await row(oomPendingOperationId)).status, 'succeeded');
   assert.equal((await prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })).expiryStatus, 'succeeded');
