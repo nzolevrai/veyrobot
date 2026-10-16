@@ -42,6 +42,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   let apiLogs = '';
   let caseId;
   let actionCaseId;
+  let grantTableRenamed = false;
   const start = async () => {
     child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.setEncoding('utf8').on('data', chunk => { apiLogs = (apiLogs + chunk).slice(-1_000_000); });
@@ -354,12 +355,13 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     const expiredResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? expiredCookieB : expiredCookieA)));
     assert.deepEqual(expiredResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'expired sessions share the anonymous IP quota under concurrent replay');
 
-    const savedDatabaseUrl = childEnv.DATABASE_URL;
-    childEnv.DATABASE_URL = 'postgresql://unavailable:unavailable@127.0.0.1:1/unavailable?connect_timeout=1';
     childEnv.API_RATE_LIMIT_MAX = '2';
-    await stop(); await start();
+    await stop();
+    await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant" RENAME TO "SessionGrant_unavailable_fixture"');
+    grantTableRenamed = true;
+    await start();
     const grantFailureResponses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie)));
-    assert.deepEqual(grantFailureResponses.map(response => response.status).sort((a, b) => a - b), [429, 503, 503], 'a grant store outage never grants a session bucket and is still bounded by the IP quota');
+    assert.deepEqual(grantFailureResponses.map(response => response.status).sort((a, b) => a - b), [429, 503, 503], 'grant lookup failures never grant a session bucket and remain bounded by the IP quota');
     for (const response of grantFailureResponses.filter(item => item.status === 503)) {
       const body = await response.json();
       assert.equal(body.error, 'Vérification de session indisponible.');
@@ -369,7 +371,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await delay(50);
     const grantFailureLog = apiLogs.split(/\r?\n/).map(line => { try { return JSON.parse(line); } catch { return null; } })
       .find(entry => entry?.phase === 'session_grant_validation' && entry?.requestId === grantFailureResponses.find(item => item.status === 503)?.headers.get('x-request-id'));
-    assert.ok(grantFailureLog, 'grant-validation PostgreSQL failure is logged with the correlated requestId');
+    assert.ok(grantFailureLog, 'grant-validation store failure is logged with the correlated requestId');
     assert.equal(grantFailureLog.code, 'SESSION_CHECK_UNAVAILABLE');
     assert.equal(grantFailureLog.status, 503);
     assert.equal(typeof grantFailureLog.exception.message, 'string');
@@ -378,19 +380,20 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
     await stop(); await start();
     const preAuthFailureStatuses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie).then(response => response.status)));
-    assert.deepEqual(preAuthFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'the pre-auth IP limit caps database grant lookups even if the database is unavailable');
-    childEnv.DATABASE_URL = savedDatabaseUrl;
+    assert.deepEqual(preAuthFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'the pre-auth IP limit caps grant-store lookups when that relation is unavailable');
     await stop();
 
-    childEnv.DATABASE_URL = savedDatabaseUrl;
+    await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');
+    grantTableRenamed = false;
     childEnv.API_RATE_LIMIT_MAX = '90';
     childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
     await start();
     const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
     assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
-    console.log('API integration passed: OAuth, distinct valid-session quotas including installation-check, revoked/expired/incomplete fallback, forged headers, bounded pre-auth grant checks, outage behavior, adapter call counts, and public-route limits.');
+    console.log('API integration passed: OAuth, distinct valid-session quotas including installation-check, revoked/expired/incomplete fallback, forged headers, bounded pre-auth grant checks, grant-store failure handling, adapter call counts, and public-route limits.');
   } finally {
     await stop();
+    if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });
     if (actionCaseId) await prisma.moderationCase.deleteMany({ where: { id: actionCaseId } });
     await prisma.configAudit.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
