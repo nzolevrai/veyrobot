@@ -47,7 +47,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${REDIS_MEMORY_LIMIT:-384M}
+          memory: ${REDIS_MEMORY_LIMIT:-512M}
     secrets:
       - source: redis_config
         target: redis.conf

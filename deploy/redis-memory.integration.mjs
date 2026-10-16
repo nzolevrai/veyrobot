@@ -23,9 +23,32 @@ function stats(name) {
   const cgroupPeak = Number(docker(['exec', name, 'cat', '/sys/fs/cgroup/memory.peak']).stdout);
   return { workingBytes: bytes(working), limitBytes: bytes(limit), cgroupCurrentBytes: cgroupCurrent || null, cgroupPeakBytes: cgroupPeak || null, oomKilled: inspectState.OOMKilled, running: inspectState.Running, exitCode: inspectState.ExitCode };
 }
-function pipeRedis(name, input) {
+function pipeRedis(name, count) {
   return new Promise((resolve, reject) => {
-    const child = spawn('docker', ['exec', '-i', name, 'redis-cli', '--pipe'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const writer = String.raw`
+      const { spawn } = require('node:child_process');
+      const { randomBytes } = require('node:crypto');
+      const name = process.argv[1];
+      const count = Number(process.argv[2]);
+      const client = spawn('docker', ['exec', '-i', name, 'redis-cli', '--pipe'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      let stdout = ''; let stderr = '';
+      client.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+      client.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+      const frame = values => Buffer.concat([Buffer.from('*' + values.length + '\r\n'), ...values.flatMap(value => { const b = Buffer.from(value); return [Buffer.from('$' + b.length + '\r\n'), b, Buffer.from('\r\n')]; })]);
+      const done = new Promise((resolve, reject) => { client.on('error', reject); client.on('close', code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error('redis-cli pipe exited ' + code + ': ' + stderr.slice(0, 300)))); });
+      client.stdin.write(frame(['BGREWRITEAOF']));
+      (async () => {
+        for (let i = 0; i < count; i++) {
+          const key = 'activity:' + i;
+          const value = randomBytes(8192).toString('base64');
+          client.stdin.write(frame(['SET', key, value]));
+          if (i % 10 === 0) await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        client.stdin.end();
+      })().catch(error => client.stdin.destroy(error));
+      done.then(result => process.stdout.write(JSON.stringify(result))).catch(error => { console.error(error.message); process.exitCode = 1; });
+    `;
+    const child = spawn(process.execPath, ['-e', writer, name, String(count)], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -36,10 +59,9 @@ function pipeRedis(name, input) {
     child.on('close', status => {
       clearTimeout(timer);
       if (timedOut) reject(new Error('Redis pipeline exceeded its 90 second test bound.'));
-      else if (status === 0) resolve({ stdout, stderr });
+      else if (status === 0) resolve(JSON.parse(stdout));
       else reject(new Error(`Redis pipeline exited ${status}.`));
     });
-    child.stdin.end(input);
   });
 }
 async function waitFor(label, predicate, timeout = 30_000) {
@@ -55,7 +77,7 @@ try {
   docker(['volume', 'create', volume]);
   cleanups.push(() => docker(['volume', 'rm', '-f', volume], { allowFailure: true }));
   const aof = names[0];
-  docker(['run', '-d', '--name', aof, '--memory=384m', '--memory-swap=384m', '-v', `${volume}:/data`, 'redis:7-alpine', 'redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec', '--save', '', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction', '--dir', '/data']);
+  docker(['run', '-d', '--name', aof, '--memory=512m', '--memory-swap=512m', '-v', `${volume}:/data`, 'redis:7-alpine', 'redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec', '--save', '', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction', '--dir', '/data']);
   cleanups.push(() => docker(['rm', '-f', aof], { allowFailure: true }));
   await sleep(1_000);
   const initialState = JSON.parse(docker(['inspect', aof, '--format', '{{json .State}}']).stdout);
@@ -64,7 +86,7 @@ try {
     JSON.parse(docker(['inspect', aof, '--format', '{{json .HostConfig}}']).stdout),
     docker(['exec', aof, 'redis-cli', 'INFO', 'server']).stdout.match(/redis_version:([^\r\n]+)/)?.[1],
   ];
-  assert.equal(hostConfig.Memory, 384 * 1024 ** 2);
+  assert.equal(hostConfig.Memory, 512 * 1024 ** 2);
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory']).stdout.split(/\r?\n/)[1], '268435456');
   assert.equal(docker(['exec', aof, 'redis-cli', 'CONFIG', 'GET', 'maxmemory-policy']).stdout.split(/\r?\n/)[1], 'noeviction');
   let seedInput = '';
@@ -75,17 +97,8 @@ try {
   }
   const seeded = spawnSync('docker', ['exec', '-i', aof, 'redis-cli', '--pipe'], { input: seedInput, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
   assert.equal(seeded.status, 0, `representative AOF data written (${seeded.stderr?.slice(0, 300) ?? 'no stderr'})`);
-  let activityInput = '';
   const concurrentWrites = 1_000;
-  for (let i = 0; i < concurrentWrites; i++) {
-    const key = `activity:${i}`;
-    const value = randomBytes(8192).toString('base64');
-    activityInput += `*3\r\n$3\r\nSET\r\n$${key.length}\r\n${key}\r\n$${value.length}\r\n${value}\r\n`;
-  }
-  docker(['exec', aof, 'redis-cli', 'BGREWRITEAOF']);
-  const rewriteStartInfo = docker(['exec', aof, 'redis-cli', 'INFO', 'persistence']).stdout;
-  assert.match(rewriteStartInfo, /aof_rewrite_in_progress:1/, 'rewrite is active before concurrent write batch starts');
-  const writer = pipeRedis(aof, activityInput);
+  const writer = pipeRedis(aof, concurrentWrites);
   const memorySamples = [];
   let rewriteObservedDuringSampling = false;
   const end = Date.now() + 60_000;
@@ -102,7 +115,7 @@ try {
   }
   const writerResult = await writer;
   assert.match(writerResult.stdout, /errors: 0/);
-  assert.match(writerResult.stdout, /replies: 1000/);
+  assert.match(writerResult.stdout, /replies: 1001/);
   assert.equal(rewriteObservedDuringSampling, true, 'sampling overlapped the AOF rewrite');
   const persistence = docker(['exec', aof, 'redis-cli', 'INFO', 'persistence']).stdout;
   assert.match(persistence, /aof_last_bgrewrite_status:ok/);
@@ -136,7 +149,7 @@ try {
   console.info(JSON.stringify({
     event: 'redis_memory_integration_passed',
     redisVersion,
-    aofRewrite: { cgroupLimitBytes: hostConfig.Memory, redisMaxmemoryBytes: 256 * 1024 ** 2, peakCgroupBytes: aofPeakCgroupBytes, peakDockerStatsWorkingSetBytes: aofPeakRssBytes, redisMaxima: redisMetricsMax, dataKeysAfterRewrite: dbsize, concurrentWriteBatchSize: concurrentWrites, completion: 'aof_last_bgrewrite_status=ok' },
+    aofRewrite: { cgroupLimitBytes: hostConfig.Memory, redisMaxmemoryBytes: 256 * 1024 ** 2, configuredHeadroomBytes: hostConfig.Memory - 256 * 1024 ** 2, peakCgroupBytes: aofPeakCgroupBytes, peakDockerStatsWorkingSetBytes: aofPeakRssBytes, redisMaxima: redisMetricsMax, dataKeysAfterRewrite: dbsize, concurrentWriteBatchSize: concurrentWrites, completion: 'aof_last_bgrewrite_status=ok' },
     oom: { cgroupLimitBytes: 48 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, recoveredAofProbe: recovered || '<absent after abrupt-kill window>', restarted: true },
     limitation: 'Standalone Redis process evidence only; PostgreSQL durable operation and production worker recovery during cgroup OOM are covered only by separate maxmemory-saturation integration, not by this OOM scenario.',
   }));

@@ -25,7 +25,7 @@ const sessionKey = randomUUID().replaceAll('-', '').padEnd(64, 'b');
 const apiInspectorPort = 9231;
 const dashboardInspectorPort = 9232;
 const botInspectorPort = 9233;
-const expectedMemory = { postgres: 1024 ** 3, redis: 384 * 1024 ** 2, migrate: 512 * 1024 ** 2, api: 512 * 1024 ** 2, bot: 768 * 1024 ** 2, dashboard: 512 * 1024 ** 2 };
+const expectedMemory = { postgres: 1024 ** 3, redis: 512 * 1024 ** 2, migrate: 512 * 1024 ** 2, api: 512 * 1024 ** 2, bot: 768 * 1024 ** 2, dashboard: 512 * 1024 ** 2 };
 const operationPrefix = `resource_${suffix}_`;
 const actorId = '123456789012345679';
 const guildIds = Array.from({ length: 24 }, (_, i) => String(800_000_000_000_000_000n + BigInt(parseInt(suffix.slice(0, 6), 16) * 100 + i)));
@@ -148,7 +148,7 @@ try {
   await writeFile(envFile, [
     'NODE_ENV=production', `VEYROBOT_IMAGE_TAG=resource-${suffix}`, 'POSTGRES_USER=veyrobot', `POSTGRES_PASSWORD=${postgresPassword}`, 'POSTGRES_DB=veyrobot',
     `DATABASE_URL=postgresql://veyrobot:${encodeURIComponent(postgresPassword)}@postgres:5432/veyrobot?schema=public`, 'DATABASE_POOL_SIZE=10',
-    `REDIS_PASSWORD=${redisPassword}`, `REDIS_URL=redis://:${encodeURIComponent(redisPassword)}@redis:6379`, 'REDIS_MEMORY_LIMIT=384M', 'REDIS_MAXMEMORY=256mb',
+    `REDIS_PASSWORD=${redisPassword}`, `REDIS_URL=redis://:${encodeURIComponent(redisPassword)}@redis:6379`, 'REDIS_MEMORY_LIMIT=512M', 'REDIS_MAXMEMORY=256mb',
     `VEYROBOT_RECOVERY_EPOCH=${epoch}`, 'API_PUBLIC_URL=http://127.0.0.1:3000/api', 'DASHBOARD_URL=http://127.0.0.1:3000',
     'API_RATE_LIMIT_MAX=90', 'API_PREAUTH_RATE_LIMIT_MAX=180', 'API_TRUSTED_PROXIES=', `API_PROXY_CLIENT_IP_SECRET=${apiProxySecret}`,
     'DISCORD_CLIENT_ID=123456789012345678', 'DISCORD_CLIENT_SECRET=fake-resource-profile-oauth-secret', 'DISCORD_BOT_TOKEN=fake-resource-profile-token',

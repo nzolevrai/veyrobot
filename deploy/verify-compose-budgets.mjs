@@ -31,7 +31,7 @@ try {
   const config = JSON.parse(configText);
   const expected = {
     postgres: 1024 ** 3, migrate: 512 * 1024 ** 2, api: 512 * 1024 ** 2,
-    bot: 768 * 1024 ** 2, dashboard: 512 * 1024 ** 2, redis: 384 * 1024 ** 2,
+    bot: 768 * 1024 ** 2, dashboard: 512 * 1024 ** 2, redis: 512 * 1024 ** 2,
   };
   for (const [service, limit] of Object.entries(expected)) {
     assert.equal(Number(config.services[service]?.deploy?.resources?.limits?.memory), limit, `${service} rendered memory cap`);
@@ -42,7 +42,7 @@ try {
   assert.equal(config.services.redis.secrets[0]?.target, 'redis.conf', 'Redis config secret is mounted at the path used by redis-server and its healthcheck');
   const redisMaxMemory = parseByteSize(redisCommand.match(/--maxmemory\s+(\S+)/)?.[1]);
   const redisContainerLimit = config.services.redis.deploy.resources.limits.memory;
-  assert.ok(redisMaxMemory <= redisContainerLimit * 0.75, 'Redis leaves at least 25% of its container limit outside maxmemory');
+  assert.ok(redisContainerLimit - redisMaxMemory >= 256 * 1024 ** 2, 'Redis leaves a 256 MiB cgroup budget above maxmemory for AOF file cache, COW, clients and native allocations');
   for (const service of ['api', 'bot', 'dashboard', 'migrate']) {
     const heap = Number(config.services[service].environment.NODE_OPTIONS.match(/max-old-space-size=(\d+)/)?.[1]);
     assert.ok(heap > 0 && heap * 1024 ** 2 <= config.services[service].deploy.resources.limits.memory * 0.75, `${service} heap leaves native/buffer/cgroup headroom`);
