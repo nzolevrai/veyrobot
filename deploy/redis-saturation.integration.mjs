@@ -139,6 +139,13 @@ async function createRequest(guildId, targetId, operationId, reason) {
   return moderation.submitModerationAction(prisma, { guildId, actorId, targetId, action: 'KICK', reason, operationId });
 }
 async function row(operationId) { return prisma.moderationCase.findUnique({ where: { operationId } }); }
+async function clearFillerKeys() {
+  if (!rawRedis) return;
+  for (let offset = 0; offset < fillerKeys.length; offset += 500) {
+    await rawRedis.command(['DEL', ...fillerKeys.slice(offset, offset + 500)]).catch(() => undefined);
+  }
+  fillerKeys.length = 0;
+}
 
 try {
   await prisma.guildConfig.createMany({
@@ -198,17 +205,30 @@ try {
   await delay(20); // let the dispatcher's initial Redis-ready promise settle
 
   const filler = 'x'.repeat(1024 * 1024);
-  let oomRejectedWrites = 0;
+  let largeChunkRejected = false;
   for (let i = 0; i < 40; i++) {
     const key = `pressure:filler:${i}`;
     try { await rawRedis.command(['SET', key, filler]); fillerKeys.push(key); }
     catch (error) {
       assert.match(error.message, /^OOM /, 'Redis refused a write because maxmemory was reached');
-      oomRejectedWrites++;
+      largeChunkRejected = true;
       break;
     }
   }
-  assert.equal(oomRejectedWrites, 1, 'the isolated Redis 7 instance reached noeviction maxmemory');
+  assert.ok(largeChunkRejected, 'a 1 MiB write proves the isolated Redis 7 instance reached noeviction maxmemory');
+  const smallFiller = 'x'.repeat(1024);
+  let smallChunkRejected = false;
+  for (let i = 40; i < 32_040; i++) {
+    const key = `pressure:filler:${i}`;
+    try { await rawRedis.command(['SET', key, smallFiller]); fillerKeys.push(key); }
+    catch (error) {
+      assert.match(error.message, /^OOM /, 'Redis rejects even a small write when effectively full');
+      smallChunkRejected = true;
+      break;
+    }
+  }
+  assert.ok(smallChunkRejected, 'fine-grained filling leaves less than 1 KiB for a BullMQ write');
+  const oomRejectedWrites = 2;
   const firstFailureAt = Date.now();
   await dispatch();
   assert.equal(dispatchErrors.length, 1, 'a refused publish is diagnosed once');
@@ -225,7 +245,7 @@ try {
 
   kickRelease();
   await until('active action durable completion while Redis is saturated', async () => (await row(activeOperationId))?.status === 'succeeded');
-  await rawRedis.command(['DEL', ...fillerKeys]);
+  await clearFillerKeys();
   const remainingBackoff = Math.max(0, firstFailureAt + 1_010 - Date.now());
   if (remainingBackoff) await delay(remainingBackoff);
   await dispatch();
@@ -260,7 +280,7 @@ try {
   }));
 } finally {
   kickRelease?.();
-  if (rawRedis && fillerKeys.length) await rawRedis.command(['DEL', ...fillerKeys]).catch(() => undefined);
+  if (rawRedis && fillerKeys.length) await clearFillerKeys();
   if (worker) await worker.close().catch(() => undefined);
   if (queue) {
     await queue.obliterate({ force: true }).catch(() => undefined);
