@@ -43,9 +43,9 @@ function Assert-PrivatePermissions([string]$Path, [bool]$Directory) {
     $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544') # backup account, LocalSystem, local Administrators
-    if ($Directory -and -not $acl.AreAccessRulesProtected) { throw 'The backup directory DACL must be protected from inherited ACEs.' }
-    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid) { throw 'Backup paths must be owned by the current backup account.' }
     $seen = @{}
+    if ($Directory -and -not $acl.AreAccessRulesProtected) { throw 'The backup directory DACL must be protected from inherited ACEs.' }
+    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $allowedSids) { throw 'Backup path owner must be the backup account, LocalSystem or local Administrators.' }
     foreach ($rule in $rules) {
       $sid = $rule.IdentityReference.Value
       if ($sid -notin $allowedSids -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
