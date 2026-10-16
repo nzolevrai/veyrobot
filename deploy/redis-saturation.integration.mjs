@@ -19,29 +19,44 @@ const [{ prisma, rejectPendingAfterDisable }, moderation, { Queue }] = await Pro
 const { createDispatcher } = await import('../apps/bot/dist/dispatcher.js');
 const { createModerationWorker } = await import('../apps/bot/dist/worker.js');
 const suffix = randomUUID().replaceAll('-', '');
+const testStartedAt = Date.now();
 const container = `veyrobot-redis-pressure-${suffix.slice(0, 10)}`;
 const queueName = `veyrobot-pressure-${suffix.slice(0, 18)}`;
 const activeGuildId = snowflake();
 const pendingGuildId = snowflake();
 const expiryGuildId = snowflake();
+const oomPendingGuildId = snowflake();
+const oomExpiryGuildId = snowflake();
 const actorId = snowflake();
 const activeTargetId = snowflake();
 const pendingTargetId = snowflake();
 const expiryTargetId = snowflake();
+const oomPendingTargetId = snowflake();
+const oomExpiryTargetId = snowflake();
 const activeOperationId = `pressure-active-${suffix}`;
 const pendingOperationId = `pressure-pending-${suffix}`;
 const expiryOperationId = `pressure-expiry-${suffix}`;
+const oomOperationId = `pressure-oom-active-${suffix}`;
+const oomPendingOperationId = `pressure-oom-pending-${suffix}`;
+const oomExpiryOperationId = `pressure-oom-expiry-${suffix}`;
 const expiryCaseId = `pressure_case_${suffix}`;
+const oomExpiryCaseId = `pressure_oom_case_${suffix}`;
 let port;
 let rawRedis;
 let worker;
 let queue;
+let dispatch;
 let kickRelease;
 let activeKickEntered;
 let activeKickCount = 0;
 let pendingKickCount = 0;
 let unbanCount = 0;
 let expiryMarker;
+let oomVolume;
+let oomKickCount = 0;
+let oomKickWasEntered = false;
+let oomKickRelease;
+const oomKickGate = new Promise(resolve => { oomKickRelease = resolve; });
 const fillerKeys = [];
 const dispatchErrors = [];
 const workerErrors = [];
@@ -67,12 +82,32 @@ async function until(label, check, timeoutMs = 15_000) {
   }
   throw new Error(`Timed out waiting for ${label} after ${timeoutMs} ms.`);
 }
-function createGuild(guildId, targetId, { holdKick = false, banReason } = {}) {
+async function connectRedisRetry(redisPort, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try { return await connectRedis(redisPort); }
+    catch (error) { lastError = error; await delay(100); }
+  }
+  throw new Error(`Redis did not accept the probe connection within ${timeoutMs} ms (${lastError instanceof Error ? lastError.code ?? lastError.name : 'unknown'}).`);
+}
+async function reserveLoopbackPort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const reservedPort = server.address().port;
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return reservedPort;
+}
+function createGuild(guildId, targetId, { holdKick = false, banReason, oomHoldKick = false } = {}) {
   const target = {
     id: targetId,
     roles: { highest: { comparePositionTo: () => -1 } },
     async kick() {
       if (holdKick) { activeKickCount++; activeKickEntered(); await kickGate; }
+      else if (oomHoldKick) { oomKickCount++; oomKickWasEntered = true; console.info(JSON.stringify({ event: 'controlled_discord_mutation_held', scenario: 'redis_cgroup_oom' })); await oomKickGate; }
       else pendingKickCount++;
     },
   };
@@ -115,11 +150,20 @@ function connectRedis(redisPort) {
     if (response && pending) {
       const current = pending;
       pending = undefined;
+      clearTimeout(current.timer);
       buffer = buffer.subarray(response.consumed);
       response.error ? current.reject(new Error(response.error)) : current.resolve(response.value);
     }
   });
-  socket.on('error', error => pending?.reject(error));
+  const rejectPending = error => {
+    if (!pending) return;
+    const current = pending;
+    pending = undefined;
+    clearTimeout(current.timer);
+    current.reject(error);
+  };
+  socket.on('error', error => rejectPending(error));
+  socket.on('close', () => rejectPending(new Error('Redis connection closed before a response.')));
   return new Promise((resolve, reject) => {
     socket.once('connect', () => resolve({
       command(args) {
@@ -128,7 +172,11 @@ function connectRedis(redisPort) {
           const value = Buffer.from(String(arg));
           return [Buffer.from(`$${value.length}\r\n`), value, Buffer.from('\r\n')];
         })]);
-        return new Promise((ok, fail) => { pending = { resolve: ok, reject: fail }; socket.write(payload); });
+        return new Promise((ok, fail) => {
+          const timer = setTimeout(() => rejectPending(new Error('Redis probe command timed out after 10 seconds.')), 10_000);
+          pending = { resolve: ok, reject: fail, timer };
+          socket.write(payload);
+        });
       },
       close: () => socket.destroy(),
     }));
@@ -152,21 +200,19 @@ try {
     data: [activeGuildId, pendingGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })),
   });
   await createRequest(activeGuildId, activeTargetId, activeOperationId, 'Controlled active action during Redis saturation');
-  const redisRun = docker(['run', '--detach', '--rm', '--name', container, '-p', '127.0.0.1::6379', 'redis:7-alpine', 'redis-server', '--save', '', '--appendonly', 'yes', '--appendfsync', 'everysec', '--maxmemory', '24mb', '--maxmemory-policy', 'noeviction']);
+  port = await reserveLoopbackPort();
+  oomVolume = `veyrobot-pressure-aof-${suffix.slice(0, 12)}`;
+  docker(['volume', 'create', oomVolume]);
+  const redisRun = docker(['run', '--detach', '--memory=128m', '--memory-swap=128m', '--name', container, '-p', `127.0.0.1:${port}:6379`, '-v', `${oomVolume}:/data`, 'redis:7-alpine', 'redis-server', '--dir', '/data', '--save', '', '--appendonly', 'yes', '--appendfsync', 'everysec', '--maxmemory', '24mb', '--maxmemory-policy', 'noeviction']);
   assert.ok(redisRun.stdout, 'isolated Redis 7 container started');
-  const portOutput = await until('ephemeral Redis port', () => {
-    const result = docker(['port', container, '6379/tcp'], true);
-    const match = result.stdout.match(/:(\d+)\s*$/);
-    return match ? Number(match[1]) : undefined;
-  });
-  port = portOutput;
+  assert.equal(JSON.parse(docker(['inspect', container, '--format', '{{json .HostConfig}}']).stdout).Memory, 128 * 1024 ** 2, 'the Redis integration container receives the bounded cgroup limit');
   rawRedis = await connectRedis(port);
   await until('Redis PONG', async () => (await rawRedis.command(['PING'])) === 'PONG');
   const serverInfo = await rawRedis.command(['INFO', 'server']);
   const redisVersion = serverInfo.match(/redis_version:([^\r\n]+)/)?.[1];
   assert.match(redisVersion ?? '', /^7\./, 'saturation runs against Redis 7');
 
-  const redisUrl = `redis://127.0.0.1:${port}`;
+  let redisUrl = `redis://127.0.0.1:${port}`;
   const consumerConnection = moderation.redisConnection(redisUrl);
   const producerConnection = moderation.redisConnection(redisUrl, true);
   queue = new Queue(queueName, { connection: producerConnection });
@@ -199,7 +245,7 @@ try {
     $queryRaw: (...args) => { dispatcherQueryCount++; return prisma.$queryRaw(...args); },
     moderationCase: prisma.moderationCase,
   };
-  const dispatch = createDispatcher(dispatchStore, queue, () => true, (key, message, error) => {
+  dispatch = createDispatcher(dispatchStore, queue, () => true, (key, message, error) => {
     dispatchErrors.push({ key, message, errorName: error instanceof Error ? error.name : 'unknown', errorMessage: error instanceof Error ? error.message : String(error) });
   });
   await delay(20); // let the dispatcher's initial Redis-ready promise settle
@@ -275,17 +321,117 @@ try {
   await dispatch();
   assert.equal(activeKickCount + pendingKickCount, 2, 'a later reconciliation does not repeat completed actions');
   assert.equal(unbanCount, 1, 'a later reconciliation does not repeat a completed expiry');
+
+  // Separate cgroup OOM test: disable Redis maxmemory only after the maxmemory refusal assertions above.
+  // PostgreSQL remains the durable outbox while Redis itself is killed under a bounded 128 MiB cgroup.
+  await prisma.guildConfig.createMany({ data: [oomPendingGuildId, oomExpiryGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })) });
+  createGuild(activeGuildId, activeTargetId, { oomHoldKick: true });
+  createGuild(oomPendingGuildId, oomPendingTargetId);
+  createGuild(oomExpiryGuildId, oomExpiryTargetId, { banReason: `temporary ban [pressure-oom-marker-${suffix}]` });
+  await createRequest(activeGuildId, activeTargetId, oomOperationId, 'Controlled mutation in flight during Redis cgroup OOM');
+  const oomExpiryMarker = `pressure-oom-marker-${suffix}`;
+  await dispatch();
+  await until('controlled Discord adapter entered during OOM scenario', () => oomKickWasEntered, 15_000);
+  assert.equal(await rawRedis.command(['CONFIG', 'SET', 'appendfsync', 'always']), 'OK');
+  assert.equal(await rawRedis.command(['SET', `oom-aof-sentinel:${suffix}`, suffix]), 'OK', 'write a sentinel with synchronous AOF before the cgroup OOM');
+  assert.equal(await rawRedis.command(['CONFIG', 'SET', 'appendfsync', 'everysec']), 'OK');
+  const aofDisabled = await rawRedis.command(['CONFIG', 'SET', 'appendonly', 'no']);
+  assert.equal(aofDisabled, 'OK', 'stop persisting only the synthetic OOM filler while retaining the existing AOF dataset');
+  await until('AOF disabled before non-durable OOM filler', async () => /aof_enabled:0/.test(await rawRedis.command(['INFO', 'persistence'])));
+  const configured = await rawRedis.command(['CONFIG', 'SET', 'maxmemory', '0']);
+  assert.equal(configured, 'OK', 'cgroup OOM phase disables Redis maxmemory so it cannot be confused with a noeviction refusal');
+  assert.equal((await rawRedis.command(['CONFIG', 'GET', 'maxmemory'])).split(/\r?\n/)[1], '0', 'cgroup test confirms logical Redis maxmemory is disabled');
+  const oomBlock = 'q'.repeat(1024 * 1024);
+  let oomWriterStatus = 0;
+  for (let i = 0; i < 256; i++) {
+    try { await rawRedis.command(['SET', `cgroup-oom:${i}`, oomBlock]); }
+    catch { oomWriterStatus = 1; break; }
+    const state = JSON.parse(docker(['inspect', container, '--format', '{{json .State}}']).stdout);
+    if (!state.Running) { oomWriterStatus = 1; break; }
+  }
+  await until('Redis cgroup OOM kill (not maxmemory rejection)', async () => {
+    const result = docker(['inspect', container, '--format', '{{json .State}}'], true);
+    try { return JSON.parse(result.stdout).OOMKilled === true; } catch { return false; }
+  }, 30_000);
+  console.info(JSON.stringify({ event: 'redis_cgroup_oom_confirmed', containerLimitBytes: 128 * 1024 ** 2 }));
+  const oomState = JSON.parse(docker(['inspect', container, '--format', '{{json .State}}']).stdout);
+  assert.equal(oomState.OOMKilled, true, 'Docker confirms the Redis process was cgroup OOM-killed');
+  await createRequest(oomPendingGuildId, oomPendingTargetId, oomPendingOperationId, 'Durable while Redis is OOM-killed');
+  await prisma.moderationCase.create({ data: {
+    id: oomExpiryCaseId, operationId: oomExpiryOperationId, guildId: oomExpiryGuildId, actorId, targetId: oomExpiryTargetId,
+    action: 'TEMPBAN', reason: 'Due expiry retained through Redis cgroup OOM', status: 'succeeded', durationMinutes: 1,
+    expiresAt: new Date(Date.now() - 60_000), banMarker: oomExpiryMarker, banGeneration: 1, expiryStatus: 'scheduled',
+  } });
+  await prisma.guildTargetDecision.create({ data: {
+    guildId: oomExpiryGuildId, targetId: oomExpiryTargetId, generation: 1, latestOperationId: oomExpiryOperationId,
+    appliedGeneration: 1, appliedOperationId: oomExpiryOperationId,
+  } });
+  assert.equal((await row(oomPendingOperationId)).status, 'requested', 'PostgreSQL retains the pending accepted operation across Redis OOM');
+  assert.equal((await prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })).expiryStatus, 'scheduled', 'PostgreSQL retains the due expiry across Redis OOM');
+  assert.equal(oomKickCount, 1, 'controlled action reached the fake Discord adapter once before OOM');
+  await dispatch();
+  rawRedis.close();
+  rawRedis = undefined;
+  oomKickRelease();
+  console.info(JSON.stringify({ event: 'controlled_discord_mutation_released_after_oom' }));
+  await until('in-flight action result persisted after Redis OOM', async () => (await row(oomOperationId))?.status === 'succeeded');
+  console.info(JSON.stringify({ event: 'in_flight_action_persisted_after_oom' }));
+  await worker.close(true).catch(() => undefined);
+  await queue.close().catch(() => undefined);
+  docker(['start', container]);
+  console.info(JSON.stringify({ event: 'redis_container_restarted_from_aof' }));
+  assert.match(docker(['port', container, '6379/tcp']).stdout, new RegExp(`:${port}$`), 'published Redis port remains stable through container restart');
+  rawRedis = await connectRedisRetry(port);
+  await until('Redis reconnect after AOF restart', async () => (await rawRedis.command(['PING']).catch(() => '')) === 'PONG', 30_000);
+  assert.equal(await rawRedis.command(['GET', `oom-aof-sentinel:${suffix}`]), suffix, 'the AOF volume restores a key fsynced before the OOM');
+  // A supervised bot restart is the supported recovery path after Redis process
+  // OOM. Rebuild production BullMQ consumers against the restored Redis endpoint.
+  queue = new Queue(queueName, { connection: moderation.redisConnection(redisUrl, true) });
+  await queue.waitUntilReady();
+  const recoveredConsumerConnection = moderation.redisConnection(redisUrl);
+  worker = createModerationWorker(client, recoveredConsumerConnection, prisma, moderation, rejectPendingAfterDisable, () => {
+    if (dispatch) setImmediate(() => void dispatch());
+  }, undefined, queueName);
+  worker.on('error', error => workerErrors.push({ source: 'worker-after-oom', name: error?.name ?? 'unknown' }));
+  const recoveredProducer = await queue.getBackend().client;
+  assert.equal(recoveredProducer.status, 'ready', 'BullMQ producer connection is ready after the supervised restart');
+  const recoveredEnqueueAttempts = [];
+  dispatch = createDispatcher(dispatchStore, queue, () => true, (key, message, error) => {
+    const diagnostic = { key, message, errorName: error instanceof Error ? error.name : 'unknown', errorMessage: error instanceof Error ? error.message : String(error) };
+    dispatchErrors.push(diagnostic);
+    console.info(JSON.stringify({ event: 'redis_recovery_dispatch_error', ...diagnostic }));
+  }, attempt => recoveredEnqueueAttempts.push(attempt));
+  let recoveryPolls = 0;
+  await until('pending operation and expiry complete after Redis OOM recovery', async () => {
+    await dispatch();
+    if (++recoveryPolls % 200 === 0) console.info(JSON.stringify({ event: 'redis_recovery_progress', producerStatus: recoveredProducer.status, enqueueAttempts: recoveredEnqueueAttempts.length, queue: await queue.getJobCounts('waiting', 'active', 'delayed', 'failed') }));
+    const [pending, expiry] = await Promise.all([row(oomPendingOperationId), prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })]);
+    return pending?.status === 'succeeded' && expiry?.expiryStatus === 'succeeded';
+  }, 60_000);
+  await until('BullMQ safely settles OOM interrupted delivery', async () => {
+    const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed').catch(() => null);
+    return counts && Object.values(counts).every(count => count === 0);
+  }, 60_000);
+  await dispatch();
+  assert.equal((await row(oomOperationId)).status, 'succeeded');
+  assert.equal((await row(oomPendingOperationId)).status, 'succeeded');
+  assert.equal((await prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })).expiryStatus, 'succeeded');
+  assert.equal(oomKickCount, 1, 'redelivery after cgroup OOM cannot repeat a confirmed mutation');
+  assert.equal(pendingKickCount, 2, 'durable pending operations execute exactly once after recovery');
+  assert.equal(unbanCount, 2, 'due expiry is reconciled exactly once after recovery');
   const memoryInfo = await rawRedis.command(['INFO', 'memory']);
   const usedMemoryBytes = Number(memoryInfo.match(/used_memory:(\d+)/)?.[1]);
   const maxMemoryBytes = Number(memoryInfo.match(/maxmemory:(\d+)/)?.[1]);
   console.info(JSON.stringify({
-    event: 'redis_saturation_integration_passed', redisVersion, oomRejectedWrites, usedMemoryBytes, maxMemoryBytes,
+    event: 'redis_saturation_integration_passed', elapsedMs: Date.now() - testStartedAt, redisVersion, oomRejectedWrites, usedMemoryBytes, maxMemoryBytes,
     acceptedRows: 2, actionsAfterRecovery: activeKickCount + pendingKickCount, expiriesAfterRecovery: unbanCount,
     dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringBackoff, dispatcherErrorsDuringBackoff,
     workerRedisErrors: workerErrors.length,
+    cgroupOom: { containerLimitBytes: 128 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, oomWriterStopped: oomWriterStatus === 1, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
   }));
 } finally {
   kickRelease?.();
+  oomKickRelease?.();
   if (rawRedis && fillerKeys.length) await clearFillerKeys();
   if (worker) await worker.close().catch(() => undefined);
   if (queue) {
@@ -294,8 +440,9 @@ try {
   }
   rawRedis?.close();
   docker(['rm', '-f', container], true);
-  await prisma.moderationCase.deleteMany({ where: { OR: [{ operationId: { in: [activeOperationId, pendingOperationId, expiryOperationId] } }, { id: expiryCaseId }] } }).catch(() => undefined);
-  await prisma.guildTargetDecision.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId] } } }).catch(() => undefined);
-  await prisma.guildConfig.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId] } } }).catch(() => undefined);
+  if (oomVolume) docker(['volume', 'rm', '-f', oomVolume], true);
+  await prisma.moderationCase.deleteMany({ where: { OR: [{ operationId: { in: [activeOperationId, pendingOperationId, expiryOperationId, oomOperationId, oomPendingOperationId, oomExpiryOperationId] } }, { id: { in: [expiryCaseId, oomExpiryCaseId] } }] } }).catch(() => undefined);
+  await prisma.guildTargetDecision.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId] } } }).catch(() => undefined);
+  await prisma.guildConfig.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId] } } }).catch(() => undefined);
   await prisma.$disconnect();
 }
