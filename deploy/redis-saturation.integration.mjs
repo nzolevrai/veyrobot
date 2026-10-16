@@ -254,7 +254,7 @@ try {
   dispatch = createDispatcher(dispatchStore, queue, () => true, (key, message, error) => {
     dispatchErrors.push({ at: Date.now(), key, message, errorName: error instanceof Error ? error.name : 'unknown', errorMessage: error instanceof Error ? error.message : String(error) });
   }, attempt => dispatchAttempts.push({ at: Date.now(), ...attempt }));
-  await delay(20); // let the dispatcher's initial Redis-ready promise settle
+  await until('BullMQ producer connection ready before applying Redis memory pressure', async () => (await queue.getBackend().client).status === 'ready');
 
   const filler = 'x'.repeat(1024 * 1024);
   let largeChunkRejected = false;
