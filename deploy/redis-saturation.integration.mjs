@@ -11,9 +11,11 @@ if (process.env.CI !== 'true' || !databaseUrl || !['localhost', '127.0.0.1'].inc
   throw new Error('Use the disposable PostgreSQL 17 CI service database for this test.');
 }
 
-const { prisma, rejectPendingAfterDisable } = await import('@veyrobot/db');
-const moderation = await import('@veyrobot/moderation');
-const { Queue } = await import('bullmq');
+const [{ prisma, rejectPendingAfterDisable }, moderation, { Queue }] = await Promise.all([
+  import('../apps/bot/node_modules/@veyrobot/db/dist/index.js'),
+  import('../apps/bot/node_modules/@veyrobot/moderation/dist/index.js'),
+  import('../apps/bot/node_modules/bullmq/dist/cjs/index.js'),
+]);
 const { createDispatcher } = await import('../apps/bot/dist/dispatcher.js');
 const { createModerationWorker } = await import('../apps/bot/dist/worker.js');
 const suffix = randomUUID().replaceAll('-', '');
@@ -258,9 +260,9 @@ try {
   }));
 } finally {
   kickRelease?.();
+  if (rawRedis && fillerKeys.length) await rawRedis.command(['DEL', ...fillerKeys]).catch(() => undefined);
   if (worker) await worker.close().catch(() => undefined);
   if (queue) {
-    if (rawRedis && fillerKeys.length) await rawRedis.command(['DEL', ...fillerKeys]).catch(() => undefined);
     await queue.obliterate({ force: true }).catch(() => undefined);
     await queue.close().catch(() => undefined);
   }
