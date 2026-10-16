@@ -21,6 +21,7 @@ const envSchema = z.object({
   API_PUBLIC_URL: z.string().url(),
   DASHBOARD_URL: z.string().url(),
   DATABASE_URL: z.string().min(1),
+  VEYROBOT_RECOVERY_EPOCH: z.string().min(32).max(256),
   DISCORD_CLIENT_ID: z.string().min(1),
   DISCORD_CLIENT_SECRET: z.string().min(1),
   DISCORD_BOT_TOKEN: z.string().min(1),
@@ -38,6 +39,13 @@ if (!envResult.success) {
 const env = envResult.data;
 const [db, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation/service')]);
 const { prisma } = db;
+try {
+  await db.assertRecoveryAuthorized(prisma, env.VEYROBOT_RECOVERY_EPOCH);
+} catch {
+  console.error('API startup refused: recovery authorization is missing, stale, or unavailable.');
+  await prisma.$disconnect();
+  process.exit(1);
+}
 
 const trustedProxies = env.API_TRUSTED_PROXIES.split(',').map(value => value.trim()).filter(Boolean);
 const app = Fastify({ logger: { serializers: { req: (req) => ({ method: req.method, path: req.url?.split('?')[0] }) } }, trustProxy: trustedProxies.length ? trustedProxies : false, bodyLimit: 16_384 });

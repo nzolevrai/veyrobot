@@ -3,7 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createHmac } from 'node:crypto';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -33,7 +33,8 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   await writeFile(guildCounterFile, '');
   await writeFile(installationCounterFile, '');
   const proxyIpSecret = 'integration-only-hmac-secret-longer-than-32-bytes';
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
+  const recoveryEpoch = randomBytes(32).toString('hex');
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, VEYROBOT_RECOVERY_EPOCH: recoveryEpoch, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -51,6 +52,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const stop = async () => { if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(200); } if (child && child.exitCode === null) { child.kill('SIGTERM'); await delay(200); } };
   const call = (path, cookie, options = {}) => fetch(`${base}${path}`, { ...options, headers: { ...(cookie ? { cookie } : {}), ...(options.headers ?? {}) } });
   try {
+    await prisma.recoveryGate.upsert({ where: { id: 'singleton' }, create: { id: 'singleton', epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') }, update: { epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') } });
     await prisma.guildPresence.createMany({ data: [{ guildId: guildA, shardId: onlineShard }, { guildId: guildC, shardId: offlineShard }] });
     await prisma.shardPresence.createMany({ data: [{ shardId: onlineShard, lastSeenAt: new Date() }, { shardId: offlineShard, lastSeenAt: new Date(0) }] });
     await start();

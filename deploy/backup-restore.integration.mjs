@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
+import { createServer } from 'node:net';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 
 const root = process.cwd();
 const id = createHash('sha256').update(`${Date.now()}-${Math.random()}`).digest('hex').slice(0, 12);
@@ -17,6 +20,8 @@ const backupDirectory = path.join(tempRoot, 'backups');
 const composePrefix = ['compose', '--project-name', project, '-f', composeFile];
 const pgUser = 'backup_test';
 const timings = {};
+const sourceEpoch = randomBytes(32).toString('hex');
+const restoreEpoch = randomBytes(32).toString('hex');
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
@@ -30,6 +35,8 @@ function run(command, args, options = {}) {
 
 function packageManager(args, env) {
   if (process.platform === 'win32') {
+    const corepackCli = path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'nodejs', 'node_modules', 'corepack', 'dist', 'corepack.js');
+    if (process.execPath && path.isAbsolute(corepackCli)) return run(process.execPath, [corepackCli, 'pnpm', ...args], { env });
     const command = `corepack pnpm ${args.map(argument => `'${String(argument).replaceAll("'", "''")}'`).join(' ')}`;
     return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { env });
   }
@@ -44,22 +51,36 @@ function docker(args) {
   return run('docker', args);
 }
 
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return address.port;
+}
+
 let composeStarted = false;
 let targetCreated = false;
 try {
-  await writeFile(composeFile, `services:\n  postgres:\n    image: postgres:17-alpine\n    environment:\n      POSTGRES_USER: ${pgUser}\n      POSTGRES_DB: ${sourceDb}\n      POSTGRES_HOST_AUTH_METHOD: trust\n    ports:\n      - "127.0.0.1::5432"\n`);
+  const nodeVersion = process.versions.node.split('.').map(Number);
+  assert.ok(nodeVersion[0] > 24 || (nodeVersion[0] === 24 && nodeVersion[1] >= 17), `Node >=24.17 required; got ${process.versions.node}`);
+  await writeFile(composeFile, `services:\n  postgres:\n    image: postgres:17-alpine\n    environment:\n      POSTGRES_USER: ${pgUser}\n      POSTGRES_DB: ${sourceDb}\n      POSTGRES_HOST_AUTH_METHOD: trust\n    ports:\n      - "127.0.0.1::5432"\n  redis:\n    image: redis:7-alpine\n    ports:\n      - "127.0.0.1::6379"\n`);
   composeStarted = true;
-  await docker([...composePrefix, 'up', '-d', 'postgres']);
+  await docker([...composePrefix, 'up', '-d', 'postgres', 'redis']);
   const portLine = docker([...composePrefix, 'port', 'postgres', '5432']).trim().split(/\r?\n/).at(-1);
   const port = Number(portLine.slice(portLine.lastIndexOf(':') + 1));
   assert.ok(Number.isInteger(port) && port > 0, 'isolated PostgreSQL port is assigned');
+  const redisPortLine = docker([...composePrefix, 'port', 'redis', '6379']).trim().split(/\r?\n/).at(-1);
+  const redisPort = Number(redisPortLine.slice(redisPortLine.lastIndexOf(':') + 1));
+  assert.ok(Number.isInteger(redisPort) && redisPort > 0, 'isolated Redis port is assigned');
   const databaseUrl = `postgresql://${pgUser}@127.0.0.1:${port}/${sourceDb}?schema=public`;
+  const redisUrl = `redis://127.0.0.1:${redisPort}`;
   const sourceEnv = { ...process.env, DATABASE_URL: databaseUrl };
   packageManager(['db:generate'], sourceEnv);
   packageManager(['db:migrate'], sourceEnv);
-  const seed = `import { prisma } from './packages/db/src/index.ts';
-const guildId = '777777777777777777';
-const actorId = '123456789012345678';
+  const seed = `import { prisma, initializeRecoveryAuthorization } from './packages/db/src/index.ts';
+const guildId = 'restore-test-guild-${id}';
+const actorId = 'restore-test-operator';
 const warningId = 'backup_${id}_warning';
 const tempbanId = 'backup_${id}_tempban';
 const requestedId = 'backup_${id}_requested';
@@ -73,6 +94,7 @@ await prisma.moderationCase.createMany({ data: [
 ] });
 await prisma.guildTargetDecision.create({ data: { guildId, targetId: '888888888888888882', generation: 1, latestOperationId: tempbanId, appliedGeneration: 1, appliedOperationId: tempbanId } });
 await prisma.sessionGrant.create({ data: { idHash: '${createHash('sha256').update(`session-${id}`).digest('hex')}', expiresAt: new Date(Date.now() + 3600000) } });
+await initializeRecoveryAuthorization(prisma, '${sourceEpoch}');
 await prisma.$disconnect();`;
   node(['--import', 'tsx', '--input-type=module', '-e', seed], sourceEnv);
 
@@ -90,6 +112,8 @@ await prisma.$disconnect();`;
   const checksum = createHash('sha256').update(archive).digest('hex');
   assert.equal(checksum, displayedHash);
   assert.ok((await readFile(checksumPath, 'utf8')).startsWith(`${checksum} *${path.basename(archivePath)}`));
+
+  node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; await prisma.moderationCase.update({where:{operationId:'backup_${id}_requested'},data:{status:'succeeded',completedAt:new Date(),result:'simulated source action after snapshot'}}); await prisma.$disconnect();`], sourceEnv);
 
   const containerId = docker([...composePrefix, 'ps', '-q', 'postgres']).trim();
   assert.ok(containerId, 'test PostgreSQL container remains available for restore');
@@ -109,18 +133,69 @@ await prisma.$disconnect();`;
 
   const targetUrl = new URL(databaseUrl);
   targetUrl.pathname = `/${targetDb}`;
-  const targetEnv = { ...process.env, DATABASE_URL: targetUrl.toString(), RESTORE_QUARANTINE_CONFIRM: '1' };
-  // Only the DB quarantine CLI is run. No API, bot, Gateway or worker is started.
-  const quarantineOutput = node(['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], targetEnv);
+  const targetEnv = { ...process.env, DATABASE_URL: targetUrl.toString(), REDIS_URL: redisUrl, RESTORE_QUARANTINE_CONFIRM: '1', VEYROBOT_RECOVERY_EPOCH: restoreEpoch,
+    DISCORD_BOT_TOKEN: 'not-a-real-token', DISCORD_CLIENT_ID: 'test-client-id' };
   const botBuildEnv = { ...sourceEnv };
   packageManager(['--filter', '@veyrobot/bot', 'build'], botBuildEnv);
-  const dispatchCheck = `import { prisma } from '@veyrobot/db'; import { createDispatcher } from './dist/dispatcher.js'; const added=[]; const queue={getBackend:()=>({client:Promise.resolve({status:'ready'})}),add:async(...args)=>added.push(args)}; const dispatch=createDispatcher(prisma,queue,()=>true,()=>{}); await new Promise(resolve=>setTimeout(resolve,0)); await dispatch(); await prisma.$disconnect(); if(added.length!==0) process.exitCode=3; console.log(JSON.stringify({published:added.length}));`;
+  packageManager(['--filter', '@veyrobot/api', 'build'], botBuildEnv);
+  const botDirectory = path.join(root, 'apps/bot');
+  const fakeGatewayPreload = path.join(botDirectory, 'test', 'fake-gateway-login-preload.mjs');
+  const startBot = (epoch) => spawnSync(process.execPath, ['--import', fakeGatewayPreload, 'dist/index.js'], {
+    cwd: botDirectory, env: { ...targetEnv, VEYROBOT_RECOVERY_EPOCH: epoch }, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 10_000,
+  });
+  const blockedStart = startBot(restoreEpoch);
+  assert.equal(blockedStart.status, 1, 'the production bot entrypoint refuses an old restored recovery epoch');
+  assert.ok(!`${blockedStart.stdout}${blockedStart.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'), 'no simulated Discord login is attempted before quarantine');
+  const redisKeysBeforeQuarantine = Number(docker([...composePrefix, 'exec', '-T', 'redis', 'redis-cli', 'dbsize']).trim());
+  assert.equal(redisKeysBeforeQuarantine, 0, 'a blocked production bot startup has not published any BullMQ job');
+  const blockedApiPort = await freePort();
+  const blockedApiEnv = { ...targetEnv, NODE_ENV: 'test', API_PORT: String(blockedApiPort), API_PUBLIC_URL: `http://127.0.0.1:${blockedApiPort}`, DASHBOARD_URL: 'http://localhost:3000', DISCORD_CLIENT_SECRET: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' };
+  const blockedApi = spawnSync(process.execPath, ['dist/index.js'], { cwd: path.join(root, 'apps/api'), env: blockedApiEnv, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 10_000 });
+  assert.equal(blockedApi.status, 1, 'the production API entrypoint also refuses the restored epoch before listening');
+  assert.ok(!`${blockedApi.stdout}${blockedApi.stderr}`.includes('Server listening'), 'API exposes no routes before quarantine');
+  const operationBeforeQuarantine = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const r=await prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_requested'}}); await prisma.$disconnect(); console.log(r.status);`], targetEnv);
+  assert.equal(operationBeforeQuarantine.trim(), 'requested', 'restored active work remains unchanged until the transaction commits');
+
+  const triggerSql = `CREATE OR REPLACE FUNCTION fail_recovery_gate_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected gate write failure'; END $$; CREATE TRIGGER fail_recovery_gate_write BEFORE INSERT OR UPDATE ON "RecoveryGate" FOR EACH ROW EXECUTE FUNCTION fail_recovery_gate_write();`;
+  docker([...composePrefix, 'exec', '-T', 'postgres', 'psql', '-U', pgUser, '-d', targetDb, '-v', 'ON_ERROR_STOP=1', '-c', triggerSql]);
+  const failedQuarantine = spawnSync(process.execPath, ['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], { cwd: root, env: targetEnv, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+  assert.notEqual(failedQuarantine.status, 0, 'injected gate persistence failure aborts quarantine');
+  docker([...composePrefix, 'exec', '-T', 'postgres', 'psql', '-U', pgUser, '-d', targetDb, '-v', 'ON_ERROR_STOP=1', '-c', 'DROP TRIGGER fail_recovery_gate_write ON "RecoveryGate"; DROP FUNCTION fail_recovery_gate_write();']);
+  const afterFailedQuarantine = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const [r,g]=await Promise.all([prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_requested'}}),prisma.recoveryGate.findUniqueOrThrow({where:{id:'singleton'}})]); await prisma.$disconnect(); console.log(JSON.stringify({status:r.status,epochHash:g.epochHash}));`], targetEnv);
+  assert.deepEqual(JSON.parse(afterFailedQuarantine.trim()), { status: 'requested', epochHash: createHash('sha256').update(sourceEpoch).digest('hex') }, 'failed quarantine transaction rolls back the gate and work states');
+  const restartDuringQuarantine = startBot(restoreEpoch);
+  assert.equal(restartDuringQuarantine.status, 1, 'restart while quarantine is incomplete remains blocked');
+  assert.ok(!`${restartDuringQuarantine.stdout}${restartDuringQuarantine.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'));
+  assert.equal(Number(docker([...composePrefix, 'exec', '-T', 'redis', 'redis-cli', 'dbsize']).trim()), 0, 'failed quarantine and restart still publish no queue job');
+
+  const quarantineOutput = node(['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], targetEnv);
+  const successfulStart = startBot(restoreEpoch);
+  assert.equal(successfulStart.status, 42, 'after atomic quarantine the production entrypoint reaches only the controlled fake Gateway adapter');
+  assert.ok(`${successfulStart.stdout}${successfulStart.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'));
+  const apiPort = await freePort();
+  const apiBase = `http://127.0.0.1:${apiPort}`;
+  const resumedApi = spawn(process.execPath, ['dist/index.js'], { cwd: path.join(root, 'apps/api'), env: { ...blockedApiEnv, API_PORT: String(apiPort), API_PUBLIC_URL: apiBase }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let apiOutput = '';
+  resumedApi.stdout.setEncoding('utf8').on('data', chunk => { apiOutput = (apiOutput + chunk).slice(-20_000); });
+  resumedApi.stderr.setEncoding('utf8').on('data', chunk => { apiOutput = (apiOutput + chunk).slice(-20_000); });
+  try {
+    let health;
+    for (let i = 0; i < 100 && resumedApi.exitCode === null; i++) {
+      try { health = await fetch(`${apiBase}/health`); break; } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+    }
+    assert.equal(health?.status, 200, `API resumes only after the recovery epoch matches. Output: ${apiOutput}`);
+  } finally {
+    if (resumedApi.exitCode === null) { resumedApi.kill('SIGTERM'); await Promise.race([once(resumedApi, 'exit'), new Promise(resolve => setTimeout(resolve, 3000))]); }
+  }
+  const postRestoreId = `backup_${id}_postrestore`;
+  await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; await prisma.moderationCase.create({data:{operationId:'${postRestoreId}',guildId:'restore-test-guild-${id}',actorId:'restore-test-operator',targetId:'restore-test-target',action:'BAN',reason:'post-restore controlled fixture',status:'requested'}}); await prisma.$disconnect();`], targetEnv);
+  const dispatchCheck = `import { prisma } from '@veyrobot/db'; import { createDispatcher } from './dist/dispatcher.js'; const added=[]; const queue={getBackend:()=>({client:Promise.resolve({status:'ready'})}),add:async(...args)=>added.push(args)}; const dispatch=createDispatcher(prisma,queue,()=>true,()=>{}); await new Promise(resolve=>setTimeout(resolve,0)); await dispatch(); await prisma.$disconnect(); console.log(JSON.stringify({published:added.map(item=>item[1].operationId)}));`;
   const dispatchOutput = node(['--input-type=module', '-e', dispatchCheck], { ...targetEnv, RESTORE_QUARANTINE_CONFIRM: '' }, path.join(root, 'apps/bot'));
-  assert.deepEqual(JSON.parse(dispatchOutput.trim()), { published: 0 }, 'production dispatcher does not publish quarantined operations');
+  assert.deepEqual(JSON.parse(dispatchOutput.trim()), { published: [postRestoreId] }, 'production dispatcher excludes restored work but resumes new requests after the gate opens');
 
   const sessionHash = createHash('sha256').update(`session-${id}`).digest('hex');
   const verify = `import { prisma } from './packages/db/src/index.ts';
-const guildId='777777777777777777'; const warningId='backup_${id}_warning'; const tempbanId='backup_${id}_tempban'; const requestedId='backup_${id}_requested'; const runningId='backup_${id}_running';
+const guildId='restore-test-guild-${id}'; const warningId='backup_${id}_warning'; const tempbanId='backup_${id}_tempban'; const requestedId='backup_${id}_requested'; const runningId='backup_${id}_running';
 const config=await prisma.guildConfig.findUnique({where:{guildId}}); const cases=await prisma.moderationCase.findMany({where:{operationId:{in:[warningId,tempbanId,requestedId,runningId]}},select:{operationId:true,action:true,status:true,expiryStatus:true,reason:true}}); const decision=await prisma.guildTargetDecision.findUnique({where:{guildId_targetId:{guildId,targetId:'888888888888888882'}}}); const grant=await prisma.sessionGrant.findUnique({where:{idHash:'${sessionHash}'}}); await prisma.$disconnect();
 const byId=Object.fromEntries(cases.map(row=>[row.operationId,row])); console.log(JSON.stringify({config:{version:config?.version,warningsEnabled:config?.warningsEnabled,memberActionsEnabled:config?.memberActionsEnabled},warning:{action:byId[warningId]?.action,status:byId[warningId]?.status,reason:byId[warningId]?.reason},tempban:{status:byId[tempbanId]?.status,expiryStatus:byId[tempbanId]?.expiryStatus},requested:{status:byId[requestedId]?.status},running:{status:byId[runningId]?.status},decision:{generation:decision?.generation,appliedGeneration:decision?.appliedGeneration,appliedOperationId:decision?.appliedOperationId},sessionRevoked:Boolean(grant?.revokedAt)}));`;
   const verification = JSON.parse(node(['--import', 'tsx', '--input-type=module', '-e', verify], { ...targetEnv, RESTORE_QUARANTINE_CONFIRM: '' }).trim());
@@ -132,7 +207,7 @@ const byId=Object.fromEntries(cases.map(row=>[row.operationId,row])); console.lo
   assert.deepEqual(verification.decision, { generation: 1, appliedGeneration: 1, appliedOperationId: `backup_${id}_tempban` });
   assert.equal(verification.sessionRevoked, true, 'all restored active sessions are revoked before service startup');
 
-  console.log(JSON.stringify({ result: 'passed', postgres: '17-alpine', scope: 'real backup script, pg_restore, DB quarantine and production dispatcher check; no API, bot or Discord client started', quarantine: JSON.parse(quarantineOutput.trim()), checks: verification, durationsMs: timings, archiveBytes: archive.length }));
+  console.log(JSON.stringify({ result: 'passed', postgres: '17-alpine', scope: 'real backup/restore; production bot entrypoint blocked before quarantine and allowed only through fake Gateway after; failed transaction and restart tested; no real Discord connection', quarantine: JSON.parse(quarantineOutput.trim()), checks: verification, durationsMs: timings, archiveBytes: archive.length }));
 } finally {
   if (targetCreated) {
     try { docker([...composePrefix, 'exec', '-T', 'postgres', 'dropdb', '-U', pgUser, '--if-exists', targetDb]); } catch { /* container teardown removes this isolated database */ }

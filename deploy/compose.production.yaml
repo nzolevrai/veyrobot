@@ -64,6 +64,7 @@ services:
       API_PUBLIC_URL: ${API_PUBLIC_URL:?set API_PUBLIC_URL in the external environment}
       DASHBOARD_URL: ${DASHBOARD_URL:?set DASHBOARD_URL in the external environment}
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
+      VEYROBOT_RECOVERY_EPOCH: ${VEYROBOT_RECOVERY_EPOCH:?set external recovery epoch}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       API_RATE_LIMIT_MAX: ${API_RATE_LIMIT_MAX:-90}
       API_PREAUTH_RATE_LIMIT_MAX: ${API_PREAUTH_RATE_LIMIT_MAX:-180}
@@ -97,6 +98,7 @@ services:
       NODE_ENV: production
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the external environment}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      VEYROBOT_RECOVERY_EPOCH: ${VEYROBOT_RECOVERY_EPOCH:?set external recovery epoch}
       REDIS_URL: ${REDIS_URL:?set REDIS_URL in the external environment}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:?set DISCORD_CLIENT_ID in the external environment}
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in the external environment}

@@ -2,51 +2,59 @@
 
 ## Sauvegarde publiée
 
-Prérequis : PowerShell 5.1 ou `pwsh`, Docker Compose v2, service PostgreSQL 17 défini par `deploy/compose.production.yaml`, fichier `.env.production` fourni hors dépôt, et répertoire de destination privé sur stockage chiffré. Le script ne reçoit aucun mot de passe PostgreSQL en argument : `pg_dump` utilise les variables déjà présentes dans le conteneur. Ne pas activer la trace des arguments Docker ni publier la sortie contenant le chemin local.
-
-Exécuter depuis la racine du dépôt, avec `.env.production` provisionné par l'exploitant :
+Prérequis : PowerShell 5.1 ou `pwsh`, Docker Compose v2, PostgreSQL 17 dans `deploy/compose.production.yaml`, fichier `.env.production` hors dépôt, et destination sur stockage chiffré privé. La voie Unix supportée est Linux avec GNU `stat`, `chmod`, `id` et `sh`. Le mot de passe PostgreSQL n'est jamais passé en argument : `pg_dump` utilise l'environnement du conteneur. Ne pas activer le traçage des arguments Docker ni publier la sortie qui contient le chemin local.
 
 ```powershell
 $env:VEYROBOT_BACKUP_DIR = 'D:\private\veyrobot-backups'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy/backup-postgres.ps1
 ```
 
-Le script produit un nom UTC avec identifiant aléatoire, crée d'abord un temporaire dans le répertoire de destination, vérifie les codes de sortie de Compose/`pg_dump`/`docker cp`/`pg_restore`, puis exécute `pg_restore --list` sur une copie de l'archive revenue du poste hôte. Il calcule le SHA-256 de cette archive validée. L'archive et le fichier `<archive>.sha256` sont publiés par `File.Move` dans le même répertoire; le sidecar, publié en dernier, est le marqueur de complétude. Les collisions échouent sans écrasement. Une sauvegarde antérieure n'est ni remplacée ni supprimée.
+Le script crée un répertoire temporaire unique sous la destination, détient un verrou exclusif `.active`, vérifie les codes de sortie Compose, `pg_dump`, `docker cp` et `pg_restore`, puis valide par `pg_restore --list` la copie recopiée sur l'hôte. Il calcule le SHA-256 de cette copie. L'archive puis son sidecar `<archive>.sha256` sont publiés par renommage dans le même répertoire; le sidecar est le marqueur de complétude. Les collisions échouent sans écrasement et les anciennes sauvegardes ne sont jamais remplacées ni supprimées.
 
-Un consommateur doit ignorer tout `*.backup` sans sidecar correspondant. En cas d'arrêt brutal après le renommage de l'archive mais avant celui du checksum, le fichier final peut rester sans sidecar; il est incomplet et ne doit pas être restauré. Le script tente de supprimer cet orphelin lorsqu'il reçoit une erreur normale. Les fichiers temporaires cachés (`.*.tmp`) ne sont jamais des sauvegardes publiées; après vérification qu'aucun run ne les utilise, l'exploitant peut les retirer. Le répertoire de sortie est restreint au compte d'exécution (Windows : ACL sans héritage, Unix : mode 0700) et les fichiers au mode 0600/ACL du propriétaire.
+Sur Windows, une nouvelle destination reçoit une DACL protégée autorisant seulement le compte sauvegarde courant, LocalSystem et le groupe Administrators local, en FullControl. Le compte courant doit être propriétaire. Une destination préexistante n'est jamais modifiée : le script la refuse si une ACE, un SID, un droit ou un héritage est hors de cette politique. Il vérifie le dossier, les temporaires (dont `.active`), les archives et les sidecars. Les chemins existants ne peuvent traverser de lien symbolique, point de jonction ou autre reparse point. Le parent doit être contrôlé par l'exploitant et ne pas permettre à un tiers de remplacer le sous-dossier. Sous Linux, le dossier appartient à l'UID du processus et vaut 0700; les fichiers valent 0600. Le conteneur crée son répertoire sous `umask 077` et mode 0700, avant d'y écrire l'archive.
 
-Le SHA-256 détecte une corruption ou une altération après création, mais ne prouve pas à lui seul la restaurabilité. La lecture `pg_restore --list` donne une validation minimale; un exercice de restauration périodique reste nécessaire.
+Tout fichier `*.backup` sans sidecar correspondant est incomplet et doit être ignoré. Un arrêt brutal entre publication de l'archive et du sidecar peut laisser cet orphelin; un arrêt plus tôt laisse un répertoire `.work`. Les temporaires ne sont pas des sauvegardes publiées. Leur nettoyage est borné, ne cible que les répertoires générés et ignore un verrou détenu :
 
-## Vérifier et restaurer en quarantaine
+```powershell
+deploy/backup-postgres.ps1 -CleanupStaleTemporaries -StaleAfterHours 24 -MaxCleanupItems 20
+```
 
-1. Choisir une base PostgreSQL 17 isolée, sans API, bot, worker, dispatcher ni autre consommateur VeyroBot. Ne jamais restaurer par-dessus la base active.
-2. Vérifier que le sidecar existe et correspond au nom de l'archive :
+Le seuil d'âge est une précaution, pas une preuve que le contenu est complet. Le SHA-256 détecte une altération depuis sa création, mais n'établit pas la restaurabilité. `pg_restore --list` valide la structure minimale; un essai de restauration est requis.
 
-   ```powershell
-   $archive = 'D:\private\veyrobot-backups\veyrobot-<id>.backup'
-   $checksumLine = Get-Content -Raw -LiteralPath "${archive}.sha256"
-   $expected = ($checksumLine.Trim() -split '\s+')[0]
-   $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-   if ($actual -ne $expected) { throw 'Archive checksum mismatch.' }
-   ```
+## Verrou technique de reprise
 
-3. Créer une base cible vide et restaurer avec PostgreSQL 17 `pg_restore --no-owner`. Restaurer le schéma et les données; ne pas démarrer l'application à ce stade.
-4. Pointer `DATABASE_URL` uniquement vers la base isolée, puis exécuter :
+Le marqueur PostgreSQL d'un snapshot ne prouve pas la fraîcheur du snapshot. Le protocole supporté conserve `VEYROBOT_RECOVERY_EPOCH` (32 octets aléatoires hexadécimaux recommandés) dans un gestionnaire de secrets indépendant des sauvegardes. L'API et le bot comparent son hash au singleton `RecoveryGate` avant d'écouter, de créer le worker ou de publier des jobs. Valeur absente, différente, mal formée ou base indisponible : démarrage refusé.
+
+À la première installation seulement, après migration et avant tout démarrage, initialiser une fois le gate :
+
+```powershell
+$env:RECOVERY_GATE_INITIALIZE = '1'
+corepack pnpm --filter @veyrobot/db recovery-gate:init
+```
+
+Pour restaurer :
+
+1. Arrêter API, bot, maintenance et tout autre consommateur.
+2. Faire tourner `VEYROBOT_RECOVERY_EPOCH` dans le gestionnaire de secrets externe. Ne pas copier l'ancienne valeur dans la cible.
+3. Créer une cible PostgreSQL distincte initialement isolée, vérifier le sidecar et le SHA-256, puis restaurer avec PostgreSQL 17 `pg_restore --no-owner`. Ne jamais restaurer par-dessus la base active.
+4. Pointer les commandes de maintenance uniquement vers la cible, injecter le nouvel epoch depuis la source externe et exécuter :
 
    ```powershell
    $env:RESTORE_QUARANTINE_CONFIRM = '1'
-   corepack pnpm --filter @veyrobot/db exec tsx src/restore-quarantine-cli.ts
+   corepack pnpm --filter @veyrobot/db recovery:quarantine
    ```
 
-   Le CLI transforme les dossiers `requested`/`running` et les échéances TEMPBAN planifiées/en cours en `uncertain`, et révoque dans la transaction tous les `SessionGrant` restaurés qui n'étaient pas déjà révoqués. Une session restaurée ne permet donc pas de réutiliser un ancien cookie : chaque utilisateur devra refaire OAuth après la remise en service.
+5. Cette transaction met en `uncertain` les opérations `requested`/`running`, les échéances TEMPBAN `pending`/`scheduled`/`running`, révoque les sessions restaurées et inscrit le hash du nouvel epoch. Toute erreur annule l'ensemble. Un redémarrage avant le commit reste bloqué. Après succès, API et bot ne démarrent qu'avec le même nouvel epoch.
+6. Examiner les opérations et comparer les actions/échéances avec les preuves Discord et les journaux externes. L'absence de preuve reste `uncertain`; elle n'autorise jamais un rejeu automatique. Les utilisateurs refont OAuth après révocation des grants.
 
-5. Vérifier les compteurs du CLI, les dossiers `uncertain`, les générations/décisions de BAN et les échéances. Comparer les sanctions et expirations avec les traces externes disponibles. Si aucune preuve ne permet de conclure, conserver `uncertain`; ne pas remettre automatiquement l'action en file.
-6. Avant le redémarrage, faire vérifier la cible, la quarantaine et les secrets de connexion par l'exploitant. Démarrer ensuite l'API, confirmer `/ready`, puis un seul processus bot. Cette procédure n'établit pas une atomicité avec Discord et ne remplace pas la réconciliation humaine.
+Ce protocole garantit l'ordre uniquement pour la procédure opérée : arrêt, rotation externe, restauration en cible isolée, quarantaine puis démarrage. Il ne détecte pas un snapshot restauré par une procédure non supportée qui ne fait pas tourner l'epoch externe, ni la copie de cet epoch avec la base. Le gestionnaire de secrets et le chemin d'exploitation doivent rester indépendants des sauvegardes.
 
-## Tests de cette tranche
+## Tests et preuves
 
-- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy/test-backup-postgres.ps1` exécute le véritable script avec un mock PowerShell de la commande Docker. Il couvre les retours d'échec simulés de `pg_dump`, des deux copies, de `pg_restore`, une collision de publication, les fichiers temporaires résiduels, la conservation d'une ancienne archive, les ACL Windows et deux appels concurrents. Ces tests ne prouvent pas le comportement des exécutables Docker/PostgreSQL réels.
-- `node deploy/backup-restore.integration.mjs` démarre un projet Compose temporaire PostgreSQL 17, applique les migrations, crée des données de test, appelle le véritable script de sauvegarde, vérifie le sidecar, demande à `pg_restore` réel de rejeter une archive tronquée, restaure une seconde base, exécute le CLI de quarantaine puis vérifie le dispatcher de production avec une file contrôlée. Aucun processus API, bot, Gateway ou worker n'est démarré et aucun appel Discord n'est effectué.
-- Sur le poste Windows vérifié le 15 octobre 2026, le run PostgreSQL 17 a pris 1 411,6 ms pour sauvegarder et 263,2 ms pour restaurer un jeu migré de 20 781 octets; le conteneur a appliqué la quarantaine à deux opérations, une échéance future et un grant. Ce petit jeu mesure uniquement ce run local; il ne définit pas de RPO/RTO ni ne prédit la durée sur une base de production.
+- Windows : `powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy/test-backup-postgres.ps1`. Le véritable script est exécuté avec Docker simulé; tests des erreurs `pg_dump`, copies, validation et publication, préservation d'une sauvegarde antérieure, collision, parallélisme, nettoyage borné, arrêt forcé et ACL. Le test Windows ajoute une ACE explicite `BUILTIN\Users` à un dossier préexistant et vérifie le refus avant toute copie, puis contrôle les ACL des temporaires, archives et sidecars. Ces cas ne sont pas des essais PostgreSQL réel.
+- Linux : la CI exécute `pwsh -NoProfile -File deploy/test-backup-postgres.ps1` pour couvrir `stat`/`chmod`/`id` et la voie de permissions Unix.
+- PostgreSQL réel : `node deploy/backup-restore.integration.mjs` demande à Compose un PostgreSQL 17 et Redis 7 isolés, applique les migrations, crée des données synthétiques, appelle le vrai script de sauvegarde, vérifie le checksum, fait rejeter une archive tronquée par `pg_restore`, restaure une seconde base et vérifie les données et états.
+- Le même scénario démarre les points d'entrée compilés de l'API et du bot contre un snapshot à epoch obsolète; ils doivent refuser avant écoute, jobs Redis ou login simulé. Une écriture du gate injectée en échec prouve le rollback transactionnel; le redémarrage reste bloqué. Après quarantaine réussie, l'API devient disponible et le bot n'atteint qu'un faux `Client.login` qui arrête le test. Le dispatcher de production n'émet ensuite qu'une nouvelle demande créée après restauration. Aucun appel Discord réel ni identifiant Discord réel n'est utilisé.
+- CI exécute l'intégration PostgreSQL 17 sur Node 24.21.0. Les durées de sauvegarde et restauration sont imprimées par scénario; elles ne constituent pas des RPO/RTO. L'intégration locale n'a pas pu être exécutée dans cette session : Docker Desktop était arrêté et le démarrage du service a été refusé par Windows (`Cannot open com.docker.service`). Les essais PostgreSQL réel et Linux sont donc à confirmer sur le run CI du SHA livré.
 
-Une archive sur le même hôte n'est pas une sauvegarde externe. La production doit copier les archives complètes et leurs sidecars vers un stockage distinct, chiffré, à accès limité et avec rétention surveillée. Aucun test de stockage distant, de panne de machine, de chiffrement au repos fourni par l'hébergeur ni de restauration à l'échelle de production n'a été fait.
+Une archive sur le même hôte n'est pas une sauvegarde externe. Aucun stockage distant, basculement de machine, chiffrement fournisseur ni restauration à la taille réelle de production n'est validé ici.

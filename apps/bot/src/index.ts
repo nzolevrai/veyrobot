@@ -19,7 +19,7 @@ function logThrottled(key: string, message: string, error: unknown): void {
   logBotError('bot_error', key, message, error);
 }
 
-const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379') });
+const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379'), VEYROBOT_RECOVERY_EPOCH: z.string().min(32).max(256) });
 const envResult = envSchema.safeParse(process.env);
 if (!envResult.success) {
   const fields = [...new Set(envResult.error.issues.map(issue => issue.path.join('.')))];
@@ -27,11 +27,19 @@ if (!envResult.success) {
   process.exit(1);
 }
 const env = envResult.data;
+const { prisma, assertRecoveryAuthorized } = await import('@veyrobot/db');
+try {
+  await assertRecoveryAuthorized(prisma, env.VEYROBOT_RECOVERY_EPOCH);
+} catch {
+  console.error('Bot startup refused: recovery authorization is missing, stale, or unavailable.');
+  await prisma.$disconnect();
+  process.exit(1);
+}
 const releaseBotLease = await acquireSingleBotLease(env.DATABASE_URL, () => {
   console.error('Verrou de processus bot perdu : arrêt pour éviter deux exécuteurs actifs.');
   process.exit(1);
 });
-const [{ rejectPendingAfterDisable, prisma, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
+const [{ rejectPendingAfterDisable, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
 const { markInterruptedOperationsUncertain, redisConnection } = moderation;
 // Uncertain network/5xx responses must reach our durable state machine; avoid
 // the REST layer automatically repeating non-idempotent moderation requests.

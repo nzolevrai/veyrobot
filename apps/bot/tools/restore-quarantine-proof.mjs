@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -10,6 +10,7 @@ const sourceUrl = process.env.DATABASE_URL ?? '';
 const sourceDatabase = decodeURIComponent(new URL(sourceUrl).pathname.slice(1));
 if (!sourceDatabase.startsWith('veyrobot_arch_bench_')) throw new Error('Use a dedicated isolated database named veyrobot_arch_bench_<run-id>.');
 const id = randomUUID().replaceAll('-', '').slice(0, 12);
+const recoveryEpoch = randomBytes(32).toString('hex');
 const targetDb = `veyrobot_restore_quarantine_${id}`;
 const archiveDir = await mkdtemp(path.join(os.tmpdir(), 'veyrobot-restore-proof-'));
 const archivePath = path.join(archiveDir, 'restore.dump');
@@ -64,7 +65,7 @@ try {
   docker(['exec', '-T', 'postgres', 'createdb', '-U', 'sentinelle', targetDb]);
   const restore = spawnSync('docker', ['compose', 'exec', '-T', 'postgres', 'pg_restore', '-U', 'sentinelle', '-d', targetDb, '--no-owner'], { cwd: process.cwd(), input: await readFile(archivePath), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   if (restore.status !== 0) throw new Error(`pg_restore failed (${restore.status}): ${restore.stderr.slice(0, 500)}`);
-  const quarantineOutput = runNode(['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], { DATABASE_URL: targetUrl.toString(), RESTORE_QUARANTINE_CONFIRM: '1' });
+  const quarantineOutput = runNode(['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], { DATABASE_URL: targetUrl.toString(), RESTORE_QUARANTINE_CONFIRM: '1', VEYROBOT_RECOVERY_EPOCH: recoveryEpoch });
   pool = new Pool({ connectionString: targetUrl.toString(), max: 2 });
   const restoredGrant = await pool.query('SELECT "revokedAt" FROM "SessionGrant" WHERE "idHash" = $1', [sessionGrantIdHash]);
   if (restoredGrant.rows.length !== 1 || restoredGrant.rows[0].revokedAt === null) throw new Error('Restored active session grant was not revoked before application startup.');
