@@ -14,6 +14,8 @@ const id = createHash('sha256').update(`${Date.now()}-${Math.random()}`).digest(
 const project = `veyrobot-backup-proof-${id}`;
 const sourceDb = `veyrobot_backup_source_${id}`;
 const targetDb = `veyrobot_backup_restore_${id}`;
+const freshDb = `veyrobot_backup_fresh_${id}`;
+const concurrentDb = `veyrobot_backup_concurrent_${id}`;
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'veyrobot-backup-restore-'));
 const composeFile = path.join(tempRoot, 'compose.test.yaml');
 const backupDirectory = path.join(tempRoot, 'backups');
@@ -59,8 +61,43 @@ async function freePort() {
   return address.port;
 }
 
+function runRecoveryCli(script, env) {
+  return spawnSync(process.execPath, ['--import', 'tsx', script], { cwd: root, env, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 15_000 });
+}
+
+function assertCliFailure(result, message) {
+  assert.equal(result.error, undefined, `${message}: CLI process must finish, not fail to spawn or time out`);
+  assert.ok(Number.isInteger(result.status) && result.status !== 0, `${message}: expected a nonzero exit; stderr=${result.stderr}`);
+}
+
+async function assertApiStarts(databaseUrl, epoch, redisUrl, label) {
+  const port = await freePort();
+  const apiBase = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, ['dist/index.js'], {
+    cwd: path.join(root, 'apps/api'),
+    env: { ...process.env, DATABASE_URL: databaseUrl, REDIS_URL: redisUrl, VEYROBOT_RECOVERY_EPOCH: epoch, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: apiBase,
+      DASHBOARD_URL: 'http://localhost:3000', DISCORD_CLIENT_ID: 'test-client-id', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'not-a-real-token',
+      SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.setEncoding('utf8').on('data', chunk => { output = (output + chunk).slice(-20_000); });
+  child.stderr.setEncoding('utf8').on('data', chunk => { output = (output + chunk).slice(-20_000); });
+  try {
+    let health;
+    for (let i = 0; i < 100 && child.exitCode === null; i++) {
+      try { health = await fetch(`${apiBase}/health`); break; } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+    }
+    assert.equal(health?.status, 200, `${label}: API should start only with an authorized recovery gate. Output: ${output}`);
+  } finally {
+    if (child.exitCode === null) { child.kill('SIGTERM'); await Promise.race([once(child, 'exit'), new Promise(resolve => setTimeout(resolve, 3000))]); }
+  }
+}
+
 let composeStarted = false;
 let targetCreated = false;
+let freshCreated = false;
+let concurrentCreated = false;
 try {
   const nodeVersion = process.versions.node.split('.').map(Number);
   assert.ok(nodeVersion[0] > 24 || (nodeVersion[0] === 24 && nodeVersion[1] >= 17), `Node >=24.17 required; got ${process.versions.node}`);
@@ -85,6 +122,7 @@ const warningId = 'backup_${id}_warning';
 const tempbanId = 'backup_${id}_tempban';
 const requestedId = 'backup_${id}_requested';
 const runningId = 'backup_${id}_running';
+await initializeRecoveryAuthorization(prisma, '${sourceEpoch}');
 await prisma.guildConfig.create({ data: { guildId, version: 8, updatedBy: actorId, warningsEnabled: true, memberActionsEnabled: true, language: 'fr', timeZone: 'Europe/Paris' } });
 await prisma.moderationCase.createMany({ data: [
   { operationId: warningId, guildId, actorId, targetId: '888888888888888881', action: 'WARN', reason: 'backup restore fixture', status: 'succeeded', result: 'warning persisted' },
@@ -94,7 +132,6 @@ await prisma.moderationCase.createMany({ data: [
 ] });
 await prisma.guildTargetDecision.create({ data: { guildId, targetId: '888888888888888882', generation: 1, latestOperationId: tempbanId, appliedGeneration: 1, appliedOperationId: tempbanId } });
 await prisma.sessionGrant.create({ data: { idHash: '${createHash('sha256').update(`session-${id}`).digest('hex')}', expiresAt: new Date(Date.now() + 3600000) } });
-await initializeRecoveryAuthorization(prisma, '${sourceEpoch}');
 await prisma.$disconnect();`;
   node(['--import', 'tsx', '--input-type=module', '-e', seed], sourceEnv);
 
@@ -143,15 +180,89 @@ await prisma.$disconnect();`;
   const startBot = (epoch) => spawnSync(process.execPath, ['--import', fakeGatewayPreload, 'dist/index.js'], {
     cwd: botDirectory, env: { ...targetEnv, VEYROBOT_RECOVERY_EPOCH: epoch }, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 10_000,
   });
+  const freshUrl = new URL(databaseUrl);
+  freshUrl.pathname = `/${freshDb}`;
+  docker([...composePrefix, 'exec', '-T', 'postgres', 'createdb', '-U', pgUser, freshDb]);
+  freshCreated = true;
+  const freshEnv = { ...sourceEnv, DATABASE_URL: freshUrl.toString() };
+  packageManager(['db:migrate'], freshEnv);
+  const firstInstallGuard = `import assert from 'node:assert/strict'; import {prisma,initializeRecoveryAuthorization} from './packages/db/src/index.ts';
+const epoch='${randomBytes(32).toString('hex')}';
+const fixtures=[
+ ['moderationCase',{guildId:'guard',actorId:'actor',targetId:'target',action:'WARN',reason:'fixture'}],
+ ['guildTargetDecision',{guildId:'guard',targetId:'target'}],
+ ['channelLockState',{guildId:'guard',channelId:'channel',originalSendMessages:'allow',lockOperationId:'lock-fixture'}],
+ ['guildConfig',{guildId:'guard',updatedBy:'actor'}],
+ ['configAudit',{guildId:'guard',actorId:'actor',version:1,changes:{fixture:true}}],
+ ['guildPresence',{guildId:'guard',shardId:0}],
+ ['shardPresence',{shardId:0}],
+ ['sessionGrant',{idHash:'session-fixture',expiresAt:new Date(Date.now()+60000)}]
+];
+for (const [name,data] of fixtures) {
+ await prisma[name].create({data});
+ await assert.rejects(initializeRecoveryAuthorization(prisma,epoch),/contains application data/,'each persisted application model must block first-install initialization');
+ await prisma[name].deleteMany();
+}
+await prisma.$disconnect();`;
+  node(['--import', 'tsx', '--input-type=module', '-e', firstInstallGuard], freshEnv);
+  const freshEpoch = randomBytes(32).toString('hex');
+  const freshInitEnv = { ...freshEnv, VEYROBOT_RECOVERY_EPOCH: freshEpoch, RECOVERY_GATE_INITIALIZE: '1' };
+  const freshInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', freshInitEnv);
+  assert.equal(freshInit.status, 0, `first-install initialization on empty migrated DB succeeds: ${freshInit.stderr}`);
+  const readGateHash = (env) => node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const row=await prisma.recoveryGate.findUniqueOrThrow({where:{id:'singleton'}}); await prisma.$disconnect(); console.log(row.epochHash);`], env);
+  const freshGateBefore = await readGateHash(freshEnv);
+  const repeatedInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', freshInitEnv);
+  assertCliFailure(repeatedInit, 'initialization refuses an existing gate');
+  assert.equal((await readGateHash(freshEnv)).trim(), freshGateBefore.trim(), 'refusing a second initialization does not realign the stored epoch');
+  await assertApiStarts(freshUrl.toString(), freshEpoch, redisUrl, 'fresh installation');
+  const freshBotStart = spawnSync(process.execPath, ['--import', fakeGatewayPreload, 'dist/index.js'], {
+    cwd: botDirectory, env: { ...freshInitEnv, REDIS_URL: redisUrl, DISCORD_BOT_TOKEN: 'not-a-real-token', DISCORD_CLIENT_ID: 'test-client-id' }, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 10_000,
+  });
+  assert.equal(freshBotStart.status, 42, 'production bot startup is authorized after fresh empty-database initialization');
+  assert.ok(`${freshBotStart.stdout}${freshBotStart.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'), 'fresh bot reaches only the fake Gateway adapter');
+
+  docker([...composePrefix, 'exec', '-T', 'postgres', 'createdb', '-U', pgUser, concurrentDb]);
+  concurrentCreated = true;
+  const concurrentUrl = new URL(databaseUrl);
+  concurrentUrl.pathname = `/${concurrentDb}`;
+  const concurrentEnv = { ...sourceEnv, DATABASE_URL: concurrentUrl.toString() };
+  packageManager(['db:migrate'], concurrentEnv);
+  const concurrentEpoch = randomBytes(32).toString('hex');
+  const launchConcurrentInit = () => new Promise(resolve => {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'packages/db/src/recovery-gate-init-cli.ts'], { cwd: root, env: { ...concurrentEnv, VEYROBOT_RECOVERY_EPOCH: concurrentEpoch, RECOVERY_GATE_INITIALIZE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000);
+    child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+    child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });
+    child.once('error', error => { clearTimeout(timeout); resolve({ code: null, output: `${output}${error.message}` }); });
+    child.once('close', code => { clearTimeout(timeout); resolve({ code, output }); });
+  });
+  const concurrentResults = await Promise.all([launchConcurrentInit(), launchConcurrentInit()]);
+  assert.equal(concurrentResults.filter(result => result.code === 0).length, 1, 'exactly one concurrent first-install initializer succeeds');
+  assert.equal(concurrentResults.filter(result => result.code !== 0).length, 1, 'the competing initializer fails closed after observing the committed gate');
+  assert.equal((await readGateHash(concurrentEnv)).trim(), createHash('sha256').update(concurrentEpoch).digest('hex'), 'concurrent initialization cannot replace the selected epoch');
+
   const blockedStart = startBot(restoreEpoch);
   assert.equal(blockedStart.status, 1, 'the production bot entrypoint refuses an old restored recovery epoch');
   assert.ok(!`${blockedStart.stdout}${blockedStart.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'), 'no simulated Discord login is attempted before quarantine');
+  const existingGateInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', { ...targetEnv, RECOVERY_GATE_INITIALIZE: '1' });
+  assertCliFailure(existingGateInit, 'first-install initialization refuses to replace an existing restored gate');
+  const restoredGateHash = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const row=await prisma.recoveryGate.findUniqueOrThrow({where:{id:'singleton'}}); await prisma.$disconnect(); console.log(row.epochHash);`], targetEnv);
+  assert.equal(restoredGateHash.trim(), createHash('sha256').update(sourceEpoch).digest('hex'), 'existing stale gate remains unchanged after init refusal');
+  docker([...composePrefix, 'exec', '-T', 'postgres', 'psql', '-U', pgUser, '-d', targetDb, '-v', 'ON_ERROR_STOP=1', '-c', 'DELETE FROM "RecoveryGate"']);
+  const legacyInit = runRecoveryCli('packages/db/src/recovery-gate-init-cli.ts', { ...targetEnv, RECOVERY_GATE_INITIALIZE: '1' });
+  assertCliFailure(legacyInit, 'a snapshot without a RecoveryGate row but with restored application data cannot use init');
+  const absentGate = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const row=await prisma.recoveryGate.findUnique({where:{id:'singleton'}}); await prisma.$disconnect(); console.log(JSON.stringify(row));`], targetEnv);
+  assert.equal(absentGate.trim(), 'null', 'refused init does not create a gate on the restored snapshot');
+  const legacyBlockedStart = startBot(restoreEpoch);
+  assert.equal(legacyBlockedStart.status, 1, 'bot remains blocked when the restored snapshot has no gate');
+  assert.ok(!`${legacyBlockedStart.stdout}${legacyBlockedStart.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'));
   const redisKeysBeforeQuarantine = Number(docker([...composePrefix, 'exec', '-T', 'redis', 'redis-cli', 'dbsize']).trim());
-  assert.equal(redisKeysBeforeQuarantine, 0, 'a blocked production bot startup has not published any BullMQ job');
+  assert.equal(redisKeysBeforeQuarantine, 0, 'blocked production bot startups have not published any BullMQ job');
   const blockedApiPort = await freePort();
   const blockedApiEnv = { ...targetEnv, NODE_ENV: 'test', API_PORT: String(blockedApiPort), API_PUBLIC_URL: `http://127.0.0.1:${blockedApiPort}`, DASHBOARD_URL: 'http://localhost:3000', DISCORD_CLIENT_SECRET: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' };
   const blockedApi = spawnSync(process.execPath, ['dist/index.js'], { cwd: path.join(root, 'apps/api'), env: blockedApiEnv, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 10_000 });
-  assert.equal(blockedApi.status, 1, 'the production API entrypoint also refuses the restored epoch before listening');
+  assert.equal(blockedApi.status, 1, 'the production API entrypoint refuses a snapshot with no gate before listening');
   assert.ok(!`${blockedApi.stdout}${blockedApi.stderr}`.includes('Server listening'), 'API exposes no routes before quarantine');
   const operationBeforeQuarantine = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const r=await prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_requested'}}); await prisma.$disconnect(); console.log(r.status);`], targetEnv);
   assert.equal(operationBeforeQuarantine.trim(), 'requested', 'restored active work remains unchanged until the transaction commits');
@@ -161,8 +272,8 @@ await prisma.$disconnect();`;
   const failedQuarantine = spawnSync(process.execPath, ['--import', 'tsx', 'packages/db/src/restore-quarantine-cli.ts'], { cwd: root, env: targetEnv, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
   assert.notEqual(failedQuarantine.status, 0, 'injected gate persistence failure aborts quarantine');
   docker([...composePrefix, 'exec', '-T', 'postgres', 'psql', '-U', pgUser, '-d', targetDb, '-v', 'ON_ERROR_STOP=1', '-c', 'DROP TRIGGER fail_recovery_gate_write ON "RecoveryGate"; DROP FUNCTION fail_recovery_gate_write();']);
-  const afterFailedQuarantine = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const [r,g]=await Promise.all([prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_requested'}}),prisma.recoveryGate.findUniqueOrThrow({where:{id:'singleton'}})]); await prisma.$disconnect(); console.log(JSON.stringify({status:r.status,epochHash:g.epochHash}));`], targetEnv);
-  assert.deepEqual(JSON.parse(afterFailedQuarantine.trim()), { status: 'requested', epochHash: createHash('sha256').update(sourceEpoch).digest('hex') }, 'failed quarantine transaction rolls back the gate and work states');
+  const afterFailedQuarantine = await node(['--import', 'tsx', '--input-type=module', '-e', `import {prisma} from './packages/db/src/index.ts'; const [r,e,g]=await Promise.all([prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_requested'}}),prisma.moderationCase.findUniqueOrThrow({where:{operationId:'backup_${id}_tempban'}}),prisma.recoveryGate.findUnique({where:{id:'singleton'}})]); const grant=await prisma.sessionGrant.findFirst(); await prisma.$disconnect(); console.log(JSON.stringify({status:r.status,expiryStatus:e.expiryStatus,gate:Boolean(g),sessionRevoked:Boolean(grant?.revokedAt)}));`], targetEnv);
+  assert.deepEqual(JSON.parse(afterFailedQuarantine.trim()), { status: 'requested', expiryStatus: 'scheduled', gate: false, sessionRevoked: false }, 'failed quarantine rolls back operation, expiry, sessions and gate as one transaction');
   const restartDuringQuarantine = startBot(restoreEpoch);
   assert.equal(restartDuringQuarantine.status, 1, 'restart while quarantine is incomplete remains blocked');
   assert.ok(!`${restartDuringQuarantine.stdout}${restartDuringQuarantine.stderr}`.includes('FAKE_GATEWAY_LOGIN_REACHED'));
@@ -209,8 +320,10 @@ const byId=Object.fromEntries(cases.map(row=>[row.operationId,row])); console.lo
 
   console.log(JSON.stringify({ result: 'passed', postgres: '17-alpine', scope: 'real backup/restore; production bot entrypoint blocked before quarantine and allowed only through fake Gateway after; failed transaction and restart tested; no real Discord connection', quarantine: JSON.parse(quarantineOutput.trim()), checks: verification, durationsMs: timings, archiveBytes: archive.length }));
 } finally {
-  if (targetCreated) {
-    try { docker([...composePrefix, 'exec', '-T', 'postgres', 'dropdb', '-U', pgUser, '--if-exists', targetDb]); } catch { /* container teardown removes this isolated database */ }
+  for (const [created, database] of [[targetCreated, targetDb], [freshCreated, freshDb], [concurrentCreated, concurrentDb]]) {
+    if (created) {
+      try { docker([...composePrefix, 'exec', '-T', 'postgres', 'dropdb', '-U', pgUser, '--if-exists', database]); } catch { /* container teardown removes this isolated database */ }
+    }
   }
   if (composeStarted) {
     try { docker([...composePrefix, 'down', '-v', '--remove-orphans']); } catch { /* isolated test project only */ }

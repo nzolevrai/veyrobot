@@ -81,6 +81,8 @@ Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interr
 
 Le script `deploy/backup-postgres.ps1` publie uniquement une archive PostgreSQL 17 validée par `pg_restore --list`, avec sidecar SHA-256 publié en dernier, noms concurrents uniques et temporaires isolés. La politique Windows autorise le compte de sauvegarde, SYSTEM et Administrators, refuse un dossier aux ACL inadéquates et teste une ACE explicite `BUILTIN\Users`; Linux est vérifié avec modes 0700/0600. Un epoch conservé hors snapshots bloque l'API et le bot après restauration jusqu'à la transaction de quarantaine et révocation des sessions. La CI teste les vrais points d'entrée compilés, une panne transactionnelle et un redémarrage bloqué, puis le dispatcher après reprise avec Discord simulé uniquement.
 
+L'initialisation `recovery-gate:init` est réservée à une première installation : transactionnellement, elle refuse tout gate existant ou toute ligne dans les tables applicatives/de session du schéma, et sérialise les initialisations concurrentes. Une base historique sans gate doit être mise à niveau avec `recovery:quarantine`; l'absence du gate seule ne classe pas la base comme restaurée.
+
 La procédure de restauration et ses commandes sont dans [BACKUP-RESTORE-VERIFICATION-2026-10-15.md](BACKUP-RESTORE-VERIFICATION-2026-10-15.md). Restent à éprouver : planification/copie vers stockage distant chiffré, surveillance de la capacité/rétention, contrôle de l'accès à ce stockage et exercice à la taille réelle de la base. Les durées locales mesurées ne constituent pas des objectifs RPO/RTO.
 
 ### Navigation routée et édition commune — 13 octobre 2026
