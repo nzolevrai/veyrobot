@@ -27,18 +27,24 @@ const pendingGuildId = snowflake();
 const expiryGuildId = snowflake();
 const oomPendingGuildId = snowflake();
 const oomExpiryGuildId = snowflake();
+const preExpiryGuildId = snowflake();
+const postExpiryGuildId = snowflake();
 const actorId = snowflake();
 const activeTargetId = snowflake();
 const pendingTargetId = snowflake();
 const expiryTargetId = snowflake();
 const oomPendingTargetId = snowflake();
 const oomExpiryTargetId = snowflake();
+const preExpiryTargetId = snowflake();
+const postExpiryTargetId = snowflake();
 const activeOperationId = `pressure-active-${suffix}`;
 const pendingOperationId = `pressure-pending-${suffix}`;
 const expiryOperationId = `pressure-expiry-${suffix}`;
 const oomOperationId = `pressure-oom-active-${suffix}`;
 const oomPendingOperationId = `pressure-oom-pending-${suffix}`;
 const oomExpiryOperationId = `pressure-oom-expiry-${suffix}`;
+const preExpiryOperationId = `pressure-pre-expiry-${suffix}`;
+const postExpiryOperationId = `pressure-post-expiry-${suffix}`;
 const expiryCaseId = `pressure_case_${suffix}`;
 const oomExpiryCaseId = `pressure_oom_case_${suffix}`;
 let port;
@@ -57,6 +63,9 @@ let oomKickCount = 0;
 let oomKickWasEntered = false;
 let oomKickRelease;
 let oomQueueDeliveries = 0;
+const recoveryScenarios = new Map();
+const workerFailures = [];
+const guildBusySkips = [];
 const oomKickGate = new Promise(resolve => { oomKickRelease = resolve; });
 const fillerKeys = [];
 const dispatchErrors = [];
@@ -76,10 +85,20 @@ function docker(args, allowFailure = false) {
   return { status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
 }
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+async function within(label, promise, timeoutMs = 15_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label} after ${timeoutMs} ms.`)), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
 async function until(label, check, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const result = await check();
+    const remaining = Math.max(1, deadline - Date.now());
+    const result = await within(label, Promise.resolve().then(check), remaining);
     if (result) return result;
     await delay(25);
   }
@@ -96,21 +115,27 @@ async function connectRedisRetry(redisPort, timeoutMs = 30_000) {
 }
 async function reserveLoopbackPort() {
   const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
+  try {
+    await within('loopback port reservation', new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    }), 5_000);
+  } catch (error) {
+    server.close();
+    throw error;
+  }
   const reservedPort = server.address().port;
-  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  await within('loopback port release', new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())), 5_000);
   return reservedPort;
 }
-function createGuild(guildId, targetId, { holdKick = false, banReason, oomHoldKick = false } = {}) {
+function createGuild(guildId, targetId, { holdKick = false, banReason, oomHoldKick = false, recovery } = {}) {
   const target = {
     id: targetId,
     roles: { highest: { comparePositionTo: () => -1 } },
     async kick() {
       if (holdKick) { activeKickCount++; activeKickEntered(); await kickGate; }
       else if (oomHoldKick) { oomKickCount++; oomKickWasEntered = true; console.info(JSON.stringify({ event: 'controlled_discord_mutation_held', scenario: 'redis_cgroup_oom' })); await oomKickGate; }
+      else if (recovery) { recovery.mutations++; recovery.entered(); await recovery.gate; }
       else pendingKickCount++;
     },
   };
@@ -167,6 +192,7 @@ function connectRedis(redisPort) {
   };
   socket.on('error', error => rejectPending(error));
   socket.on('close', () => rejectPending(new Error('Redis connection closed before a response.')));
+  socket.setTimeout(10_000, () => { socket.destroy(new Error('Redis probe socket timed out after 10 seconds.')); });
   return new Promise((resolve, reject) => {
     socket.once('connect', () => resolve({
       command(args) {
@@ -187,9 +213,9 @@ function connectRedis(redisPort) {
   });
 }
 async function createRequest(guildId, targetId, operationId, reason) {
-  return moderation.submitModerationAction(prisma, { guildId, actorId, targetId, action: 'KICK', reason, operationId });
+  return within(`PostgreSQL admission for ${operationId}`, moderation.submitModerationAction(prisma, { guildId, actorId, targetId, action: 'KICK', reason, operationId }), 10_000);
 }
-async function row(operationId) { return prisma.moderationCase.findUnique({ where: { operationId } }); }
+async function row(operationId) { return within(`PostgreSQL read for ${operationId}`, prisma.moderationCase.findUnique({ where: { operationId } }), 10_000); }
 async function clearFillerKeys() {
   if (!rawRedis) return;
   for (let offset = 0; offset < fillerKeys.length; offset += 500) {
@@ -197,11 +223,40 @@ async function clearFillerKeys() {
   }
   fillerKeys.length = 0;
 }
+function makeRecoveryGate(operationId) {
+  let enter;
+  let release;
+  const scenario = {
+    operationId, deliveries: 0, mutations: 0, stalled: 0, failures: [], completions: 0,
+    entered: () => enter(),
+    gate: new Promise(resolve => { release = resolve; }),
+    enteredGate: new Promise(resolve => { enter = resolve; }),
+    release: () => release(),
+  };
+  recoveryScenarios.set(operationId, scenario);
+  return scenario;
+}
+async function restartRedisControlled({ holdMs = 0, label }) {
+  const queueClient = await within(`${label}: producer client`, queue.getBackend().client, 5_000);
+  const workerClient = await within(`${label}: worker client`, worker.getBackend().client, 5_000);
+  docker(['stop', '--time=1', container]);
+  rawRedis?.close();
+  rawRedis = undefined;
+  await until(`${label}: both live BullMQ clients detect Redis stop`, () => queueClient.status !== 'ready' && workerClient.status !== 'ready', 8_000);
+  if (holdMs > 0) await delay(holdMs);
+  docker(['start', container]);
+  assert.match(docker(['port', container, '6379/tcp']).stdout, new RegExp(`:${port}$`), `${label}: Redis resumes on the original port`);
+  rawRedis = await connectRedisRetry(port, 15_000);
+  await until(`${label}: Redis accepts PING`, async () => (await rawRedis.command(['PING']).catch(() => '')) === 'PONG', 15_000);
+  await until(`${label}: original queue and worker clients reconnect`, () => queueClient.status === 'ready' && workerClient.status === 'ready', 20_000);
+  assert.strictEqual(await queue.getBackend().client, queueClient, `${label}: producer client identity is unchanged`);
+  assert.strictEqual(await worker.getBackend().client, workerClient, `${label}: worker client identity is unchanged`);
+}
 
 try {
-  await prisma.guildConfig.createMany({
+  await within('test guild setup', prisma.guildConfig.createMany({
     data: [activeGuildId, pendingGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })),
-  });
+  }), 10_000);
   await createRequest(activeGuildId, activeTargetId, activeOperationId, 'Controlled active action during Redis saturation');
   port = await reserveLoopbackPort();
   oomVolume = `veyrobot-pressure-aof-${suffix.slice(0, 12)}`;
@@ -222,29 +277,25 @@ try {
   const producerConnection = moderation.redisConnection(redisUrl, true);
   queue = new Queue(queueName, { connection: producerConnection });
   queue.on('error', error => queueErrors.push({ at: Date.now(), source: 'producer', name: error?.name ?? 'unknown' }));
-  await queue.waitUntilReady();
+  await within('BullMQ producer queue readiness', queue.waitUntilReady(), 15_000);
   createGuild(activeGuildId, activeTargetId, { holdKick: true });
   createGuild(pendingGuildId, pendingTargetId);
   const client = { isReady: () => true, guilds: { cache: { get: id => guildMap.get(id) } } };
-  worker = createModerationWorker(client, consumerConnection, prisma, moderation, rejectPendingAfterDisable, () => undefined, undefined, queueName, { lockDuration: 3_000, stalledInterval: 1_000 });
-  worker.on('active', job => { if (job.id === oomOperationId) oomQueueDeliveries++; });
+  worker = createModerationWorker(client, consumerConnection, prisma, moderation, rejectPendingAfterDisable, () => undefined, {
+    onGuildBusySkip: (guildId, operationId) => guildBusySkips.push({ guildId, operationId, at: Date.now() }),
+  }, queueName, { lockDuration: 12_000, stalledInterval: 500 });
+  worker.on('active', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.deliveries++; if (job.id === oomOperationId) oomQueueDeliveries++; });
+  worker.on('stalled', jobId => { const scenario = recoveryScenarios.get(jobId); if (scenario) scenario.stalled++; });
+  worker.on('failed', (job, error) => {
+    const scenario = recoveryScenarios.get(job?.id);
+    const failure = { jobId: job?.id, name: error?.name ?? 'unknown', message: String(error?.message ?? 'unknown').slice(0, 300) };
+    workerFailures.push(failure);
+    scenario?.failures.push(failure);
+  });
+  worker.on('completed', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.completions++; });
   worker.on('error', error => workerErrors.push({ at: Date.now(), source: 'worker', name: error?.name ?? 'unknown' }));
-  await queue.add('moderation-action', { guildId: activeGuildId, operationId: activeOperationId }, { jobId: activeOperationId, attempts: 1, removeOnComplete: true, removeOnFail: true });
-  await enteredGate;
-  await createRequest(pendingGuildId, pendingTargetId, pendingOperationId, 'Must remain durable while Redis refuses writes');
-
-  expiryMarker = `pressure-marker-${suffix}`;
-  await prisma.guildConfig.create({ data: { guildId: expiryGuildId, updatedBy: actorId, memberActionsEnabled: true } });
-  await prisma.moderationCase.create({ data: {
-    id: expiryCaseId, operationId: expiryOperationId, guildId: expiryGuildId, actorId, targetId: expiryTargetId,
-    action: 'TEMPBAN', reason: 'Due expiry retained through Redis outage', status: 'succeeded', durationMinutes: 1,
-    expiresAt: new Date(Date.now() - 60_000), banMarker: expiryMarker, banGeneration: 1, expiryStatus: 'scheduled',
-  } });
-  await prisma.guildTargetDecision.create({ data: {
-    guildId: expiryGuildId, targetId: expiryTargetId, generation: 1, latestOperationId: expiryOperationId,
-    appliedGeneration: 1, appliedOperationId: expiryOperationId,
-  } });
-  createGuild(expiryGuildId, expiryTargetId, { banReason: `temporary ban [${expiryMarker}]` });
+  await within('initial BullMQ job enqueue', queue.add('moderation-action', { guildId: activeGuildId, operationId: activeOperationId }, { jobId: activeOperationId, attempts: 1, removeOnComplete: true, removeOnFail: true }), 15_000);
+  await within('initial controlled Discord mutation gate', enteredGate, 15_000);
 
   let dispatcherQueryCount = 0;
   const dispatchStore = {
@@ -255,6 +306,74 @@ try {
     dispatchErrors.push({ at: Date.now(), key, message, errorName: error instanceof Error ? error.name : 'unknown', errorMessage: error instanceof Error ? error.message : String(error) });
   }, attempt => dispatchAttempts.push({ at: Date.now(), ...attempt }));
   await until('BullMQ producer connection ready before applying Redis memory pressure', async () => (await queue.getBackend().client).status === 'ready');
+
+  const runRecoveryScenario = async ({ operationId, guildId, targetId, label, outageMs, expectStalled }) => {
+    const gate = makeRecoveryGate(operationId);
+    await within(`${label}: PostgreSQL guild setup`, prisma.guildConfig.create({ data: { guildId, updatedBy: actorId, memberActionsEnabled: true } }), 10_000);
+    createGuild(guildId, targetId, { recovery: gate });
+    await createRequest(guildId, targetId, operationId, `Controlled ${label} Redis recovery`);
+    await within(`${label}: production dispatcher wake`, dispatch(), 15_000);
+    await within(`${label}: production worker enters controlled Discord adapter`, gate.enteredGate, 15_000);
+    await until(`${label}: job is active in BullMQ`, async () => {
+      const job = await queue.getJob(operationId);
+      return job ? await job.getState() === 'active' : false;
+    }, 15_000);
+    const lockKey = `${queue.toKey(operationId)}:lock`;
+    const lockTtlBefore = Number(await rawRedis.command(['PTTL', lockKey]));
+    assert.ok(lockTtlBefore > 0, `${label}: BullMQ lock has a live TTL before outage`);
+    assert.equal(gate.deliveries, 1, `${label}: exactly one initial worker delivery before outage`);
+    assert.equal(gate.mutations, 1, `${label}: exactly one simulated Discord mutation entered before outage`);
+    await restartRedisControlled({ holdMs: outageMs, label });
+    const lockTtlAfter = Number(await rawRedis.command(['PTTL', lockKey]));
+    if (expectStalled) {
+      assert.ok(lockTtlAfter < 0, `${label}: the lock is absent after its test-only lease expired (PTTL=${lockTtlAfter})`);
+      await within(`${label}: BullMQ reports stalled recovery`, until(`${label}: stalled event and redelivery`, () => gate.stalled >= 1 && gate.deliveries >= 2, 15_000), 16_000);
+      // The same worker still owns the original in-flight operation, so its duplicate
+      // delivery must be skipped by the production per-guild guard, not mutate Discord.
+      assert.equal(gate.mutations, 1, `${label}: stalled delivery did not repeat the mutation`);
+      assert.ok(guildBusySkips.some(skip => skip.operationId === operationId && skip.guildId === guildId), `${label}: the live production worker's same-guild guard observed and skipped the stalled redelivery`);
+      gate.release();
+      await until(`${label}: original operation reaches durable PostgreSQL success`, async () => (await row(operationId))?.status === 'succeeded', 20_000);
+    } else {
+      assert.ok(lockTtlAfter > 0, `${label}: the original lock remains live before expiry (PTTL=${lockTtlAfter})`);
+      gate.release();
+      await until(`${label}: operation reaches durable PostgreSQL success`, async () => (await row(operationId))?.status === 'succeeded', 20_000);
+    }
+    await until(`${label}: BullMQ proof job is removed after completion`, async () => (await queue.getJob(operationId)) === undefined, 20_000);
+    assert.equal((await row(operationId)).status, 'succeeded', `${label}: PostgreSQL operation is succeeded`);
+    assert.equal(gate.mutations, 1, `${label}: exactly one simulated Discord mutation`);
+    assert.equal(gate.failures.length, 0, `${label}: no BullMQ failed event before auto-removal`);
+    if (!expectStalled) {
+      assert.equal(gate.deliveries, 1, `${label}: no redelivery while lock is valid`);
+      assert.equal(gate.stalled, 0, `${label}: no stalled event before lock expiry`);
+    } else {
+      assert.equal(gate.deliveries, 2, `${label}: one initial delivery plus exactly one stalled redelivery`);
+      assert.equal(gate.stalled, 1, `${label}: exactly one stalled recovery was observed`);
+      assert.equal(gate.completions, 1, `${label}: exactly one recovered queue job emitted completion`);
+    }
+    console.info(JSON.stringify({ event: 'bullmq_redis_recovery_scenario', label, deliveries: gate.deliveries, stalledEvents: gate.stalled, mutations: gate.mutations, failures: gate.failures.length, lockTtlBeforeMs: lockTtlBefore, lockTtlAfterRestartMs: lockTtlAfter, outcome: (await row(operationId)).status }));
+  };
+
+  // Integration-only lease timings: 12 s lock / 500 ms stalled scan, not the BullMQ
+  // production defaults (30 s / 30 s). The outage durations straddle that lease.
+  await runRecoveryScenario({ operationId: preExpiryOperationId, guildId: preExpiryGuildId, targetId: preExpiryTargetId, label: 'restart_before_lock_expiry', outageMs: 1_000, expectStalled: false });
+  await runRecoveryScenario({ operationId: postExpiryOperationId, guildId: postExpiryGuildId, targetId: postExpiryTargetId, label: 'restart_after_lock_expiry', outageMs: 13_000, expectStalled: true });
+
+  // Add the durable backlog only after the live-client restart scenarios, so
+  // their dispatcher calls cannot publish the request before maxmemory refusal.
+  await createRequest(pendingGuildId, pendingTargetId, pendingOperationId, 'Must remain durable while Redis refuses writes');
+  expiryMarker = `pressure-marker-${suffix}`;
+  await within('due expiry guild setup', prisma.guildConfig.create({ data: { guildId: expiryGuildId, updatedBy: actorId, memberActionsEnabled: true } }), 10_000);
+  await within('due expiry case setup', prisma.moderationCase.create({ data: {
+    id: expiryCaseId, operationId: expiryOperationId, guildId: expiryGuildId, actorId, targetId: expiryTargetId,
+    action: 'TEMPBAN', reason: 'Due expiry retained through Redis outage', status: 'succeeded', durationMinutes: 1,
+    expiresAt: new Date(Date.now() - 60_000), banMarker: expiryMarker, banGeneration: 1, expiryStatus: 'scheduled',
+  } }), 10_000);
+  await within('due expiry decision setup', prisma.guildTargetDecision.create({ data: {
+    guildId: expiryGuildId, targetId: expiryTargetId, generation: 1, latestOperationId: expiryOperationId,
+    appliedGeneration: 1, appliedOperationId: expiryOperationId,
+  } }), 10_000);
+  createGuild(expiryGuildId, expiryTargetId, { banReason: `temporary ban [${expiryMarker}]` });
 
   const filler = 'x'.repeat(1024 * 1024);
   let largeChunkRejected = false;
@@ -282,31 +401,31 @@ try {
   assert.ok(smallChunkRejected, 'fine-grained filling leaves less than 1 KiB for a BullMQ write');
   const oomRejectedWrites = 2;
   const firstFailureAt = Date.now();
-  await dispatch();
+  await within('production dispatcher wake before maxmemory refusal', dispatch(), 15_000);
   assert.equal(dispatchErrors.length, 1, 'a refused publish is diagnosed once');
   assert.equal(dispatchErrors[0].key, 'moderation-queue-dispatch');
   assert.match(dispatchErrors[0].message, /PostgreSQL request remains durable/);
   assert.match(dispatchErrors[0].errorName, /Error/);
   assert.match(dispatchErrors[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
   assert.equal((await row(pendingOperationId)).status, 'requested', 'failed Redis enqueue does not lose accepted PostgreSQL work');
-  assert.equal((await prisma.moderationCase.findUnique({ where: { id: expiryCaseId } })).expiryStatus, 'scheduled', 'due expiry remains durable');
+  assert.equal((await within('read due expiry after refused publication', prisma.moderationCase.findUnique({ where: { id: expiryCaseId } }), 10_000)).expiryStatus, 'scheduled', 'due expiry remains durable');
   assert.equal(activeKickCount, 1, 'the already active controlled Discord operation was not repeated');
 
   const outboxQueriesBeforeCooldownWakes = dispatcherQueryCount;
   const errorsBeforeCooldownWakes = dispatchErrors.length;
-  for (let i = 0; i < 8; i++) await dispatch();
-  const dispatcherOutboxQueriesDuringBackoff = dispatcherQueryCount - outboxQueriesBeforeCooldownWakes;
+  for (let i = 0; i < 8; i++) await within(`dispatcher cooldown wake ${i + 1}`, dispatch(), 5_000);
+  const dispatcherOutboxQueriesDuringCooldown = dispatcherQueryCount - outboxQueriesBeforeCooldownWakes;
   const dispatcherErrorsDuringBackoff = dispatchErrors.length - errorsBeforeCooldownWakes;
   assert.equal(dispatchErrors.length, 1, 'repeated wakes are held by exponential cooldown rather than log/retry storm');
-  assert.equal(dispatcherOutboxQueriesDuringBackoff, 0, 'cooldown avoids repeated PostgreSQL outbox scans');
+  assert.equal(dispatcherOutboxQueriesDuringCooldown, 0, 'cooldown avoids repeated PostgreSQL outbox scans');
   assert.equal(dispatcherErrorsDuringBackoff, 0, 'cooldown emits no additional diagnostics');
 
   kickRelease();
   await until('active action durable completion while Redis is saturated', async () => (await row(activeOperationId))?.status === 'succeeded');
   await clearFillerKeys();
   const remainingBackoff = Math.max(0, firstFailureAt + 1_010 - Date.now());
-  if (remainingBackoff) await delay(remainingBackoff);
-  await dispatch();
+  if (remainingBackoff) await within('bounded dispatcher cooldown expiry', delay(remainingBackoff), 1_500);
+  await within('production dispatcher wake after Redis space is released', dispatch(), 15_000);
 
   await until('pending operation and due expiry to reconcile after Redis recovers', async () => {
     const [pending, expiry] = await Promise.all([
@@ -320,30 +439,30 @@ try {
   }, 45_000);
   assert.equal((await row(activeOperationId)).status, 'succeeded');
   assert.equal((await row(pendingOperationId)).status, 'succeeded');
-  assert.equal((await prisma.moderationCase.findUnique({ where: { id: expiryCaseId } })).expiryStatus, 'succeeded');
+  assert.equal((await within('read due expiry after recovery', prisma.moderationCase.findUnique({ where: { id: expiryCaseId } }), 10_000)).expiryStatus, 'succeeded');
   assert.equal(activeKickCount, 1, 'lost/late BullMQ acknowledgement cannot produce a second Discord mutation');
   assert.equal(pendingKickCount, 1, 'the durable request is executed once after recovery');
   assert.equal(unbanCount, 1, 'the overdue expiry is reconciled once after Redis recovers');
-  await dispatch();
+  await within('production dispatcher reconciliation after recovery', dispatch(), 15_000);
   assert.equal(activeKickCount + pendingKickCount, 2, 'a later reconciliation does not repeat completed actions');
   assert.equal(unbanCount, 1, 'a later reconciliation does not repeat a completed expiry');
 
   // Separate cgroup OOM test: disable Redis maxmemory only after the maxmemory refusal assertions above.
   // PostgreSQL remains the durable outbox while Redis itself is killed under a bounded 64 MiB cgroup.
-  await prisma.guildConfig.createMany({ data: [oomPendingGuildId, oomExpiryGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })) });
+  await within('OOM test guild setup', prisma.guildConfig.createMany({ data: [oomPendingGuildId, oomExpiryGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })) }), 10_000);
   createGuild(activeGuildId, activeTargetId, { oomHoldKick: true });
   createGuild(oomPendingGuildId, oomPendingTargetId);
   createGuild(oomExpiryGuildId, oomExpiryTargetId, { banReason: `temporary ban [pressure-oom-marker-${suffix}]` });
   assert.equal(await rawRedis.command(['CONFIG', 'SET', 'appendfsync', 'always']), 'OK');
   await createRequest(activeGuildId, activeTargetId, oomOperationId, 'Controlled mutation in flight during Redis cgroup OOM');
   const oomExpiryMarker = `pressure-oom-marker-${suffix}`;
-  await dispatch();
+  await within('production dispatcher wake before OOM', dispatch(), 15_000);
   await until('controlled Discord adapter entered during OOM scenario', () => oomKickWasEntered, 15_000);
   await until('active BullMQ job exists before Redis outage', async () => {
     const activeJob = await queue.getJob(oomOperationId);
     return activeJob ? await activeJob.getState() === 'active' : false;
   });
-  assert.ok(oomQueueDeliveries >= 1, 'the controlled operation entered the production BullMQ worker before the Redis outage');
+  assert.equal(oomQueueDeliveries, 1, 'the controlled operation had exactly one initial production-worker delivery before OOM');
   const beforeOomPersistence = await rawRedis.command(['INFO', 'persistence']);
   assert.match(beforeOomPersistence, /^aof_last_write_status:ok$/m);
   assert.match(beforeOomPersistence, /^aof_pending_bio_fsync:0$/m);
@@ -374,17 +493,17 @@ try {
   const workerClientBeforeRestart = await worker.getBackend().client;
   await until('same BullMQ clients detect Redis outage', () => queueClientBeforeRestart.status !== 'ready' && workerClientBeforeRestart.status !== 'ready', 5_000);
   await createRequest(oomPendingGuildId, oomPendingTargetId, oomPendingOperationId, 'Durable while Redis is OOM-killed');
-  await prisma.moderationCase.create({ data: {
+  await within('OOM due expiry case setup', prisma.moderationCase.create({ data: {
     id: oomExpiryCaseId, operationId: oomExpiryOperationId, guildId: oomExpiryGuildId, actorId, targetId: oomExpiryTargetId,
     action: 'TEMPBAN', reason: 'Due expiry retained through Redis cgroup OOM', status: 'succeeded', durationMinutes: 1,
     expiresAt: new Date(Date.now() - 60_000), banMarker: oomExpiryMarker, banGeneration: 1, expiryStatus: 'scheduled',
-  } });
-  await prisma.guildTargetDecision.create({ data: {
+  } }), 10_000);
+  await within('OOM due expiry decision setup', prisma.guildTargetDecision.create({ data: {
     guildId: oomExpiryGuildId, targetId: oomExpiryTargetId, generation: 1, latestOperationId: oomExpiryOperationId,
     appliedGeneration: 1, appliedOperationId: oomExpiryOperationId,
-  } });
+  } }), 10_000);
   assert.equal((await row(oomPendingOperationId)).status, 'requested', 'PostgreSQL retains the pending accepted operation across Redis OOM');
-  assert.equal((await prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })).expiryStatus, 'scheduled', 'PostgreSQL retains the due expiry across Redis OOM');
+  assert.equal((await within('read OOM due expiry before Redis returns', prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } }), 10_000)).expiryStatus, 'scheduled', 'PostgreSQL retains the due expiry across Redis OOM');
   assert.equal(oomKickCount, 1, 'controlled action reached the fake Discord adapter once before OOM');
   rawRedis.close();
   rawRedis = undefined;
@@ -420,7 +539,7 @@ try {
   } finally {
     clearInterval(recoveryTimer);
   }
-  assert.ok(oomQueueDeliveries >= 1, 'BullMQ delivered the active job before the outage; successful completion or a stalled redelivery is allowed after recovery');
+  assert.ok([1, 2].includes(oomQueueDeliveries), `OOM recovery observed one initial delivery and at most one stalled redelivery (observed ${oomQueueDeliveries})`);
   assert.ok(dispatchAttempts.some(attempt => attempt.operationId === oomPendingOperationId), 'the same production dispatcher published the durable pending request');
   assert.ok(dispatchAttempts.some(attempt => attempt.operationId === `expiry-${oomExpiryCaseId}`), 'the same production dispatcher published the due PostgreSQL expiry');
   const outageEnqueueAttempts = dispatchAttempts.filter(attempt => attempt.at >= outageStartedAt).length;
@@ -429,8 +548,11 @@ try {
   assert.ok(dispatchErrors.filter(error => error.at >= outageStartedAt).length <= 4, 'dispatcher retry diagnostics remain bounded during the Redis outage');
   assert.equal((await row(oomOperationId)).status, 'succeeded');
   assert.equal((await row(oomPendingOperationId)).status, 'succeeded');
-  assert.equal((await prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } })).expiryStatus, 'succeeded');
+  assert.equal((await within('read OOM due expiry after recovery', prisma.moderationCase.findUnique({ where: { id: oomExpiryCaseId } }), 10_000)).expiryStatus, 'succeeded');
   assert.equal(oomKickCount, 1, 'redelivery after cgroup OOM cannot repeat a confirmed mutation');
+  const oomFailureEvents = workerFailures.filter(failure => failure.jobId === oomOperationId);
+  assert.equal(oomFailureEvents.length, 0, 'no OOM scenario job failure was emitted before removeOnFail could remove a job');
+  console.info(JSON.stringify({ event: 'bullmq_oom_recovery_path', deliveries: oomQueueDeliveries, path: oomQueueDeliveries === 1 ? 'active_job_completed_without_stall' : 'active_job_recovered_after_stall', failuresObservedBeforeRemoval: oomFailureEvents.length }));
   assert.equal(pendingKickCount, 2, 'durable pending operations execute exactly once after recovery');
   assert.equal(unbanCount, 2, 'due expiry is reconciled exactly once after recovery');
   const memoryInfo = await rawRedis.command(['INFO', 'memory']);
@@ -438,22 +560,25 @@ try {
   const maxMemoryBytes = Number(memoryInfo.match(/maxmemory:(\d+)/)?.[1]);
   console.info(JSON.stringify({
     event: 'redis_saturation_integration_passed', elapsedMs: Date.now() - testStartedAt, redisVersion, oomRejectedWrites, usedMemoryBytes, maxMemoryBytes,
-    acceptedRows: 2, actionsAfterRecovery: activeKickCount + pendingKickCount, expiriesAfterRecovery: unbanCount,
-    dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringBackoff, dispatcherErrorsDuringBackoff,
+    acceptedRows: 2, backpressureAndOomActions: activeKickCount + pendingKickCount, controlledRecoveryMutations: [...recoveryScenarios.values()].reduce((total, scenario) => total + scenario.mutations, 0) + oomKickCount, expiriesAfterRecovery: unbanCount,
+    dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringCooldown, dispatcherErrorsDuringBackoff,
     workerRedisErrors: workerErrors.length, queueRedisErrors: queueErrors.length, oomQueueDeliveries,
+    workerFailureEventsBeforeRemoval: workerFailures.length,
+    recoveryScenarios: [...recoveryScenarios.values()].map(({ operationId, deliveries, stalled, mutations, failures, completions }) => ({ operationId, deliveries, stalled, mutations, failures: failures.length, completions })),
     cgroupOom: { containerLimitBytes: 64 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, oomWriterStopped: oomWriterStatus === 1, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
   }));
 } finally {
   kickRelease?.();
   oomKickRelease?.();
+  for (const scenario of recoveryScenarios.values()) scenario.release();
   if (rawRedis && fillerKeys.length) await clearFillerKeys();
-  if (worker) await Promise.race([worker.close(true).catch(() => undefined), delay(3_000)]);
-  if (queue) await Promise.race([queue.close().catch(() => undefined), delay(3_000)]);
+  if (worker) await within('worker shutdown cleanup', worker.close(true), 5_000).catch(() => undefined);
+  if (queue) await within('queue shutdown cleanup', queue.close(), 5_000).catch(() => undefined);
   rawRedis?.close();
   docker(['rm', '-f', container], true);
   if (oomVolume) docker(['volume', 'rm', '-f', oomVolume], true);
-  await prisma.moderationCase.deleteMany({ where: { OR: [{ operationId: { in: [activeOperationId, pendingOperationId, expiryOperationId, oomOperationId, oomPendingOperationId, oomExpiryOperationId] } }, { id: { in: [expiryCaseId, oomExpiryCaseId] } }] } }).catch(() => undefined);
-  await prisma.guildTargetDecision.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId] } } }).catch(() => undefined);
-  await prisma.guildConfig.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId] } } }).catch(() => undefined);
-  await prisma.$disconnect();
+  await within('test operation cleanup', prisma.moderationCase.deleteMany({ where: { OR: [{ operationId: { in: [activeOperationId, pendingOperationId, expiryOperationId, oomOperationId, oomPendingOperationId, oomExpiryOperationId, preExpiryOperationId, postExpiryOperationId] } }, { id: { in: [expiryCaseId, oomExpiryCaseId] } }] } }), 8_000).catch(() => undefined);
+  await within('test decision cleanup', prisma.guildTargetDecision.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId, preExpiryGuildId, postExpiryGuildId] } } }), 8_000).catch(() => undefined);
+  await within('test guild cleanup', prisma.guildConfig.deleteMany({ where: { guildId: { in: [activeGuildId, pendingGuildId, expiryGuildId, oomPendingGuildId, oomExpiryGuildId, preExpiryGuildId, postExpiryGuildId] } } }), 8_000).catch(() => undefined);
+  await within('Prisma disconnect cleanup', prisma.$disconnect(), 5_000).catch(() => undefined);
 }

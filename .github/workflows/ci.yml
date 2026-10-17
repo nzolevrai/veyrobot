@@ -3,6 +3,7 @@ on: [push, pull_request]
 jobs:
   backup-script:
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Test backup publication failure handling with mocked Docker
@@ -10,6 +11,7 @@ jobs:
         run: .\deploy\test-backup-postgres.ps1
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
