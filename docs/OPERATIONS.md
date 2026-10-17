@@ -14,6 +14,8 @@ L'API fait confiance à aucun proxy par défaut. `API_TRUSTED_PROXIES` accepte u
 
 Les erreurs API côté client sont génériques et corrélées par `requestId`. Les logs serveur contiennent le type, un code borné et un message limité avec filtrage des cookies, jetons et URL DB; ne pas y ajouter les corps de requête, headers d'authentification ni motifs Discord. Une alerte externe doit surveiller le taux d'erreurs et les `uncertain`; ces logs seuls ne sont pas une astreinte.
 
+La canonicalisation IPv4/IPv6, la politique IPv4 mappée et les limites de la chaîne HMAC sont précisées dans [IP-TRUST-CHAIN.md](IP-TRUST-CHAIN.md). Le Compose lie Next à localhost mais ne déploie pas d'ingress : la réécriture effective et les pairs load balancer restent à valider sur l'hébergement.
+
 ## Incident
 
 Si Redis est indisponible, l'API peut garder les nouvelles demandes en PostgreSQL jusqu'au plafond. Le dispatcher bot ne publie qu'après rétablissement ; vérifier les demandes persistées puis leur âge. Si PostgreSQL est indisponible, `/ready` répond 503 et les nouvelles décisions ne doivent pas être annoncées acceptées. Si le worker tombe pendant un appel Discord, attendre la réconciliation du bail (120 s + jusqu'à 60 s) et examiner les dossiers `uncertain` avant toute intervention. Un `operationId` déjà accepté ne doit pas être remplacé pour forcer une répétition ; vérifier d'abord l'état Discord et l'audit humain. Les échéances `TEMPBAN` restent dans PostgreSQL après redémarrage.

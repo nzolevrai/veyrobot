@@ -130,6 +130,10 @@ importers:
         version: 5.9.3
 
   packages/contracts:
+    dependencies:
+      ipaddr.js:
+        specifier: 2.5.0
+        version: 2.5.0
     devDependencies:
       tsx:
         specifier: ^4.20.6

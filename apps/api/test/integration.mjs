@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createHmac } from 'node:crypto';
+import { canonicalizeClientIp, clientIpSigningPayload } from '@veyrobot/contracts/client-ip';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -39,6 +41,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
   let dashboard;
+  let ingress;
   let apiLogs = '';
   let caseId;
   let actionCaseId;
@@ -50,7 +53,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     for (let i = 0; i < 150; i++) { try { if ((await fetch(`${base}/health`)).ok) return; } catch { /* wait for listen */ } await delay(100); }
     throw new Error('API test process did not start');
   };
-  const stop = async () => { if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(200); } if (child && child.exitCode === null) { child.kill('SIGTERM'); await delay(200); } };
+  const stop = async () => { if (ingress?.listening) await new Promise(resolve => ingress.close(() => resolve())); if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(200); } if (child && child.exitCode === null) { child.kill('SIGTERM'); await delay(200); } };
   const call = (path, cookie, options = {}) => fetch(`${base}${path}`, { ...options, headers: { ...(cookie ? { cookie } : {}), ...(options.headers ?? {}) } });
   try {
     await prisma.recoveryGate.upsert({ where: { id: 'singleton' }, create: { id: 'singleton', epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') }, update: { epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') } });
@@ -63,11 +66,29 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await oauthStart(forgedIp)).status, 302);
     assert.equal((await oauthStart(forgedIp)).status, 302);
     assert.equal((await oauthStart(forgedIp)).status, 429, 'unsigned client identity cannot escape the socket-IP bucket');
-    const signed = ip => ({ 'x-veyrobot-client-ip': ip, 'x-veyrobot-client-ip-signature': createHmac('sha256', proxyIpSecret).update(ip).digest('hex') });
+    const duplicateIdentityHeaders = new Headers();
+    duplicateIdentityHeaders.append('x-veyrobot-client-ip', '203.0.113.10');
+    duplicateIdentityHeaders.append('x-veyrobot-client-ip', '203.0.113.11');
+    duplicateIdentityHeaders.set('x-veyrobot-client-ip-signature', createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload('203.0.113.10')).digest('hex'));
+    assert.equal((await fetch(`${base}/oauth/discord/start`, { headers: duplicateIdentityHeaders, redirect: 'manual' })).status, 429, 'duplicated identity headers are rejected and use the same direct-socket fallback bucket');
+    const signed = ip => {
+      const canonicalIp = canonicalizeClientIp(ip);
+      assert.ok(canonicalIp, 'test address must be valid');
+      return { 'x-veyrobot-client-ip': ip, 'x-veyrobot-client-ip-signature': createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload(canonicalIp)).digest('hex') };
+    };
     assert.equal((await oauthStart(signed('203.0.113.10'))).status, 302);
     assert.equal((await oauthStart(signed('203.0.113.10'))).status, 302);
     assert.equal((await oauthStart(signed('203.0.113.10'))).status, 429);
     assert.equal((await oauthStart(signed('203.0.113.11'))).status, 302, 'distinct signed anonymous clients retain separate buckets');
+    const v6Expanded = '2001:0DB8:0000:0000:0000:0000:0000:0001';
+    assert.equal((await oauthStart(signed(v6Expanded))).status, 302);
+    assert.equal((await oauthStart(signed(v6Expanded))).status, 302);
+    assert.equal((await oauthStart(signed('2001:db8::1'))).status, 429, 'equivalent IPv6 spellings share one pre-auth quota');
+    assert.equal((await oauthStart(signed('2001:db8::2'))).status, 302, 'a different IPv6 address has a separate quota');
+    assert.equal((await oauthStart(signed('192.0.2.77'))).status, 302);
+    assert.equal((await oauthStart(signed('::ffff:c000:024d'))).status, 302);
+    assert.equal((await oauthStart(signed('::ffff:192.0.2.77'))).status, 429, 'IPv4-mapped IPv6 shares the IPv4 bucket');
+    assert.equal((await oauthStart(signed('192.0.2.78'))).status, 302);
     await stop();
     childEnv.API_RATE_LIMIT_MAX = '90';
     delete childEnv.API_PREAUTH_RATE_LIMIT_MAX;
@@ -100,7 +121,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     if (process.env.RUN_DASHBOARD_ROUTE_INTEGRATION === '1') {
       const dashboardPort = await freePort();
       const dashboardEntry = fileURLToPath(new URL('../../dashboard/node_modules/next/dist/bin/next', import.meta.url));
-      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
       const direct = `http://localhost:${dashboardPort}/dashboard/${guildA}/overview`;
       let available = false;
       for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { available = true; break; } } catch { /* wait for Next */ } await delay(100); }
@@ -111,6 +132,43 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       });
       assert.equal((await proxiedBody(1_048_577)).status, 413, 'Next must reject a chunked oversized body before the API');
       assert.equal((await proxiedBody(2)).status, 401, 'Next must forward a bounded chunked body to the API');
+      childEnv.API_RATE_LIMIT_MAX = '2';
+      await stop();
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let dashboardRestarted = false;
+      for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { dashboardRestarted = true; break; } } catch { /* wait for Next */ } await delay(100); }
+      assert.equal(dashboardRestarted, true, 'Next must restart with the trusted-header test configuration');
+      await start();
+      ingress = createHttpServer(async (incoming, outgoing) => {
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(incoming.headers)) if (typeof value === 'string') headers.set(name, value);
+        // This disposable ingress models the reference boundary: overwrite, never append, source identity.
+        headers.set('x-real-ip', incoming.socket.remoteAddress ?? '');
+        try {
+          const upstream = await fetch(`http://localhost:${dashboardPort}${incoming.url ?? '/'}`, { method: incoming.method, headers, redirect: 'manual' });
+          const body = Buffer.from(await upstream.arrayBuffer());
+          outgoing.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
+          outgoing.end(body);
+        } catch {
+          outgoing.writeHead(502); outgoing.end();
+        }
+      });
+      await new Promise(resolve => ingress.listen(0, '127.0.0.1', resolve));
+      const ingressAddress = ingress.address();
+      assert.ok(ingressAddress && typeof ingressAddress !== 'string');
+      const ingressUrl = `http://127.0.0.1:${ingressAddress.port}`;
+      const throughIngress = extra => fetch(`${ingressUrl}/api/public-config`, { headers: extra });
+      assert.equal((await throughIngress({ 'x-real-ip': '198.51.100.1', 'x-forwarded-for': '198.51.100.1' })).status, 200);
+      assert.equal((await throughIngress({ 'x-real-ip': '198.51.100.2', 'x-forwarded-for': '198.51.100.2' })).status, 200);
+      assert.equal((await throughIngress({ 'x-real-ip': '203.0.113.200', 'x-veyrobot-client-ip': '203.0.113.200', 'x-veyrobot-client-ip-signature': createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload('203.0.113.200')).digest('hex') })).status, 429, 'forged source and internal identity headers are overwritten/stripped and cannot escape the observed-source quota');
+      await new Promise(resolve => ingress.close(() => resolve()));
+      ingress = undefined;
+      childEnv.API_RATE_LIMIT_MAX = '90';
+      await stop(); await start();
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let dashboardReadyAgain = false;
+      for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { dashboardReadyAgain = true; break; } } catch { /* wait for Next */ } await delay(100); }
+      assert.equal(dashboardReadyAgain, true, 'Dashboard must return after the quota-chain test restart');
       let delayedUpload;
       const slowBody = new ReadableStream({
         start(controller) { controller.enqueue(Buffer.from('{')); delayedUpload = setTimeout(() => { controller.enqueue(Buffer.from('}')); controller.close(); }, 500); },
@@ -390,7 +448,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await start();
     const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
     assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
-    console.log('API integration passed: OAuth, distinct valid-session quotas including installation-check, revoked/expired/incomplete fallback, forged headers, bounded pre-auth grant checks, grant-store failure handling, adapter call counts, and public-route limits.');
+    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, local ingress overwrite across Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
   } finally {
     await stop();
     if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');

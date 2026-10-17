@@ -12,6 +12,7 @@ import { guildRoutes } from './guild-routes.js';
 import { moderationRoutes, admissionTotals } from './moderation-routes.js';
 import { GuildListCache } from './guild-list-cache.js';
 import { verifiedClientIp } from './client-ip.js';
+import { canonicalizeClientIp } from '@veyrobot/contracts/client-ip';
 import { apiExceptionLogRecord, classifyApiError } from './error-details.js';
 
 const envSchema = z.object({
@@ -56,7 +57,8 @@ const validatedSessionIds = new WeakMap<FastifyRequest, string>();
 const sessionValidationFailures = new WeakMap<FastifyRequest, { status: 401 | 503; code: string; message: string }>();
 const clientIpKey = (req: FastifyRequest) => {
   const signedIp = env.API_PROXY_CLIENT_IP_SECRET ? verifiedClientIp(req.headers, env.API_PROXY_CLIENT_IP_SECRET) : null;
-  return `ip:${signedIp ?? req.ip}`;
+  // trustProxy is disabled by default, so this fallback is the direct socket peer.
+  return `ip:${canonicalizeClientIp(signedIp ?? req.ip) ?? 'invalid-socket-address'}`;
 };
 const requestRateLimitKey = (req: FastifyRequest) => {
   const sessionId = validatedSessionIds.get(req);

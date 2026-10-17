@@ -30,6 +30,8 @@ Redis reste sur AOF avec `appendfsync everysec`, RDB périodique désactivé et 
 
 ## Chaîne de confiance de l'adresse client
 
+Voir aussi la [spécification vérifiée de canonicalisation et des frontières de confiance](IP-TRUST-CHAIN.md), qui définit IPv4-mapped, les formes refusées et les scénarios couverts en CI.
+
 Le frontal TLS doit écouter sur 443, appliquer sa limite publique et **remplacer**, jamais concaténer, `X-Real-IP` par l'adresse source qu'il a lui-même observée. Il transmet `Host` et `X-Forwarded-Proto: https` et n'expose pas directement le port 3000 sur Internet. Par exemple, pour Nginx sur le même hôte :
 
 ```nginx
