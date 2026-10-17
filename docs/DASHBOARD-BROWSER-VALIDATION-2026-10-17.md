@@ -36,8 +36,13 @@ En CI, le même parcours est lancé par `pnpm test` avec les services PostgreSQL
 - Le dialogue du sélecteur de couleur était sans nom accessible et le nom de son déclencheur n’incluait pas la valeur hexadécimale visible. Le dialogue est maintenant nommé et le déclencheur annonce la couleur courante.
 - axe-core a relevé des contrastes insuffisants sur le bouton principal, les catégories et l’onglet actif, l’aperçu, les en-têtes et métadonnées du tableau ainsi que le compteur du formulaire. Les couleurs concernées utilisent maintenant des tons plus lisibles dans la palette existante. La couleur de fond de marque reste inchangée.
 - Le parcours E2E utilise des états d’attente déterministes et nettoie chaque dossier créé même si un test échoue.
+- La vérification du défilement `End` mobile lisait `window.scrollY` juste après l’envoi de la touche, sans attendre que le navigateur applique son déplacement. Le diagnostic Chromium a trouvé le focus sur `BODY` et le document comme conteneur réellement défilant (`HTML`: `scrollHeight=844`, `clientHeight=600`, `scrollTop=0`; `BODY`: `scrollHeight=844`, `clientHeight=844`). Dans le run local, `window.scrollY` est passé de `0` à `244` immédiatement après `End`; aucun défilement interne de panneau n’était impliqué. Le test attend maintenant, au maximum 1 seconde, la condition observable `window.scrollY > valeurAvant`, puis conserve une assertion avec focus, dimensions et positions dans son message d’échec. Le diagnostic local n’a pas observé de mouvement différé; les échecs CI étaient compatibles avec une lecture trop précoce, mais leurs traces ne permettent pas d’affirmer le délai exact sur ces runners. Une mutation temporaire qui empêchait le défaut clavier avec `preventDefault()` a bien fait échouer cette même assertion (`0→0`), confirmant qu’elle ne peut pas réussir sans défilement réel.
 
 Les tests et corrections sont dans `apps/dashboard/tools/browser-journey.mjs`, `apps/api/test/integration.mjs`, `apps/dashboard/app/navigation.tsx`, `apps/dashboard/app/configuration.tsx` et `apps/dashboard/app/style.css`.
+
+## Reproduction de la régression CI — 17 octobre 2026
+
+Les runs push `39050260256` et PR `39050263425` ont échoué au même contrôle après `End`. Le parcours complet a été rejoué avec Node `24.21.0`, pnpm `10.18.3`, Chromium/Playwright `1.62.1` et PostgreSQL `17` isolé. La nouvelle attente ne déclenche pas le défilement : elle attend uniquement la modification réelle de `window.scrollY` après la touche et est bornée à 1 seconde. Le parcours complet passe après la correction; l’expérience de mutation ci-dessus confirme que bloquer l’action clavier entraîne un échec explicite. Aucun changement de comportement du dashboard n’a été nécessaire.
 
 ## Captures de contrôle
 

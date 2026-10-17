@@ -262,10 +262,33 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await page.goto(`${baseUrl}/dashboard/${guildId}/settings`);
     await page.getByRole('heading', { name: 'Paramètres' }).waitFor();
     await page.setViewportSize({ width: 390, height: 600 });
-    const pageMetrics = await page.evaluate(() => ({ viewport: document.documentElement.clientHeight, document: document.documentElement.scrollHeight }));
+    const pageMetrics = await page.evaluate(() => ({
+      viewport: document.documentElement.clientHeight,
+      document: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      scrollTop: document.documentElement.scrollTop,
+      bodyClientHeight: document.body.clientHeight,
+      bodyScrollHeight: document.body.scrollHeight,
+      bodyScrollTop: document.body.scrollTop,
+      activeElement: document.activeElement?.tagName,
+      activeRole: document.activeElement?.getAttribute('role'),
+      activeLabel: document.activeElement?.getAttribute('aria-label'),
+      documentScrollBehavior: getComputedStyle(document.documentElement).scrollBehavior,
+      bodyScrollBehavior: getComputedStyle(document.body).scrollBehavior
+    }));
     assert.ok(pageMetrics.document > pageMetrics.viewport, 'mobile settings content must remain vertically scrollable');
+    assert.equal(pageMetrics.activeElement, 'BODY', 'the page itself is focused before testing document keyboard scrolling');
+    const beforeEndScrollY = pageMetrics.scrollY;
     await page.keyboard.press('End');
-    assert.ok(await page.evaluate(() => window.scrollY > 0), 'keyboard End scrolls long settings content');
+    const immediateEndScroll = await page.evaluate(() => ({ scrollY: window.scrollY, scrollTop: document.documentElement.scrollTop }));
+    let endScrollObserved = immediateEndScroll.scrollY > beforeEndScrollY;
+    if (!endScrollObserved) {
+      endScrollObserved = await page.waitForFunction(previousY => window.scrollY > previousY, beforeEndScrollY, { timeout: 1_000 }).then(() => true, error => {
+        if (error.name === 'TimeoutError') return false;
+        throw error;
+      });
+    }
+    assert.ok(endScrollObserved, `keyboard End scrolls long settings content (focus=${pageMetrics.activeElement} ${pageMetrics.activeRole ?? ''} ${pageMetrics.activeLabel ?? ''}; document ${pageMetrics.document}px / viewport ${pageMetrics.viewport}px; body ${pageMetrics.bodyScrollHeight}px / ${pageMetrics.bodyClientHeight}px; root scrollTop ${pageMetrics.scrollTop}→${immediateEndScroll.scrollTop}; window.scrollY ${beforeEndScrollY}→${immediateEndScroll.scrollY})`);
     await page.keyboard.press('Home');
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('button', { name: /Choisir la couleur des embeds/ }).click();
