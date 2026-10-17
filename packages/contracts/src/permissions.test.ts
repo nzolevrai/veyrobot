@@ -41,6 +41,29 @@ test('canonicalizes equivalent IP literals without grouping unrelated networks',
   assert.equal(canonicalizeClientIp('2001:db8::2'), '2001:db8::2');
 });
 
+test('preserves IPv6 identity for strictly validated dotted tails', () => {
+  const equivalentPairs = [
+    ['::1.2.3.4', '::102:304'],
+    ['0:0:0:0:0:0:1.2.3.4', '::102:304'],
+    ['::0.0.0.1', '::1'],
+    ['0:0:0:0:0:0:0.0.0.1', '::1'],
+    ['::ffff:192.0.2.1', '::ffff:c000:201'],
+    ['0:0:0:0:0:ffff:192.0.2.1', '192.0.2.1'],
+  ] as const;
+  for (const [dotted, hexadecimal] of equivalentPairs) {
+    const canonical = canonicalizeClientIp(dotted);
+    assert.ok(canonical, `${dotted} should be a valid IP literal`);
+    assert.equal(canonical, canonicalizeClientIp(hexadecimal), `${dotted} and ${hexadecimal} should share identity`);
+    assert.equal(canonicalizeClientIp(canonical), canonical, `${dotted} canonicalization should be idempotent`);
+  }
+  assert.equal(canonicalizeClientIp('::1.2.3.4'), '::102:304');
+  assert.notEqual(canonicalizeClientIp('::1.2.3.4'), canonicalizeClientIp('1.2.3.4'));
+  assert.equal(canonicalizeClientIp('::0.0.0.1'), '::1');
+  assert.notEqual(canonicalizeClientIp('::0.0.0.1'), canonicalizeClientIp('0.0.0.1'));
+  assert.equal(canonicalizeClientIp('64:ff9b::192.0.2.1'), '64:ff9b::c000:201', 'NAT64 remains IPv6');
+  assert.notEqual(canonicalizeClientIp('64:ff9b::192.0.2.1'), canonicalizeClientIp('192.0.2.1'));
+});
+
 test('rejects ambiguous, decorated, unsupported, and overlong client address values', () => {
   for (const invalid of [
     '', ' 192.0.2.1', '192.0.2.1 ', '192.0.2.1, 198.51.100.1', '192.0.2.1:443',

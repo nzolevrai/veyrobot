@@ -16,16 +16,26 @@ export function canonicalizeClientIp(value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_CLIENT_IP_LENGTH) return null;
   if (value !== value.trim() || /[,\s\[\]%/\\]/.test(value)) return null;
 
+  let address = value;
   if (value.includes('.')) {
     const lastColon = value.lastIndexOf(':');
     const ipv4Tail = lastColon < 0 ? value : value.slice(lastColon + 1);
     if (!validStrictIpv4(ipv4Tail)) return null;
+    // ipaddr.js can classify IPv6 addresses with a dotted tail as IPv4-mapped
+    // even when the IPv6 prefix is not the mapped prefix (for example ::1.2.3.4).
+    // Convert only the already-validated decimal tail before asking it to parse.
+    if (lastColon >= 0) {
+      const octets = ipv4Tail.split('.').map(Number);
+      const high = ((octets[0]! << 8) | octets[1]!).toString(16);
+      const low = ((octets[2]! << 8) | octets[3]!).toString(16);
+      address = `${value.slice(0, lastColon + 1)}${high}:${low}`;
+    }
   }
 
-  if (value.includes(':')) {
-    if (!IPV6_TEXT.test(value) || !ipaddr.IPv6.isValid(value)) return null;
+  if (address.includes(':')) {
+    if (!IPV6_TEXT.test(address) || !ipaddr.IPv6.isValid(address)) return null;
     try {
-      const parsed = ipaddr.IPv6.parse(value);
+      const parsed = ipaddr.IPv6.parse(address);
       if (parsed.zoneId) return null;
       return parsed.isIPv4MappedAddress() ? parsed.toIPv4Address().toString() : parsed.toRFC5952String().toLowerCase();
     } catch {

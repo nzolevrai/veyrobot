@@ -7,7 +7,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createHmac } from 'node:crypto';
 import { canonicalizeClientIp, clientIpSigningPayload } from '@veyrobot/contracts/client-ip';
 import { createServer } from 'node:net';
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -139,7 +139,9 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { dashboardRestarted = true; break; } } catch { /* wait for Next */ } await delay(100); }
       assert.equal(dashboardRestarted, true, 'Next must restart with the trusted-header test configuration');
       await start();
+      const ingressPeers = [];
       ingress = createHttpServer(async (incoming, outgoing) => {
+        ingressPeers.push(incoming.socket.remoteAddress);
         const headers = new Headers();
         for (const [name, value] of Object.entries(incoming.headers)) if (typeof value === 'string') headers.set(name, value);
         // This disposable ingress models the reference boundary: overwrite, never append, source identity.
@@ -156,11 +158,24 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       await new Promise(resolve => ingress.listen(0, '127.0.0.1', resolve));
       const ingressAddress = ingress.address();
       assert.ok(ingressAddress && typeof ingressAddress !== 'string');
-      const ingressUrl = `http://127.0.0.1:${ingressAddress.port}`;
-      const throughIngress = extra => fetch(`${ingressUrl}/api/public-config`, { headers: extra });
-      assert.equal((await throughIngress({ 'x-real-ip': '198.51.100.1', 'x-forwarded-for': '198.51.100.1' })).status, 200);
-      assert.equal((await throughIngress({ 'x-real-ip': '198.51.100.2', 'x-forwarded-for': '198.51.100.2' })).status, 200);
-      assert.equal((await throughIngress({ 'x-real-ip': '203.0.113.200', 'x-veyrobot-client-ip': '203.0.113.200', 'x-veyrobot-client-ip-signature': createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload('203.0.113.200')).digest('hex') })).status, 429, 'forged source and internal identity headers are overwritten/stripped and cannot escape the observed-source quota');
+      const throughIngressFrom = (sourceAddress, headers) => new Promise((resolve, reject) => {
+        const request = httpRequest({ hostname: '127.0.0.1', port: ingressAddress.port, path: '/api/public-config', method: 'GET', headers, localAddress: sourceAddress, agent: false }, response => {
+          response.resume();
+          response.once('end', () => resolve(response.statusCode));
+        });
+        request.once('error', reject);
+        request.end();
+      });
+      const forged = label => ({ 'x-real-ip': `198.51.100.${label}`, 'x-forwarded-for': `198.51.100.${label}`, 'x-veyrobot-client-ip': `203.0.113.${label}`, 'x-veyrobot-client-ip-signature': 'f'.repeat(64) });
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('11')), 200, 'first anonymous client begins with its own signed IP bucket');
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('12')), 200);
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('13')), 429, 'first anonymous client is rate limited after two calls');
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('21')), 200, 'second socket source retains a separate signed quota after the first is exhausted');
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('22')), 200);
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('23')), 429, 'second client has its own complete quota');
+      assert.ok(ingressPeers.includes('127.0.0.1'), 'ingress observes the first TCP peer address');
+      assert.ok(ingressPeers.includes('127.0.0.2'), 'ingress observes the second TCP peer address');
+      assert.ok(ingressPeers.every(address => address === '127.0.0.1' || address === '127.0.0.2'), 'the ingress-derived identities match the bound client socket addresses');
       await new Promise(resolve => ingress.close(() => resolve()));
       ingress = undefined;
       childEnv.API_RATE_LIMIT_MAX = '90';
@@ -448,7 +463,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await start();
     const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
     assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
-    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, local ingress overwrite across Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
+    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
   } finally {
     await stop();
     if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');

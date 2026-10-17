@@ -41,6 +41,28 @@ test('forwards a bounded body without Content-Length and filters hop headers in 
   assert.equal(response.headers.getSetCookie().length, 2);
 });
 
+test('proxyRequest removes every forwarded and hop header while preserving application headers', async () => {
+  const incoming = new Headers({
+    'x-forwarded-a': 'a', 'x-forwarded-b': 'b', 'x-forwarded-c': 'c', 'x-forwarded-d': 'd', 'x-forwarded-e': 'e',
+    'x-forwarded-client-cert': 'client-cert', 'x-forwarded-for': '192.0.2.1', 'x-forwarded-host': 'forged.example',
+    'x-forwarded-proto': 'http', 'x-forwarded-port': '80', 'forwarded': 'for=192.0.2.1', 'x-real-ip': '192.0.2.1',
+    'x-veyrobot-client-ip': '192.0.2.1', 'x-veyrobot-client-ip-signature': 'forged',
+    'connection': 'x-nominated-hop', 'x-nominated-hop': 'drop-me',
+    'content-type': 'application/json', 'x-application-trace': 'keep-me',
+  });
+  let observed: Headers | undefined;
+  await proxyRequest(new Request('http://localhost/api/test', { headers: incoming }), ['test'], '', async (_url, init) => {
+    observed = init?.headers as Headers;
+    return new Response('ok');
+  });
+  assert.ok(observed, 'proxyRequest should call the upstream');
+  for (const name of ['x-forwarded-a', 'x-forwarded-b', 'x-forwarded-c', 'x-forwarded-d', 'x-forwarded-e', 'x-forwarded-client-cert', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'forwarded', 'x-real-ip', 'x-veyrobot-client-ip', 'x-veyrobot-client-ip-signature', 'connection', 'x-nominated-hop']) {
+    assert.equal(observed.get(name), null, `${name} must not reach the API`);
+  }
+  assert.equal(observed.get('content-type'), 'application/json');
+  assert.equal(observed.get('x-application-trace'), 'keep-me');
+});
+
 test('forwards client identity only from the configured ingress header and signs it', async () => {
   const priorHeader = process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
   const priorSecret = process.env.API_PROXY_CLIENT_IP_SECRET;
