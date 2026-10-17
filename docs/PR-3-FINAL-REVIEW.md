@@ -1,6 +1,6 @@
 # Synthèse finale de revue — PR #3
 
-État de référence du code audité : `e2da88eea5c27661f68074a02c591ab8a19e1c11` (`hardening/foundation-quality`). Cette synthèse ne constitue pas une validation de production. La tête exacte et les checks du commit de livraison documentaire sont à vérifier dans [les checks de la PR #3](https://github.com/nzolevrai/veyrobot/pull/3/checks). PR ouverte, non fusionnée.
+Référence de code de cette synthèse : PR #3, branche `hardening/foundation-quality`, commit F14 `638c8f5bb181ea0538e900f2f747eaf669fa863f`. La PR est ouverte et non fusionnée. Les checks requis sont verts sur ce SHA ([CI run #113](https://github.com/nzolevrai/veyrobot/actions/runs/39036780166)); consulter aussi l'onglet [Checks de la PR](https://github.com/nzolevrai/veyrobot/pull/3/checks) pour le commit documentaire le plus récent. Cette synthèse ne constitue pas une validation de production. Le développement et les vérifications décrits ici restent locaux; AWS est envisagé plus tard et aucune ressource AWS n'a été créée.
 
 ## Constats des revues indépendantes F1–F14
 
@@ -19,7 +19,7 @@
 | F11 — Redis/BullMQ et migrations en CI | Corrigé | `.github/workflows/ci.yml`, suites d'intégration Redis/BullMQ et contrôle schéma/migrations | La CI utilise Redis/PostgreSQL jetables; elle ne prouve pas les caractéristiques d'un hébergement de production. |
 | F12 — Compose, ports et identité d'exécution | Corrigé pour la référence déclarative; déploiement non éprouvé | `deploy/compose.production.yaml`, tests/CI de configuration et `docs/PRODUCTION-REFERENCE.md` | Aucun service public provisionné; secret manager, TLS, stockage distant, alertes et exploitation réelle restent à configurer. |
 | F13 — CSP Next | Corrigé pour `script-src`; validation navigateur partielle | `apps/dashboard/proxy.ts`, layout dynamique et contrôle Chrome headless documenté dans `docs/ROADMAP.md` | `style-src 'unsafe-inline'` reste; revue visuelle desktop/mobile à effectuer. |
-| F14 — mémoire et cycle de vie Gateway | Mesuré passivement; fermeture du Client attendue avant libération du verrou | `docs/F14-GATEWAY-MEMORY-2026-10-17.md`, instantanés agrégés dans `apps/bot/src/index.ts`, test d’ordre `apps/bot/test/shutdown-order.test.mjs` | 11 mesures au repos sur une guilde ne démontrent pas la croissance des caches par taille/activité ni une capacité. Pas de charge Gateway/REST ou mémoire cgroup sur hébergement. |
+| F14 — mémoire et cycle de vie Gateway | Mesuré passivement; fermeture du Client attendue avant libération du verrou | Commit `638c8f5`; `docs/F14-GATEWAY-MEMORY-2026-10-17.md`, instantanés agrégés dans `apps/bot/src/index.ts`, tests `apps/bot/test/resource-snapshot.test.mjs` et `apps/bot/test/shutdown-order.test.mjs` | 11 mesures au repos sur une guilde ne démontrent pas la croissance des caches par taille/activité ni une capacité. Pas de charge Gateway/REST représentative ou mémoire cgroup sur l'hébergement. |
 
 ## Réserves ciblées ajoutées par les revues
 
@@ -35,15 +35,15 @@
 
 ### Bloqueurs de fusion
 
-Aucun défaut bloquant n'a été identifié dans les constats F1–F14 et les tranches ciblées, sur la tête examinée. La recommandation est de fusionner la PR après confirmation que les checks requis sont verts sur la tête exacte de livraison. Cette recommandation n'est pas une approbation automatique ni une validation de mise en production.
+Aucun défaut bloquant n'a été identifié dans les constats F1–F14 et les tranches ciblées. Sur le commit F14 `638c8f5bb181ea0538e900f2f747eaf669fa863f`, `validate` et `backup-script` du run #113 sont réussis. Les checks du commit documentaire actuel doivent aussi rester verts avant toute fusion. Aucun blocage de code connu n'est identifié; la PR reste ouverte, sans fusion automatique. Cette conclusion n'est pas une validation de mise en production.
 
 ### Conditions avant production
 
-- Configurer et vérifier l'ingress/WAF, TLS, écrasement des en-têtes client et accès privé de l'API; définir les budgets par rapport à l'hôte cible.
-- Faire une revue visuelle du Dashboard sur tailles desktop/mobile et tester les parcours/actions autorisés dans un serveur privé; les tests automatisés n'appellent pas Discord.
-- Déployer une supervision/redémarrage/alerting réel, répéter sauvegarde/restauration sur le stockage cible et vérifier la rotation externe de l'epoch avant réouverture.
-- Mesurer les caches Gateway par population et vérifier la croissance de `ModerationCase`; aucune purge de dossiers n'est activée.
-- Accepter le compromis CSP actuel : `script-src` sans `unsafe-inline`, mais `style-src` conserve `unsafe-inline`.
+- **Validé localement / par CI sur le code F14** : typecheck, lint, build et suite workspace sous Node 24.19.0; CI #113 (`validate` et `backup-script`) sur le commit F14 `638c8f5bb181ea0538e900f2f747eaf669fa863f`; connexion Gateway réelle passive au seul serveur privé autorisé pendant environ dix minutes; mesures RSS/heap/cache et test à barrière de l'ordre d'arrêt. Les tests automatisés Discord utilisent des adaptateurs contrôlés. Les parcours manuels confirmés par le propriétaire sont listés dans `FEATURE-MATRIX.md`.
+- **Vérification de livraison** : l'état des checks du commit documentaire le plus récent est celui affiché dans [Checks de la PR #3](https://github.com/nzolevrai/veyrobot/pull/3/checks); le run #113 cité ci-dessus n'est pas présenté comme un check de ce commit ultérieur.
+- **Réservé au futur hébergement AWS** : réseau/VPC et groupes de sécurité, ingress/WAF/TLS et écrasement des en-têtes, accès privé à l'API et aux bases, gestion/rotation des secrets, plafonds mémoire et marge de l'hôte, supervision/redémarrage/alertes, sauvegardes externes chiffrées et restauration/quarantaine avec epoch externe. Aucun de ces éléments AWS n'a été provisionné ou testé; aucun service AWS n'a été créé.
+- Faire une revue visuelle du Dashboard desktop/mobile; mesurer les caches Gateway sur une population et tailles de guildes représentatives et suivre la croissance de `ModerationCase` (purge toujours désactivée).
+- Conserver le compromis CSP documenté : `script-src` sans `unsafe-inline`, `style-src` le permet encore.
 
 ### Évolutions conditionnées aux mesures
 
@@ -59,3 +59,4 @@ Aucun défaut bloquant n'a été identifié dans les constats F1–F14 et les tr
 - [Budgets mémoire/Redis](MEMORY-REDIS-BUDGETS-2026-10-16.md)
 - [Chaîne IP de confiance](IP-TRUST-CHAIN.md)
 - [Mesures de performance](PERFORMANCE-BASELINE.md)
+- [Mesure F14 Gateway](F14-GATEWAY-MEMORY-2026-10-17.md)

@@ -1,6 +1,6 @@
 # Matrice des fonctions Discord
 
-État du code au 15 octobre 2026, avec validations manuelles du propriétaire consignées séparément des tests automatisés. Les coûts décrivent le type de charge, sans annoncer de capacité. Le bot n'active que l'intent `Guilds`; les permissions effectives de l'acteur et du bot sont revérifiées par le service métier.
+État du code au 17 octobre 2026, avec validations manuelles du propriétaire consignées séparément des tests automatisés. Les coûts décrivent le type de charge, sans annoncer de capacité. Le bot n'active que l'intent `Guilds`; les permissions effectives de l'acteur et du bot sont revérifiées par le service métier.
 
 | Fonction | Utilité | Permissions acteur / bot | Intents et contraintes Discord | Coût / repli | État réel |
 |---|---|---|---|---|---|
@@ -20,7 +20,7 @@
 | Signalements/recours | Recevoir, examiner et suivre une contestation | Pas de permission Discord de stockage; accès d'équipe explicite à créer | Aucun intent | DB, limitation d'abus et rétention nécessaires | À faire |
 | Raid / âge du compte | Détecter des arrivées rapides et confiner prudemment | Alertes seules; actions `ModerateMembers`/`KickMembers` opt-in | `GuildMembers` privilégié; approbation Discord potentielle | Événements de membres, fenêtres temporelles, faux positifs | À faire; aucune réaction automatique en production |
 | Journaux d'audit serveur | Corréler bans, suppressions et modifications sensibles | `ViewAuditLog`; permission d'action distincte | `Guilds`; entrées différées et attribution incertaine | Requêtes REST; jamais attribuer une action sur un rapprochement ambigu | À faire |
-| Présence bot | Afficher l'état shard/dashboard | Aucun droit OAuth supplémentaire | Un heartbeat PG par shard toutes les 30 s; TTL 90 s | O(shards) par heartbeat, présence installée par guild | Implémenté; pas de connexion Gateway live vérifiée |
+| Présence bot | Afficher l'état shard/dashboard | Aucun droit OAuth supplémentaire | Un heartbeat PG par shard toutes les 30 s; TTL 90 s | O(shards) par heartbeat, présence installée par guild | Implémenté; connexion Gateway réelle observée passivement sur le serveur privé du propriétaire pour F14, sans valider la mémoire sur une grande population |
 | Abonnements | Quotas et droits commerciaux | Aucun droit Discord | Premium Apps/éligibilité/prix à revalider avant vente | Frais, support, stockage à mesurer | Aucun paiement, offre payante ou entitlement implémenté |
 
 `ManageRoles`, `ManageChannels`, `ManageMessages`, `ViewChannel` et `ReadMessageHistory` s'ajoutent aux permissions de modération déjà livrées pour l'installation complète. Aucun module ne demande `Administrator`. Les commandes de test sont publiées uniquement sur `DISCORD_TEST_GUILD_ID`.
