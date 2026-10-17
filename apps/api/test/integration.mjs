@@ -30,13 +30,15 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const offlineShard = onlineShard + 1;
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
+  const dashboardPort = await freePort();
+  const dashboardBaseUrl = `http://localhost:${dashboardPort}`;
   const guildCounterFile = join(tmpdir(), `veyrobot-guild-fetch-${process.pid}-${seed}.txt`);
   const installationCounterFile = join(tmpdir(), `veyrobot-installation-check-${process.pid}-${seed}.txt`);
   await writeFile(guildCounterFile, '');
   await writeFile(installationCounterFile, '');
   const proxyIpSecret = 'integration-only-hmac-secret-longer-than-32-bytes';
   const recoveryEpoch = randomBytes(32).toString('hex');
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, VEYROBOT_RECOVERY_EPOCH: recoveryEpoch, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: dashboardBaseUrl, API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, VEYROBOT_RECOVERY_EPOCH: recoveryEpoch, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
@@ -45,6 +47,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   let apiLogs = '';
   let caseId;
   let actionCaseId;
+  let browserWarningIds = [];
   let grantTableRenamed = false;
   const start = async () => {
     child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -99,7 +102,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await call('/me', stateCookie)).status, 401, 'OAuth state cookie must not be treated as an authenticated session');
     const callback = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
     assert.equal(callback.status, 302);
-    assert.equal(callback.headers.get('location'), 'http://localhost:3000/dashboard/user');
+    assert.equal(callback.headers.get('location'), `${dashboardBaseUrl}/dashboard/user`);
     const secondStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
     const secondState = new URL(secondStart.headers.get('location')).searchParams.get('state');
     const secondStateCookie = secondStart.headers.get('set-cookie').split(';', 1)[0];
@@ -119,7 +122,6 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     let cookie = callback.headers.get('set-cookie').split(';', 1)[0];
     assert.equal(cookie.split('=', 1)[0], 'veyrobot_session', 'Unexpected OAuth session cookie name');
     if (process.env.RUN_DASHBOARD_ROUTE_INTEGRATION === '1') {
-      const dashboardPort = await freePort();
       const dashboardEntry = fileURLToPath(new URL('../../dashboard/node_modules/next/dist/bin/next', import.meta.url));
       dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
       const direct = `http://localhost:${dashboardPort}/dashboard/${guildA}/overview`;
@@ -264,7 +266,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       child.kill('SIGTERM'); await delay(350);
       delete childEnv.MOCK_GUILDS_STATUS;
       await start();
-      const proxiedLogout = await fetch(`http://localhost:${dashboardPort}/api/logout`, { method: 'POST', headers: { cookie, origin: 'http://localhost:3000' } });
+    const proxiedLogout = await fetch(`http://localhost:${dashboardPort}/api/logout`, { method: 'POST', headers: { cookie, origin: dashboardBaseUrl } });
       assert.equal(proxiedLogout.status, 204, 'Dashboard rewrite must forward logout');
       assert.match(proxiedLogout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
       assert.equal((await call('/me', cookie)).status, 401, 'A saved cookie must not survive logout');
@@ -282,8 +284,8 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.deepEqual(guilds.map(item => [item.botInstalled, item.botOnline]), [[true, true], [false, false], [true, false]]);
     assert.equal((await call(`/guilds/${guildB}/cases`, cookie)).status, 403);
     assert.equal((await call(`/guilds/${guildB}/config`, cookie)).status, 403);
-    const post = (path, body) => call(path, cookie, { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ ...body, csrf }) });
-    const put = (path, body) => call(path, cookie, { method: 'PUT', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ ...body, csrf }) });
+    const post = (path, body) => call(path, cookie, { method: 'POST', headers: { 'content-type': 'application/json', origin: dashboardBaseUrl }, body: JSON.stringify({ ...body, csrf }) });
+    const put = (path, body) => call(path, cookie, { method: 'PUT', headers: { 'content-type': 'application/json', origin: dashboardBaseUrl }, body: JSON.stringify({ ...body, csrf }) });
     const absent = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
     assert.equal(absent.botInstalled, false);
     assert.equal((await post(`/guilds/${guildC}/warnings`, { targetId, reason: 'offline' })).status, 503);
@@ -343,7 +345,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     const secondCsrf = (await secondMe.json()).csrf;
     const installationPost = (sessionCookie, sessionCsrf, headers = {}) => call(`/guilds/${guildB}/installation-check`, sessionCookie, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', origin: 'http://localhost:3000', ...headers },
+      headers: { 'content-type': 'application/json', origin: dashboardBaseUrl, ...headers },
       body: JSON.stringify({ csrf: sessionCsrf }),
     });
     for (let index = 0; index < 5; index++) {
@@ -378,11 +380,11 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await call('/me', secondCookie)).status, 200);
     assert.equal((await call('/me', secondCookie)).status, 429, 'The second valid session has its own complete quota');
     await stop(); delete childEnv.API_RATE_LIMIT_MAX; await start();
-    const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
+    const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: dashboardBaseUrl } });
     assert.equal(logout.status, 204);
     assert.match(logout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
     assert.equal((await call('/me', cookie)).status, 401, 'A copied cookie must be revoked server-side');
-    const logoutSecond = await call('/logout', secondCookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
+    const logoutSecond = await call('/logout', secondCookie, { method: 'POST', headers: { origin: dashboardBaseUrl } });
     assert.equal(logoutSecond.status, 204);
     await stop(); await start();
     assert.equal((await call('/me', cookie)).status, 401, 'Revocation must survive API restart');
@@ -463,12 +465,34 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     await start();
     const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
     assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
+    if (process.env.RUN_DASHBOARD_BROWSER_INTEGRATION === '1') {
+      assert.equal(process.env.RUN_DASHBOARD_ROUTE_INTEGRATION, '1', 'browser journey requires the isolated Next/API route integration');
+      assert.ok(dashboardBaseUrl, 'built Next server must be available for browser journey');
+      childEnv.API_PREAUTH_RATE_LIMIT_MAX = '180';
+      childEnv.API_RATE_LIMIT_MAX = '500';
+      await stop(); await start();
+      await prisma.shardPresence.update({ where: { shardId: onlineShard }, data: { lastSeenAt: new Date() } });
+      if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(350); }
+      const dashboardEntry = fileURLToPath(new URL('../../dashboard/node_modules/next/dist/bin/next', import.meta.url));
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let browserDashboardReady = false;
+      for (let attempt = 0; attempt < 150; attempt++) {
+        try { if ((await fetch(`${dashboardBaseUrl}/`)).ok) { browserDashboardReady = true; break; } } catch { /* wait for built Next */ }
+        await delay(100);
+      }
+      assert.equal(browserDashboardReady, true, 'built Next server must be ready before launching Chromium');
+      const browserCookie = await createSessionCookie();
+      const { runDashboardBrowserJourney } = await import('../../dashboard/tools/browser-journey.mjs');
+      browserWarningIds = await runDashboardBrowserJourney({ baseUrl: dashboardBaseUrl, sessionCookie: browserCookie, guildId: guildA, onWarningCreated: id => browserWarningIds.push(id) });
+      console.log('Dashboard browser integration passed: OAuth-backed session fixture, routes/history, keyboard settings, module save/reset, draft guards, simulated history 429 after warning writes, mobile layout, axe, focus and logout. Discord OAuth and guild data were simulated; no Discord mutation was sent.');
+    }
     console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
   } finally {
     await stop();
     if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });
     if (actionCaseId) await prisma.moderationCase.deleteMany({ where: { id: actionCaseId } });
+    if (browserWarningIds.length) await prisma.moderationCase.deleteMany({ where: { id: { in: browserWarningIds } } });
     await prisma.configAudit.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildConfig.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildPresence.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });

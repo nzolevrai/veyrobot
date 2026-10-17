@@ -62,10 +62,10 @@ Délégations d'équipe révocables, droits/quota centralisés, configuration d'
 
 - Livré : barre d’icônes de serveurs avec états installé/hors ligne/absent, vérification d’installation via Discord sur demande, navigation repliable, recherche locale sans accents, modules activables en base et paramètres de langue/fuseau/couleur. Les modules historiques sont désactivés par défaut sur les nouveaux et anciens serveurs. Les commandes et l’API refusent les nouvelles demandes désactivées; le worker garde les décisions antérieures et les échéances confirmées.
 - Validé localement : deux migrations appliquées, tests PostgreSQL réels des défauts et de la persistance, essai API complet avec Discord simulé (OAuth, absence, hors ligne, installation, isolation, conflit, redémarrage), tests de registre et tests de modération existants. Aucune sanction Discord réelle.
-- À contrôler : rendu visuel desktop/mobile à 100 % et focus des infobulles lorsque le navigateur intégré sera disponible; confirmation en direct sur le serveur privé des réglages, de `/warn` activé/désactivé et de la présence après invitation. Aucun essai de bannissement, kick, timeout ou suppression sans cible explicitement désignée.
+- Vérifié dans Chromium local le 17 octobre 2026 : parcours desktop/mobile, clavier, routes directes et historique, 429 simulés, sauvegarde/réinitialisation, brouillon, contraste axe-core et captures; voir [le rapport](DASHBOARD-BROWSER-VALIDATION-2026-10-17.md). Les validations Discord réelles sont consignées séparément par le propriétaire; aucun essai de bannissement, kick, timeout ou suppression sans cible explicitement désignée.
 - Suites : config métier détaillée par module, diagnostics de permissions du bot dans l’interface, coordination REST entre processus avant réplication de l’API, rétention et autres modules de la roadmap.
 
-La prochaine vérification en direct doit activer Avertissements sur sa page dédiée, sauvegarder, relancer `/warn` sur le serveur privé puis désactiver le module et constater le refus, sans sanction ni suppression. Vérifier ensuite la persistance des paramètres et le rendu visuel en navigateur. Ne pas essayer les actions destructrices avant qu’une cible ou un salon de test soit explicitement désigné.
+Les contrôles manuels restants concernent les technologies d’assistance, les autres moteurs de navigateur et les parcours Discord non encore validés en réel. Aucun de ces points n’est remplacé par une simulation du navigateur local; ne pas essayer d’action destructive sans cible ou salon de test explicitement désigné.
 
 ## Historique de reprise après la revue du 14 octobre 2026
 
@@ -75,7 +75,7 @@ Les travaux de fiabilité et de qualité de la PR #3 sont terminés sur `hardeni
 
 ### Tâches restantes, priorisées
 
-1. Pour cette PR : la CI sur la tête exacte est vérifiée dans [la synthèse finale](PR-3-FINAL-REVIEW.md); recueillir les revues indépendantes avant décision humaine. Pour mise en production : contrôle visuel navigateur et parcours Discord autorisés; aucune sanction réelle n'est requise pour fusionner les correctifs backend.
+1. Pour cette PR : la validation Chromium locale est décrite dans [le rapport navigateur](DASHBOARD-BROWSER-VALIDATION-2026-10-17.md); recueillir les revues indépendantes avant décision humaine. Pour une mise en production : valider l’hébergement et les parcours Discord autorisés; aucune sanction réelle n'est requise pour fusionner les correctifs backend.
 2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
 3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
 
