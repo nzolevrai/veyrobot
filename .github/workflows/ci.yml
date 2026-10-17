@@ -1,8 +1,17 @@
 name: CI
 on: [push, pull_request]
 jobs:
+  backup-script:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test backup publication failure handling with mocked Docker
+        shell: powershell
+        run: .\deploy\test-backup-postgres.ps1
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:17-alpine
@@ -33,7 +42,16 @@ jobs:
         with:
           node-version: 24.21.0
           cache: pnpm
+      - name: Verify production Compose budgets are rendered and enforced
+        run: node deploy/verify-compose-budgets.mjs
+        env:
+          VEYROBOT_RECOVERY_EPOCH: '00000000000000000000000000000000'
+      - name: Test backup publication handling on Linux
+        shell: pwsh
+        run: ./deploy/test-backup-postgres.ps1
       - run: pnpm install --frozen-lockfile
+      - name: Install Chromium for dashboard end-to-end tests
+        run: pnpm --filter @veyrobot/dashboard exec playwright install --with-deps chromium
       - run: pnpm db:generate
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
@@ -60,3 +78,22 @@ jobs:
           RUN_REDIS_INTEGRATION: '1'
           REDIS_URL: redis://127.0.0.1:6379
           RUN_DASHBOARD_ROUTE_INTEGRATION: '1'
+          RUN_DASHBOARD_BROWSER_INTEGRATION: '1'
+      - name: Verify a real PostgreSQL 17 backup, restore and recovery gate
+        run: node deploy/backup-restore.integration.mjs
+      - name: Verify Redis refusals and OOM recovery with live production BullMQ clients
+        run: node deploy/redis-saturation.integration.mjs
+        env:
+          DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
+          REDIS_URL: redis://127.0.0.1:6379
+          RUN_REDIS_SATURATION_INTEGRATION: '1'
+          VEYROBOT_ISOLATED_INTEGRATION: '1'
+      - name: Rewrite a representative Redis AOF and verify a cgroup OOM restart
+        run: node deploy/redis-memory.integration.mjs
+        env:
+          RUN_REDIS_MEMORY_INTEGRATION: '1'
+      - name: Run production images under Compose memory caps with controlled Discord adapter
+        run: node deploy/production-resource-profile.integration.mjs
+        env:
+          CI: 'true'
+          RUN_PRODUCTION_RESOURCE_PROFILE: '1'

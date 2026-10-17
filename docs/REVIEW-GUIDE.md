@@ -1,5 +1,7 @@
 # Guide de revue indépendante
 
+> **Archive historique PR #1.** Les commits, résultats CI et consignes ci-dessous concernent la PR #1 et ne doivent pas être utilisés comme état actuel. Pour la PR #3, consulter [la synthèse finale, son tableau de constats et ses preuves](PR-3-FINAL-REVIEW.md), puis vérifier la tête et les checks GitHub indiqués dans ce document.
+
 Ce guide décrit les preuves disponibles pour la PR [#1](https://github.com/nzolevrai/veyrobot/pull/1). **Commit de code et tests à examiner : `99c1c8be82a420dba1988b9612336b487d481c7d`**, comparé au commit précédemment relu `5219f2f99f2a1eb0446bb7aacf18c589d4f90528`. Les runs CI [push `38771171093`](https://github.com/nzolevrai/veyrobot/actions/runs/38771171093) et [PR `38771180224`](https://github.com/nzolevrai/veyrobot/actions/runs/38771180224) portent sur ce SHA; ils exécutent PostgreSQL 17, Redis 7, migrations, diff schéma/migrations, typecheck, build, lint et tests. La PR reste en brouillon et ne doit pas être fusionnée automatiquement.
 
 ChatGPT, Claude et Gemini peuvent utiliser le même SHA et les commandes ci-dessous, mais doivent examiner le code eux-mêmes. Rapporter chaque constat avec chemin/ligne, scénario reproductible, gravité et impact; signaler aussi les zones non vérifiables depuis le dépôt. Ne pas inférer une garantie à partir d’un test simulé.

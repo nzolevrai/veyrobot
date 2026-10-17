@@ -1,8 +1,18 @@
 # Roadmap, décisions et reprise
 
+## Validation utilisateur et qualité du socle — 15 octobre 2026
+
+Le propriétaire confirme avoir testé en réel sur son serveur privé : OAuth, navigation, actualisation et déconnexion; refus d'accès après déconnexion; persistance des paramètres et activation/désactivation; avertissements depuis le Dashboard et `/warn`; timeout et retrait immédiat; slowmode et restauration. Ce sont des validations manuelles rapportées par le propriétaire, non rejouées par la CI ni reproduites dans cette tranche. Les autres actions Discord, notamment kick, ban, unban, ban temporaire et purge, restent non validées en réel.
+
+Un contrôle automatisé Chrome headless a testé le dashboard construit avec la CSP nonce (réponse HTTP 200, nonce transmis aux scripts Next, pas de `unsafe-inline` dans `script-src`, aucune violation CSP signalée pendant le chargement). La revue visuelle desktop/mobile reste manquante. Une campagne de 30 minutes du pipeline réel (dispatcher/worker/exécuteur, Discord simulé), avec trois serveurs dominants, échéances et repos, est maintenant consignée dans `PERFORMANCE-BASELINE.md`; elle ne valide ni Discord réel ni capacité maximale.
+
+Les limites consolidées et leur classification figurent dans [FOUNDATION-QUALITY-REVIEW-2026-10-15.md](FOUNDATION-QUALITY-REVIEW-2026-10-15.md). F14 est mesuré passivement sur une seule guilde et le cycle d'arrêt attend la fermeture du Gateway ([rapport F14](F14-GATEWAY-MEMORY-2026-10-17.md)). La production est préparée par une topologie de référence, mais aucun service n'est provisionné ni déployé. Le développement reste local; AWS est une étape ultérieure sans ressources créées pour cette PR.
+
+Les premiers budgets mémoire Compose, `maxmemory` Redis/noeviction, backoff de publication et intégration de saturation sont décrits dans [MEMORY-REDIS-BUDGETS-2026-10-16.md](MEMORY-REDIS-BUDGETS-2026-10-16.md). Les chiffres de référence viennent de campagnes antérieures sans ces caps; le comportement des processus sous plafonds et l'alerting en hébergement restent à mesurer/déployer.
+
 ## Étape 1 — socle et premier parcours
 
-Monorepo TypeScript strict, PostgreSQL/Prisma, Redis/BullMQ, API Fastify, Dashboard Next, bot Gateway séparé, OAuth Discord, sélection des serveurs, avertissements et dossiers paginés sont livrés. Les migrations locales PostgreSQL ont été appliquées et les tests d'intégration du dossier ont déjà été exécutés sur le service local. L'utilisateur a précédemment validé OAuth, la sélection et `/warn` sur son serveur privé ; les changements de la tranche navigation et configuration ne sont pas encore revalidés en direct.
+Monorepo TypeScript strict, PostgreSQL/Prisma, Redis/BullMQ, API Fastify, Dashboard Next, bot Gateway séparé, OAuth Discord, sélection des serveurs, avertissements et dossiers paginés sont livrés. Les migrations locales PostgreSQL ont été appliquées et les tests d'intégration du dossier ont déjà été exécutés sur le service local. Les validations manuelles actuelles du propriétaire sont listées dans la section de statut ci-dessus; l'historique ci-dessous ne remplace pas cette liste.
 
 ## Étape 2 — modération manuelle (en cours)
 
@@ -12,7 +22,7 @@ Le worker utilise PostgreSQL comme outbox, dispatch équitable une opération pa
 
 ## Interface du Dashboard
 
-Nouvelle identité anthracite et indigo, en-tête de 64 px, navigation stable de 240 px, menu mobile repliable, registre typé des modules réellement disponibles, formulaires de modération séparés et confirmation intégrée pour les demandes sensibles. Les anciennes polices et captures ne sont plus utilisées. Les interrupteurs persistants des trois modules d'action et les préférences de langue, fuseau et couleur sont livrés ; les réglages métier détaillés par module restent à faire. Voir [DASHBOARD-DESIGN.md](DASHBOARD-DESIGN.md). Une revue visuelle dans le navigateur reste nécessaire car son ouverture automatisée a échoué lors de la dernière tentative documentée.
+Nouvelle identité anthracite et indigo, en-tête de 64 px, navigation stable de 240 px, menu mobile repliable, registre typé des modules réellement disponibles, formulaires de modération séparés et confirmation intégrée pour les demandes sensibles. Les anciennes polices et captures ne sont plus utilisées. Les interrupteurs persistants des trois modules d'action et les préférences de langue, fuseau et couleur sont livrés ; les réglages métier détaillés par module restent à faire. Voir [DASHBOARD-DESIGN.md](DASHBOARD-DESIGN.md). Le contrôle headless de CSP est réussi; la revue visuelle en plusieurs tailles d'écran reste nécessaire.
 
 ## Étape 3 — règles et AutoMod
 
@@ -52,22 +62,30 @@ Délégations d'équipe révocables, droits/quota centralisés, configuration d'
 
 - Livré : barre d’icônes de serveurs avec états installé/hors ligne/absent, vérification d’installation via Discord sur demande, navigation repliable, recherche locale sans accents, modules activables en base et paramètres de langue/fuseau/couleur. Les modules historiques sont désactivés par défaut sur les nouveaux et anciens serveurs. Les commandes et l’API refusent les nouvelles demandes désactivées; le worker garde les décisions antérieures et les échéances confirmées.
 - Validé localement : deux migrations appliquées, tests PostgreSQL réels des défauts et de la persistance, essai API complet avec Discord simulé (OAuth, absence, hors ligne, installation, isolation, conflit, redémarrage), tests de registre et tests de modération existants. Aucune sanction Discord réelle.
-- À contrôler : rendu visuel desktop/mobile à 100 % et focus des infobulles lorsque le navigateur intégré sera disponible; confirmation en direct sur le serveur privé des réglages, de `/warn` activé/désactivé et de la présence après invitation. Aucun essai de bannissement, kick, timeout ou suppression sans cible explicitement désignée.
+- Vérifié dans Chromium local le 17 octobre 2026 : parcours desktop/mobile, clavier, routes directes et historique, 429 simulés, sauvegarde/réinitialisation, brouillon, contraste axe-core et captures; voir [le rapport](DASHBOARD-BROWSER-VALIDATION-2026-10-17.md). Les validations Discord réelles sont consignées séparément par le propriétaire; aucun essai de bannissement, kick, timeout ou suppression sans cible explicitement désignée.
 - Suites : config métier détaillée par module, diagnostics de permissions du bot dans l’interface, coordination REST entre processus avant réplication de l’API, rétention et autres modules de la roadmap.
 
-La prochaine vérification en direct doit activer Avertissements sur sa page dédiée, sauvegarder, relancer `/warn` sur le serveur privé puis désactiver le module et constater le refus, sans sanction ni suppression. Vérifier ensuite la persistance des paramètres et le rendu visuel en navigateur. Ne pas essayer les actions destructrices avant qu’une cible ou un salon de test soit explicitement désigné.
+Les contrôles manuels restants concernent les technologies d’assistance, les autres moteurs de navigateur et les parcours Discord non encore validés en réel. Aucun de ces points n’est remplacé par une simulation du navigateur local; ne pas essayer d’action destructive sans cible ou salon de test explicitement désigné.
 
-## Reprise après la revue du 14 octobre 2026
+## Historique de reprise après la revue du 14 octobre 2026
 
-Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime sont livrés sur la branche d'architecture. Les validations locales, les coupures isolées Redis/PostgreSQL et les performances avec leurs incertitudes figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les prochaines priorités sont des pannes pendant l'exécution Discord et charge prolongée, des métriques corrélées, un essai de restauration, la politique de croissance des dossiers d'action et la validation navigateur/Discord réel sans sanction. Aucun déploiement multi-processus n'est autorisé par le code actuel.
+Les frontières API/bot, le verrou d'instance unique, la révocation de session, la borne d'admission, la reprise du producteur Redis, la rétention partielle et le proxy Next résolu au runtime ont été les éléments de départ de la branche d'architecture. Les validations locales et leurs limites historiques figurent dans [RELIABILITY-REVIEW-2026-10-14.md](RELIABILITY-REVIEW-2026-10-14.md). Les tranches ultérieures et leur état consolidé sont référencés dans [la synthèse PR #3](PR-3-FINAL-REVIEW.md). Aucun déploiement multi-processus n'est autorisé par le code actuel.
 
-Suite sur la même branche : lecture bornée et timeout du proxy, tests d'interruption sur l'exécuteur réel, quarantaine à la restauration, banc PostgreSQL/BullMQ/worker de 30 minutes, attente du pool et admission sont consignés dans [RELIABILITY-VERIFICATION-2026-10-14.md](RELIABILITY-VERIFICATION-2026-10-14.md). Les dossiers d'action ne sont pas purgés : ils croissent jusqu'à une conception et un test de course des tombstones; suivre la taille de `ModerationCase` avant saturation. Avant mise en production, valider le rendu dans un navigateur et les parcours Discord autorisés sans sanction destructive. Les résultats simulés ne prouvent pas les limites de Discord réel. La PR reste en brouillon.
+Les travaux de fiabilité et de qualité de la PR #3 sont terminés sur `hardening/foundation-quality`; la tranche F14 a été livrée au commit `638c8f5bb181ea0538e900f2f747eaf669fa863f`. Voir la [synthèse finale et les preuves](PR-3-FINAL-REVIEW.md) et consulter les checks de la tête actuelle dans GitHub. La PR reste ouverte et non fusionnée. Le développement reste local; AWS n'est pas provisionné. Les dossiers d'action ne sont pas purgés : ils croissent jusqu'à une conception et un test de course des tombstones; suivre la taille de `ModerationCase` avant saturation. Avant une production AWS ultérieure, valider le rendu visuel dans un navigateur, configurer et éprouver réseau/ingress/WAF/TLS/secrets, budgets/alerting et sauvegarde/restauration avec epoch externe sur cet hébergement. Les intégrations Discord simulées ne prouvent pas les limites de Discord réel.
 
 ### Tâches restantes, priorisées
 
-1. Pour cette PR : vérifier la CI sur la tête exacte et recueillir les revues indépendantes via [le guide de revue](REVIEW-GUIDE.md). Pour mise en production : contrôle visuel navigateur et vérifications Discord autorisées; aucune sanction réelle n'est requise pour la fusion des correctifs backend.
+1. Pour cette PR : la validation Chromium locale est décrite dans [le rapport navigateur](DASHBOARD-BROWSER-VALIDATION-2026-10-17.md); recueillir les revues indépendantes avant décision humaine. Pour une mise en production : valider l’hébergement et les parcours Discord autorisés; aucune sanction réelle n'est requise pour fusionner les correctifs backend.
 2. Avant rétention des dossiers : concevoir tombstone transactionnel à `operationId` durable, course entre admission et archivage, restauration et politique explicite d'horizon/capacité. La purge reste désactivée.
 3. Évolution future : coordination REST multi-processus et sharding uniquement après les signaux de saturation listés dans `OPERATIONS.md`; le verrou d'instance bot reste actif.
+
+### Sauvegarde/restauration — 15 octobre 2026
+
+Le script `deploy/backup-postgres.ps1` publie uniquement une archive PostgreSQL 17 validée par `pg_restore --list`, avec sidecar SHA-256 publié en dernier, noms concurrents uniques et temporaires isolés. La politique Windows autorise le compte de sauvegarde, SYSTEM et Administrators, refuse un dossier aux ACL inadéquates et teste une ACE explicite `BUILTIN\Users`; Linux est vérifié avec modes 0700/0600. Un epoch conservé hors snapshots bloque l'API et le bot après restauration jusqu'à la transaction de quarantaine et révocation des sessions. La CI teste les vrais points d'entrée compilés, une panne transactionnelle et un redémarrage bloqué, puis le dispatcher après reprise avec Discord simulé uniquement.
+
+L'initialisation `recovery-gate:init` est réservée à une première installation : transactionnellement, elle refuse tout gate existant ou toute ligne dans les tables applicatives/de session du schéma, et sérialise les initialisations concurrentes. Une base historique sans gate doit être mise à niveau avec `recovery:quarantine`; l'absence du gate seule ne classe pas la base comme restaurée.
+
+La procédure de restauration et ses commandes sont dans [BACKUP-RESTORE-VERIFICATION-2026-10-15.md](BACKUP-RESTORE-VERIFICATION-2026-10-15.md). Restent à éprouver : planification/copie vers stockage distant chiffré, surveillance de la capacité/rétention, contrôle de l'accès à ce stockage et exercice à la taille réelle de la base. Les durées locales mesurées ne constituent pas des objectifs RPO/RTO.
 
 ### Navigation routée et édition commune — 13 octobre 2026
 

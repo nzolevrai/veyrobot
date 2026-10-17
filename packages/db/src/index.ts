@@ -41,6 +41,7 @@ export const prisma = new PrismaClient({ adapter, log: process.env.NODE_ENV === 
 export * from './guild-config.js';
 export * from './admission.js';
 export * from './restore-quarantine.js';
+export * from './recovery-gate.js';
 
 export async function createWarningCase(input: WarningCaseInput) {
   return prisma.$transaction(async tx => {

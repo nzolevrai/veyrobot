@@ -4,6 +4,7 @@ import { DashboardProvider } from '../../dashboard-context';
 import { readApiFailure, type ApiFailure } from '../../api-failure';
 import { DashboardLoadFailure } from '../load-failure';
 import type { GuildConfig } from '../../dashboard-types';
+import { safeDiagnosticCode, safeDiagnosticText } from '@veyrobot/contracts';
 
 export default async function GuildLayout({ children, params }: { children: React.ReactNode; params: Promise<{ guildId: string }> }) {
   const { guildId } = await params;
@@ -26,7 +27,7 @@ export default async function GuildLayout({ children, params }: { children: Reac
   if (response.status === 403 || response.status === 404) redirect('/?access=denied');
   if (!response.ok) {
     const failure: ApiFailure = await readApiFailure(response);
-    console.warn(JSON.stringify({ endpoint: '/guilds/:guildId/config', status: failure.status, durationMs: Math.round(performance.now() - started), code: failure.code, requestId: failure.requestId }));
+    console.warn(JSON.stringify({ endpoint: '/guilds/:guildId/config', status: failure.status, durationMs: Math.round(performance.now() - started), code: safeDiagnosticCode(failure.code) ?? 'UNKNOWN_ERROR', requestId: safeDiagnosticText(failure.requestId, 128) ?? 'unknown' }));
     return <DashboardLoadFailure failure={failure} />;
   }
   const initialConfig = await response.json() as GuildConfig;

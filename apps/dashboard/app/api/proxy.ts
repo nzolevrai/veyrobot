@@ -1,3 +1,6 @@
+import { createHmac } from 'node:crypto';
+import { canonicalizeClientIp, clientIpSigningPayload } from '@veyrobot/contracts/client-ip';
+
 const MAX_BODY_BYTES = 1_048_576;
 const HOP_HEADERS = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'proxy-connection'];
 
@@ -7,7 +10,6 @@ function withoutHopHeaders(source: Headers, extra: string[] = []): Headers {
   for (const header of [...HOP_HEADERS, ...nominated, ...extra]) result.delete(header);
   return result;
 }
-
 function failure(status: number, code: string, message: string): Response {
   return Response.json({ error: message, code }, { status, headers: { 'Cache-Control': 'no-store' } });
 }
@@ -70,7 +72,18 @@ export async function proxyRequest(request: Request, path: string[], search = ''
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(new Error('Upstream timeout')), timeoutMs);
   const signal = AbortSignal.any([request.signal, timeout.signal]);
-  const headers = withoutHopHeaders(request.headers, ['host', 'content-length', 'forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip']);
+  const headers = withoutHopHeaders(request.headers, ['host', 'content-length', 'forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip', 'x-veyrobot-client-ip', 'x-veyrobot-client-ip-signature']);
+  for (const name of [...headers.keys()]) if (name.startsWith('x-forwarded-')) headers.delete(name);
+  const trustedClientIpHeader = (process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER ?? '').trim().toLowerCase();
+  const clientIpSecret = process.env.API_PROXY_CLIENT_IP_SECRET ?? '';
+  if (/^[a-z0-9-]+$/.test(trustedClientIpHeader) && clientIpSecret.length >= 32) {
+    // Headers.get() combines duplicate values with commas; the strict parser rejects lists.
+    const clientIp = canonicalizeClientIp(request.headers.get(trustedClientIpHeader));
+    if (clientIp) {
+      headers.set('x-veyrobot-client-ip', clientIp);
+      headers.set('x-veyrobot-client-ip-signature', createHmac('sha256', clientIpSecret).update(clientIpSigningPayload(clientIp)).digest('hex'));
+    }
+  }
   const requestId = crypto.randomUUID();
   const upstreamStarted = performance.now();
   try {

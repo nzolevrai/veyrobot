@@ -20,6 +20,7 @@ const child = spawn(process.execPath, [fileURLToPath(new URL('../dist/index.js',
     DISCORD_BOT_TOKEN: 'local-smoke-test-only',
     SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     DATABASE_URL: 'postgresql://nobody:nobody@127.0.0.1:1/smoke',
+    VEYROBOT_RECOVERY_EPOCH: 'a'.repeat(64),
   },
 });
 child.stdout.setEncoding('utf8').on('data', chunk => { childOutput += chunk; });
@@ -33,22 +34,9 @@ try {
     try { health = await fetch(`${apiUrl}/health`); break; }
     catch { await delay(100); }
   }
-  assert.equal(health?.status, 200, `API starts without opening a database connection. Child output: ${childOutput}`);
-  assert.deepEqual(await health.json(), { status: 'ok' });
-  assert.equal((await fetch(`${apiUrl}/guilds`)).status, 401, 'expired or missing dashboard sessions cannot list guilds');
-  assert.equal((await fetch(`${apiUrl}/guilds/123456789012345678/cases`)).status, 401, 'expired or missing sessions cannot read even a known guild dossier');
-
-  const start = await fetch(`${apiUrl}/oauth/discord/start`, { redirect: 'manual' });
-  assert.equal(start.status, 302);
-  const authorization = new URL(start.headers.get('location'));
-  assert.equal(authorization.origin, 'https://discord.com');
-  assert.equal(authorization.searchParams.get('scope'), 'identify guilds');
-  assert.ok(authorization.searchParams.get('state'));
-  const cookie = start.headers.get('set-cookie')?.split(';', 1)[0];
-  assert.ok(cookie, 'OAuth state is stored in the encrypted session cookie');
-
-  const callback = await fetch(`${apiUrl}/oauth/discord/callback?code=unused&state=wrong`, { headers: { cookie } });
-  assert.equal(callback.status, 400, 'OAuth callback rejects a mismatched state before token exchange');
+  assert.equal(health, undefined, `API must fail closed when recovery authorization cannot be read. Child output: ${childOutput}`);
+  assert.equal(child.exitCode, 1, `API must exit before opening a listener. Child output: ${childOutput}`);
+  assert.match(childOutput, /recovery authorization is missing, stale, or unavailable/i);
 } finally {
   if (child.exitCode === null) child.kill('SIGTERM');
 }

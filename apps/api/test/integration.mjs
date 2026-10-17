@@ -3,8 +3,11 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHmac } from 'node:crypto';
+import { canonicalizeClientIp, clientIpSigningPayload } from '@veyrobot/contracts/client-ip';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -27,34 +30,79 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
   const offlineShard = onlineShard + 1;
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
+  const dashboardPort = await freePort();
+  const dashboardBaseUrl = `http://localhost:${dashboardPort}`;
   const guildCounterFile = join(tmpdir(), `veyrobot-guild-fetch-${process.pid}-${seed}.txt`);
+  const installationCounterFile = join(tmpdir(), `veyrobot-installation-check-${process.pid}-${seed}.txt`);
   await writeFile(guildCounterFile, '');
-  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: 'http://localhost:3000', API_PROXY_BODY_TIMEOUT_MS: '200', DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile };
+  await writeFile(installationCounterFile, '');
+  const proxyIpSecret = 'integration-only-hmac-secret-longer-than-32-bytes';
+  const recoveryEpoch = randomBytes(32).toString('hex');
+  const childEnv = { ...process.env, NODE_ENV: 'test', API_PORT: String(port), API_PUBLIC_URL: base, DASHBOARD_URL: dashboardBaseUrl, API_PROXY_BODY_TIMEOUT_MS: '200', API_RATE_LIMIT_MAX: '2', API_PREAUTH_RATE_LIMIT_MAX: '12', API_PROXY_CLIENT_IP_SECRET: proxyIpSecret, VEYROBOT_RECOVERY_EPOCH: recoveryEpoch, DISCORD_CLIENT_ID: '123456789012345678', DISCORD_CLIENT_SECRET: 'fake-only', DISCORD_BOT_TOKEN: 'fake-only', SESSION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', TEST_USER_ID: actorId, TEST_GUILD_A: guildA, TEST_GUILD_B: guildB, TEST_GUILD_C: guildC, MOCK_GUILDS_COUNTER_FILE: guildCounterFile, MOCK_INSTALLATION_COUNTER_FILE: installationCounterFile };
   const apiEntry = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const mockEntry = new URL('./mock-discord.mjs', import.meta.url).href;
   let child;
   let dashboard;
+  let ingress;
+  let apiLogs = '';
   let caseId;
   let actionCaseId;
+  let browserWarningIds = [];
+  let grantTableRenamed = false;
   const start = async () => {
-    child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: 'ignore' });
+    child = spawn(process.execPath, ['--import', mockEntry, apiEntry], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8').on('data', chunk => { apiLogs = (apiLogs + chunk).slice(-1_000_000); });
+    child.stderr.setEncoding('utf8').on('data', chunk => { apiLogs = (apiLogs + chunk).slice(-1_000_000); });
     for (let i = 0; i < 150; i++) { try { if ((await fetch(`${base}/health`)).ok) return; } catch { /* wait for listen */ } await delay(100); }
     throw new Error('API test process did not start');
   };
-  const stop = async () => { if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(200); } if (child && child.exitCode === null) { child.kill('SIGTERM'); await delay(200); } };
+  const stop = async () => { if (ingress?.listening) await new Promise(resolve => ingress.close(() => resolve())); if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(200); } if (child && child.exitCode === null) { child.kill('SIGTERM'); await delay(200); } };
   const call = (path, cookie, options = {}) => fetch(`${base}${path}`, { ...options, headers: { ...(cookie ? { cookie } : {}), ...(options.headers ?? {}) } });
   try {
+    await prisma.recoveryGate.upsert({ where: { id: 'singleton' }, create: { id: 'singleton', epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') }, update: { epochHash: createHash('sha256').update(recoveryEpoch).digest('hex') } });
     await prisma.guildPresence.createMany({ data: [{ guildId: guildA, shardId: onlineShard }, { guildId: guildC, shardId: offlineShard }] });
     await prisma.shardPresence.createMany({ data: [{ shardId: onlineShard, lastSeenAt: new Date() }, { shardId: offlineShard, lastSeenAt: new Date(0) }] });
     await start();
     assert.equal((await call('/ready')).status, 200);
-    const oauthStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
-    const state = new URL(oauthStart.headers.get('location')).searchParams.get('state');
-    const stateCookie = oauthStart.headers.get('set-cookie').split(';', 1)[0];
+    const oauthStart = (headers = {}) => fetch(`${base}/oauth/discord/start`, { redirect: 'manual', headers });
+    const forgedIp = { 'x-veyrobot-client-ip': '203.0.113.10', 'x-veyrobot-client-ip-signature': 'a'.repeat(64) };
+    assert.equal((await oauthStart(forgedIp)).status, 302);
+    assert.equal((await oauthStart(forgedIp)).status, 302);
+    assert.equal((await oauthStart(forgedIp)).status, 429, 'unsigned client identity cannot escape the socket-IP bucket');
+    const duplicateIdentityHeaders = new Headers();
+    duplicateIdentityHeaders.append('x-veyrobot-client-ip', '203.0.113.10');
+    duplicateIdentityHeaders.append('x-veyrobot-client-ip', '203.0.113.11');
+    duplicateIdentityHeaders.set('x-veyrobot-client-ip-signature', createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload('203.0.113.10')).digest('hex'));
+    assert.equal((await fetch(`${base}/oauth/discord/start`, { headers: duplicateIdentityHeaders, redirect: 'manual' })).status, 429, 'duplicated identity headers are rejected and use the same direct-socket fallback bucket');
+    const signed = ip => {
+      const canonicalIp = canonicalizeClientIp(ip);
+      assert.ok(canonicalIp, 'test address must be valid');
+      return { 'x-veyrobot-client-ip': ip, 'x-veyrobot-client-ip-signature': createHmac('sha256', proxyIpSecret).update(clientIpSigningPayload(canonicalIp)).digest('hex') };
+    };
+    assert.equal((await oauthStart(signed('203.0.113.10'))).status, 302);
+    assert.equal((await oauthStart(signed('203.0.113.10'))).status, 302);
+    assert.equal((await oauthStart(signed('203.0.113.10'))).status, 429);
+    assert.equal((await oauthStart(signed('203.0.113.11'))).status, 302, 'distinct signed anonymous clients retain separate buckets');
+    const v6Expanded = '2001:0DB8:0000:0000:0000:0000:0000:0001';
+    assert.equal((await oauthStart(signed(v6Expanded))).status, 302);
+    assert.equal((await oauthStart(signed(v6Expanded))).status, 302);
+    assert.equal((await oauthStart(signed('2001:db8::1'))).status, 429, 'equivalent IPv6 spellings share one pre-auth quota');
+    assert.equal((await oauthStart(signed('2001:db8::2'))).status, 302, 'a different IPv6 address has a separate quota');
+    assert.equal((await oauthStart(signed('192.0.2.77'))).status, 302);
+    assert.equal((await oauthStart(signed('::ffff:c000:024d'))).status, 302);
+    assert.equal((await oauthStart(signed('::ffff:192.0.2.77'))).status, 429, 'IPv4-mapped IPv6 shares the IPv4 bucket');
+    assert.equal((await oauthStart(signed('192.0.2.78'))).status, 302);
+    await stop();
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    delete childEnv.API_PREAUTH_RATE_LIMIT_MAX;
+    await start();
+    const oauthStartResponse = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
+    const state = new URL(oauthStartResponse.headers.get('location')).searchParams.get('state');
+    const stateCookie = oauthStartResponse.headers.get('set-cookie').split(';', 1)[0];
     assert.equal((await call('/me', stateCookie)).status, 401, 'OAuth state cookie must not be treated as an authenticated session');
     const callback = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
     assert.equal(callback.status, 302);
-    assert.equal(callback.headers.get('location'), 'http://localhost:3000/dashboard/user');
+    assert.equal(callback.headers.get('location'), `${dashboardBaseUrl}/dashboard/user`);
     const secondStart = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
     const secondState = new URL(secondStart.headers.get('location')).searchParams.get('state');
     const secondStateCookie = secondStart.headers.get('set-cookie').split(';', 1)[0];
@@ -74,9 +122,8 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     let cookie = callback.headers.get('set-cookie').split(';', 1)[0];
     assert.equal(cookie.split('=', 1)[0], 'veyrobot_session', 'Unexpected OAuth session cookie name');
     if (process.env.RUN_DASHBOARD_ROUTE_INTEGRATION === '1') {
-      const dashboardPort = await freePort();
       const dashboardEntry = fileURLToPath(new URL('../../dashboard/node_modules/next/dist/bin/next', import.meta.url));
-      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
       const direct = `http://localhost:${dashboardPort}/dashboard/${guildA}/overview`;
       let available = false;
       for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { available = true; break; } } catch { /* wait for Next */ } await delay(100); }
@@ -87,6 +134,58 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       });
       assert.equal((await proxiedBody(1_048_577)).status, 413, 'Next must reject a chunked oversized body before the API');
       assert.equal((await proxiedBody(2)).status, 401, 'Next must forward a bounded chunked body to the API');
+      childEnv.API_RATE_LIMIT_MAX = '2';
+      await stop();
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let dashboardRestarted = false;
+      for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { dashboardRestarted = true; break; } } catch { /* wait for Next */ } await delay(100); }
+      assert.equal(dashboardRestarted, true, 'Next must restart with the trusted-header test configuration');
+      await start();
+      const ingressPeers = [];
+      ingress = createHttpServer(async (incoming, outgoing) => {
+        ingressPeers.push(incoming.socket.remoteAddress);
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(incoming.headers)) if (typeof value === 'string') headers.set(name, value);
+        // This disposable ingress models the reference boundary: overwrite, never append, source identity.
+        headers.set('x-real-ip', incoming.socket.remoteAddress ?? '');
+        try {
+          const upstream = await fetch(`http://localhost:${dashboardPort}${incoming.url ?? '/'}`, { method: incoming.method, headers, redirect: 'manual' });
+          const body = Buffer.from(await upstream.arrayBuffer());
+          outgoing.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
+          outgoing.end(body);
+        } catch {
+          outgoing.writeHead(502); outgoing.end();
+        }
+      });
+      await new Promise(resolve => ingress.listen(0, '127.0.0.1', resolve));
+      const ingressAddress = ingress.address();
+      assert.ok(ingressAddress && typeof ingressAddress !== 'string');
+      const throughIngressFrom = (sourceAddress, headers) => new Promise((resolve, reject) => {
+        const request = httpRequest({ hostname: '127.0.0.1', port: ingressAddress.port, path: '/api/public-config', method: 'GET', headers, localAddress: sourceAddress, agent: false }, response => {
+          response.resume();
+          response.once('end', () => resolve(response.statusCode));
+        });
+        request.once('error', reject);
+        request.end();
+      });
+      const forged = label => ({ 'x-real-ip': `198.51.100.${label}`, 'x-forwarded-for': `198.51.100.${label}`, 'x-veyrobot-client-ip': `203.0.113.${label}`, 'x-veyrobot-client-ip-signature': 'f'.repeat(64) });
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('11')), 200, 'first anonymous client begins with its own signed IP bucket');
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('12')), 200);
+      assert.equal(await throughIngressFrom('127.0.0.1', forged('13')), 429, 'first anonymous client is rate limited after two calls');
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('21')), 200, 'second socket source retains a separate signed quota after the first is exhausted');
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('22')), 200);
+      assert.equal(await throughIngressFrom('127.0.0.2', forged('23')), 429, 'second client has its own complete quota');
+      assert.ok(ingressPeers.includes('127.0.0.1'), 'ingress observes the first TCP peer address');
+      assert.ok(ingressPeers.includes('127.0.0.2'), 'ingress observes the second TCP peer address');
+      assert.ok(ingressPeers.every(address => address === '127.0.0.1' || address === '127.0.0.2'), 'the ingress-derived identities match the bound client socket addresses');
+      await new Promise(resolve => ingress.close(() => resolve()));
+      ingress = undefined;
+      childEnv.API_RATE_LIMIT_MAX = '90';
+      await stop(); await start();
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let dashboardReadyAgain = false;
+      for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${dashboardPort}/`)).ok) { dashboardReadyAgain = true; break; } } catch { /* wait for Next */ } await delay(100); }
+      assert.equal(dashboardReadyAgain, true, 'Dashboard must return after the quota-chain test restart');
       let delayedUpload;
       const slowBody = new ReadableStream({
         start(controller) { controller.enqueue(Buffer.from('{')); delayedUpload = setTimeout(() => { controller.enqueue(Buffer.from('}')); controller.close(); }, 500); },
@@ -167,7 +266,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
       child.kill('SIGTERM'); await delay(350);
       delete childEnv.MOCK_GUILDS_STATUS;
       await start();
-      const proxiedLogout = await fetch(`http://localhost:${dashboardPort}/api/logout`, { method: 'POST', headers: { cookie, origin: 'http://localhost:3000' } });
+    const proxiedLogout = await fetch(`http://localhost:${dashboardPort}/api/logout`, { method: 'POST', headers: { cookie, origin: dashboardBaseUrl } });
       assert.equal(proxiedLogout.status, 204, 'Dashboard rewrite must forward logout');
       assert.match(proxiedLogout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
       assert.equal((await call('/me', cookie)).status, 401, 'A saved cookie must not survive logout');
@@ -185,8 +284,8 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.deepEqual(guilds.map(item => [item.botInstalled, item.botOnline]), [[true, true], [false, false], [true, false]]);
     assert.equal((await call(`/guilds/${guildB}/cases`, cookie)).status, 403);
     assert.equal((await call(`/guilds/${guildB}/config`, cookie)).status, 403);
-    const post = (path, body) => call(path, cookie, { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ ...body, csrf }) });
-    const put = (path, body) => call(path, cookie, { method: 'PUT', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ ...body, csrf }) });
+    const post = (path, body) => call(path, cookie, { method: 'POST', headers: { 'content-type': 'application/json', origin: dashboardBaseUrl }, body: JSON.stringify({ ...body, csrf }) });
+    const put = (path, body) => call(path, cookie, { method: 'PUT', headers: { 'content-type': 'application/json', origin: dashboardBaseUrl }, body: JSON.stringify({ ...body, csrf }) });
     const absent = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
     assert.equal(absent.botInstalled, false);
     assert.equal((await post(`/guilds/${guildC}/warnings`, { targetId, reason: 'offline' })).status, 503);
@@ -238,11 +337,36 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await post(`/guilds/${guildA}/warnings`, { targetId, reason: 'after disable' })).status, 400);
     assert.ok((await (await call(`/guilds/${guildA}/cases`, cookie)).json()).items.some(item => item.id === caseId));
     childEnv.MOCK_INSTALLATION_CHECK_STATUS = '200';
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    await writeFile(installationCounterFile, '');
     await stop(); await start();
-    const installed = await (await post(`/guilds/${guildB}/installation-check`, {})).json();
-    assert.equal(installed.botInstalled, true); assert.equal(installed.botOnline, false);
+    const secondMe = await call('/me', secondCookie);
+    assert.equal(secondMe.status, 200);
+    const secondCsrf = (await secondMe.json()).csrf;
+    const installationPost = (sessionCookie, sessionCsrf, headers = {}) => call(`/guilds/${guildB}/installation-check`, sessionCookie, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: dashboardBaseUrl, ...headers },
+      body: JSON.stringify({ csrf: sessionCsrf }),
+    });
+    for (let index = 0; index < 5; index++) {
+      assert.equal((await installationPost(cookie, csrf, { 'x-forwarded-for': `198.51.100.${index + 1}`, 'x-veyrobot-client-ip': `203.0.113.${index + 1}`, 'x-veyrobot-client-ip-signature': 'f'.repeat(64) })).status, 200);
+    }
+    const sixthFirstSession = await installationPost(cookie, csrf, { 'x-forwarded-for': '203.0.113.90', 'x-veyrobot-client-ip': '203.0.113.90', 'x-veyrobot-client-ip-signature': '0'.repeat(64) });
+    assert.equal(sixthFirstSession.status, 429, 'installation-check enforces five requests for the first valid session despite forged IP headers');
+    const secondSessionFirstCall = await installationPost(secondCookie, secondCsrf);
+    assert.equal(secondSessionFirstCall.status, 200, 'exhausting one session does not block another session on the same IP');
+    for (let index = 1; index < 5; index++) assert.equal((await installationPost(secondCookie, secondCsrf)).status, 200);
+    assert.equal((await installationPost(secondCookie, secondCsrf)).status, 429, 'the second valid session has its own five-request installation-check quota');
+    assert.equal((await call('/me', cookie)).status, 200, 'exhausting the route-specific quota does not exhaust the general session quota');
+    assert.equal((await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length, 10, 'only the ten allowed installation checks reach the Discord adapter');
     const otherGuildConfig = await (await call(`/guilds/${guildB}/config`, cookie)).json();
     assert.equal(otherGuildConfig.language, 'fr'); assert.equal(otherGuildConfig.embedColor, '#7775F5'); assert.equal(otherGuildConfig.warningsEnabled, false);
+    childEnv.MOCK_INSTALLATION_CHECK_STATUS = '429';
+    await stop(); await start();
+    const discordLimited = await post(`/guilds/${guildB}/installation-check`, {});
+    assert.equal(discordLimited.status, 503);
+    assert.equal(discordLimited.headers.get('retry-after'), '7', 'The direct bot-token Discord read must preserve Retry-After and avoid an automatic retry');
+    delete childEnv.MOCK_INSTALLATION_CHECK_STATUS;
     await stop(); await start();
     const persisted = await (await call(`/guilds/${guildA}/config`, cookie)).json();
     assert.equal(persisted.embedColor, '#ABCDEF'); assert.equal(persisted.timeZone, 'Europe/Paris'); assert.equal(persisted.language, 'en'); assert.equal(persisted.warningsEnabled, false); assert.equal(persisted.memberActionsEnabled, true); assert.equal(persisted.version, disabled.version);
@@ -253,23 +377,128 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal((await call('/me', cookie, { headers: { 'x-forwarded-for': '203.0.113.99' } })).status, 200);
     assert.equal((await call('/me', cookie, { headers: { 'x-forwarded-for': '192.0.2.42' } })).status, 429, 'Forged forwarding headers must not bypass the session limit');
     assert.equal((await call('/me', secondCookie, { headers: { 'x-forwarded-for': '198.51.100.1' } })).status, 200, 'A second session must have a separate rate limit bucket');
+    assert.equal((await call('/me', secondCookie)).status, 200);
+    assert.equal((await call('/me', secondCookie)).status, 429, 'The second valid session has its own complete quota');
     await stop(); delete childEnv.API_RATE_LIMIT_MAX; await start();
-    const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: 'http://localhost:3000' } });
+    const logout = await call('/logout', cookie, { method: 'POST', headers: { origin: dashboardBaseUrl } });
     assert.equal(logout.status, 204);
     assert.match(logout.headers.get('set-cookie') ?? '', /veyrobot_session=;/);
     assert.equal((await call('/me', cookie)).status, 401, 'A copied cookie must be revoked server-side');
+    const logoutSecond = await call('/logout', secondCookie, { method: 'POST', headers: { origin: dashboardBaseUrl } });
+    assert.equal(logoutSecond.status, 204);
     await stop(); await start();
     assert.equal((await call('/me', cookie)).status, 401, 'Revocation must survive API restart');
-    console.log('API integration passed: OAuth to user route, direct user and guild routes, proxied logout, outage and rate limit, guild isolation, restart persistence.');
+
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const revokedResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? secondCookie : cookie)));
+    assert.deepEqual(revokedResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'revoked sessions share the same anonymous IP quota under concurrent replay');
+    const installationCountBeforeRevokedReplay = (await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length;
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const revokedInstallChecks = await Promise.all(Array.from({ length: 8 }, (_, index) => installationPost(index % 2 ? secondCookie : cookie, csrf)));
+    assert.deepEqual(revokedInstallChecks.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'revoked cookies share the IP quota and cannot reach the installation adapter');
+    assert.equal((await readFile(installationCounterFile, 'utf8')).trim().split('\n').filter(Boolean).length, installationCountBeforeRevokedReplay, 'revoked session requests never call the Discord adapter');
+
+    await stop(); await start();
+    const publicOne = await call('/public-config', cookie);
+    const publicTwo = await call('/public-config', secondCookie);
+    const publicThree = await call('/public-config', cookie);
+    assert.deepEqual([publicOne.status, publicTwo.status, publicThree.status], [200, 200, 429], 'public routes use IP quota even when a stale authenticated cookie is present');
+
+    await stop(); await start();
+    const incompleteResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? secondStateCookie : stateCookie)));
+    assert.deepEqual(incompleteResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'OAuth state cookies without a complete session share the anonymous IP quota');
+
+    await stop(); childEnv.API_RATE_LIMIT_MAX = '90'; await start();
+    const createSessionCookie = async () => {
+      const startResponse = await call('/oauth/discord/start', undefined, { redirect: 'manual' });
+      const state = new URL(startResponse.headers.get('location')).searchParams.get('state');
+      const stateCookie = startResponse.headers.get('set-cookie').split(';', 1)[0];
+      const callbackResponse = await call(`/oauth/discord/callback?code=fixture&state=${state}`, stateCookie, { redirect: 'manual' });
+      assert.equal(callbackResponse.status, 302);
+      return callbackResponse.headers.get('set-cookie').split(';', 1)[0];
+    };
+    const grantsBeforeExpiry = new Set((await prisma.sessionGrant.findMany({ select: { idHash: true } })).map(grant => grant.idHash));
+    const expiredCookieA = await createSessionCookie();
+    const expiredCookieB = await createSessionCookie();
+    const newGrantHashes = (await prisma.sessionGrant.findMany({ select: { idHash: true } })).map(grant => grant.idHash).filter(hash => !grantsBeforeExpiry.has(hash));
+    assert.equal(newGrantHashes.length, 2);
+    await prisma.sessionGrant.updateMany({ where: { idHash: { in: newGrantHashes } }, data: { expiresAt: new Date(Date.now() - 1_000) } });
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const expiredResponses = await Promise.all(Array.from({ length: 8 }, (_, index) => call('/me', index % 2 ? expiredCookieB : expiredCookieA)));
+    assert.deepEqual(expiredResponses.map(response => response.status).sort((a, b) => a - b), [401, 401, 429, 429, 429, 429, 429, 429], 'expired sessions share the anonymous IP quota under concurrent replay');
+
+    childEnv.API_RATE_LIMIT_MAX = '2';
+    await stop();
+    await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant" RENAME TO "SessionGrant_unavailable_fixture"');
+    grantTableRenamed = true;
+    await start();
+    const grantFailureResponses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie)));
+    assert.deepEqual(grantFailureResponses.map(response => response.status).sort((a, b) => a - b), [429, 503, 503], 'grant lookup failures never grant a session bucket and remain bounded by the IP quota');
+    for (const response of grantFailureResponses.filter(item => item.status === 503)) {
+      const body = await response.json();
+      assert.equal(body.error, 'Vérification de session indisponible.');
+      assert.equal(body.requestId, response.headers.get('x-request-id'));
+      assert.doesNotMatch(body.error, /Prisma|postgres|fixture|connect|database|P100/i);
+    }
+    await delay(50);
+    const grantFailureLog = apiLogs.split(/\r?\n/).map(line => { try { return JSON.parse(line); } catch { return null; } })
+      .find(entry => entry?.phase === 'session_grant_validation' && entry?.requestId === grantFailureResponses.find(item => item.status === 503)?.headers.get('x-request-id'));
+    assert.ok(grantFailureLog, 'grant-validation store failure is logged with the correlated requestId');
+    assert.equal(grantFailureLog.code, 'SESSION_CHECK_UNAVAILABLE');
+    assert.equal(grantFailureLog.status, 503);
+    assert.equal(typeof grantFailureLog.exception.message, 'string');
+    assert.doesNotMatch(JSON.stringify(grantFailureLog), /fixture_local_only|fixture:|postgresql:\/\//i);
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
+    await stop(); await start();
+    const preAuthFailureStatuses = await Promise.all([expiredCookieA, expiredCookieB, expiredCookieA].map(cookie => call('/me', cookie).then(response => response.status)));
+    assert.deepEqual(preAuthFailureStatuses.sort((a, b) => a - b), [429, 503, 503], 'the pre-auth IP limit caps grant-store lookups when that relation is unavailable');
+    await stop();
+
+    await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');
+    grantTableRenamed = false;
+    childEnv.API_RATE_LIMIT_MAX = '90';
+    childEnv.API_PREAUTH_RATE_LIMIT_MAX = '2';
+    await start();
+    const preAuthStatuses = await Promise.all([call('/public-config'), call('/public-config'), call('/public-config')].map(response => response.then(value => value.status)));
+    assert.deepEqual(preAuthStatuses.sort((a, b) => a - b), [200, 200, 429], 'the bounded pre-auth IP quota applies to public routes');
+    if (process.env.RUN_DASHBOARD_BROWSER_INTEGRATION === '1') {
+      assert.equal(process.env.RUN_DASHBOARD_ROUTE_INTEGRATION, '1', 'browser journey requires the isolated Next/API route integration');
+      assert.ok(dashboardBaseUrl, 'built Next server must be available for browser journey');
+      childEnv.API_PREAUTH_RATE_LIMIT_MAX = '180';
+      childEnv.API_RATE_LIMIT_MAX = '500';
+      await stop(); await start();
+      await prisma.shardPresence.update({ where: { shardId: onlineShard }, data: { lastSeenAt: new Date() } });
+      if (dashboard && dashboard.exitCode === null) { dashboard.kill('SIGTERM'); await delay(350); }
+      const dashboardEntry = fileURLToPath(new URL('../../dashboard/node_modules/next/dist/bin/next', import.meta.url));
+      dashboard = spawn(process.execPath, [dashboardEntry, 'start', '-p', String(dashboardPort)], { env: { ...childEnv, API_INTERNAL_URL: base, DASHBOARD_TRUSTED_CLIENT_IP_HEADER: 'x-real-ip' }, cwd: fileURLToPath(new URL('../../dashboard/', import.meta.url)), stdio: 'ignore' });
+      let browserDashboardReady = false;
+      for (let attempt = 0; attempt < 150; attempt++) {
+        try { if ((await fetch(`${dashboardBaseUrl}/`)).ok) { browserDashboardReady = true; break; } } catch { /* wait for built Next */ }
+        await delay(100);
+      }
+      assert.equal(browserDashboardReady, true, 'built Next server must be ready before launching Chromium');
+      const browserCookie = await createSessionCookie();
+      const { runDashboardBrowserJourney } = await import('../../dashboard/tools/browser-journey.mjs');
+      browserWarningIds = await runDashboardBrowserJourney({ baseUrl: dashboardBaseUrl, sessionCookie: browserCookie, guildId: guildA, onWarningCreated: id => browserWarningIds.push(id) });
+      console.log('Dashboard browser integration passed: OAuth-backed session fixture, routes/history, keyboard settings, module save/reset, draft guards, simulated history 429 after warning writes, mobile layout, axe, focus and logout. Discord OAuth and guild data were simulated; no Discord mutation was sent.');
+    }
+    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
   } finally {
     await stop();
+    if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');
     if (caseId) await prisma.moderationCase.deleteMany({ where: { id: caseId } });
     if (actionCaseId) await prisma.moderationCase.deleteMany({ where: { id: actionCaseId } });
+    if (browserWarningIds.length) await prisma.moderationCase.deleteMany({ where: { id: { in: browserWarningIds } } });
     await prisma.configAudit.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildConfig.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.guildPresence.deleteMany({ where: { guildId: { in: [guildA, guildB, guildC] } } });
     await prisma.shardPresence.deleteMany({ where: { shardId: { in: [onlineShard, offlineShard] } } });
     await import('node:fs/promises').then(({ unlink }) => unlink(guildCounterFile).catch(() => undefined));
+    await import('node:fs/promises').then(({ unlink }) => unlink(installationCounterFile).catch(() => undefined));
     await prisma.$disconnect();
   }
 }
