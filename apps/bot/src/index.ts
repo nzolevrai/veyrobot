@@ -7,6 +7,8 @@ import { z } from 'zod';
 import { acquireSingleBotLease } from './single-instance.js';
 import { registerInteractionHandler } from './interactions.js';
 import { logBotError } from './error-log.js';
+import { readBotCacheCounts } from './resource-snapshot.js';
+import { destroyClientBeforeReleasingLease } from './shutdown-order.js';
 
 const lastErrorLogAt = new Map<string, number>();
 const errorTotals = new Map<string, number>();
@@ -64,7 +66,7 @@ const failProcess = (error: unknown, source: string) => {
   if (!fatalShutdown) fatalShutdown = (async () => {
     try {
       if (stopBot) await stopBot();
-      else { await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); }
+      else { await worker.close(); await queue.close(); await prisma.$disconnect(); await destroyClientBeforeReleasingLease(client, releaseBotLease); }
     } catch (shutdownError) { logThrottled('fatal-shutdown', 'Fatal shutdown cleanup failed', shutdownError); }
     process.exit(1);
   })();
@@ -141,12 +143,13 @@ client.once(Events.ClientReady, async ready => {
       usedMemoryBytes: redisInfoNumber(redisInfo, 'used_memory'), maxMemoryBytes: redisInfoNumber(redisInfo, 'maxmemory'),
       connectedClients: redisInfoNumber(redisInfo, 'connected_clients'), oomErrors: redisInfoNumber(redisInfo, 'errorstat_OOM', 'count'),
     }, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
-      errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
+      errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed,
+      externalBytes: memory.external, arrayBuffersBytes: memory.arrayBuffers, cacheCounts: readBotCacheCounts(client),
       eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, (_key, value) => typeof value === 'bigint' ? Number(value) : value));
     loopDelay.reset();
   })().catch(error => logThrottled('operational-metrics', 'Operational snapshot failed', error)); }, 60_000);
   metricsTimer.unref();
-  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); };
+  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); await destroyClientBeforeReleasingLease(client, releaseBotLease); };
   stopBot = shutdown;
   process.once('SIGINT', () => void shutdown()); process.once('SIGTERM', () => void shutdown());
 });
@@ -162,7 +165,7 @@ catch (error) {
   await worker.close().catch(() => undefined);
   await queue.close().catch(() => undefined);
   await prisma.$disconnect().catch(() => undefined);
-  await releaseBotLease();
+  await destroyClientBeforeReleasingLease(client, releaseBotLease);
   logBotError('bot_start_failed', 'discord_login', 'Discord client login failed', error);
   process.exitCode = 1;
 }

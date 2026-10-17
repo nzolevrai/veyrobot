@@ -19,7 +19,7 @@
 | F11 — Redis/BullMQ et migrations en CI | Corrigé | `.github/workflows/ci.yml`, suites d'intégration Redis/BullMQ et contrôle schéma/migrations | La CI utilise Redis/PostgreSQL jetables; elle ne prouve pas les caractéristiques d'un hébergement de production. |
 | F12 — Compose, ports et identité d'exécution | Corrigé pour la référence déclarative; déploiement non éprouvé | `deploy/compose.production.yaml`, tests/CI de configuration et `docs/PRODUCTION-REFERENCE.md` | Aucun service public provisionné; secret manager, TLS, stockage distant, alertes et exploitation réelle restent à configurer. |
 | F13 — CSP Next | Corrigé pour `script-src`; validation navigateur partielle | `apps/dashboard/proxy.ts`, layout dynamique et contrôle Chrome headless documenté dans `docs/ROADMAP.md` | `style-src 'unsafe-inline'` reste; revue visuelle desktop/mobile à effectuer. |
-| F14 — caches discord.js | Partiellement corrigé et mesuré | `apps/bot/src/index.ts`, fetch membres/bans ciblés sans cache; snapshots passifs décrits dans `docs/FOUNDATION-QUALITY-REVIEW-2026-10-15.md` | Petite population seulement; coût des caches par tailles de guildes non établi. |
+| F14 — mémoire et cycle de vie Gateway | Mesuré passivement; fermeture du Client attendue avant libération du verrou | `docs/F14-GATEWAY-MEMORY-2026-10-17.md`, instantanés agrégés dans `apps/bot/src/index.ts`, test d’ordre `apps/bot/test/shutdown-order.test.mjs` | 11 mesures au repos sur une guilde ne démontrent pas la croissance des caches par taille/activité ni une capacité. Pas de charge Gateway/REST ou mémoire cgroup sur hébergement. |
 
 ## Réserves ciblées ajoutées par les revues
 
