@@ -1,6 +1,6 @@
 # Registre unique des limites du socle — 15 octobre 2026
 
-État du code sur la branche `hardening/foundation-quality` (commit final à compléter après checks). Les constats historiques F1–F14 restent détaillés dans [le registre de correction](REVIEW-F1-F14-2026-10-15.md); cette liste consolide uniquement les limites encore ouvertes après ces corrections. Les preuves automatisées, les déclarations du propriétaire et les déploiements non testés sont séparés.
+État du code fonctionnel sur `hardening/foundation-quality`, commit `e2da88eea5c27661f68074a02c591ab8a19e1c11`. La synchronisation documentaire finale est suivie dans [la synthèse PR #3](PR-3-FINAL-REVIEW.md). Les constats historiques F1–F14 restent détaillés dans [le registre de correction](REVIEW-F1-F14-2026-10-15.md); cette liste consolide uniquement les limites encore ouvertes après ces corrections. Les preuves automatisées, les déclarations du propriétaire et les déploiements non testés sont séparés. La PR #3 est ouverte, prête pour revue et non fusionnée.
 
 | Sujet | Classe | État et preuve | Suite / condition |
 |---|---|---|---|
