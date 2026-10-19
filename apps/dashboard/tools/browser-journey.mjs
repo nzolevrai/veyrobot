@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import axe from 'axe-core';
-import { chromium } from 'playwright';
+import { chromium, firefox } from 'playwright';
 
 const captureDirectory = fileURLToPath(new URL('../../../docs/dashboard-browser-captures/', import.meta.url));
 
@@ -51,9 +51,12 @@ async function selectByKeyboard(page, label, direction, expectedText) {
   }, { accessibleName: label, text: expectedText });
 }
 
-export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guildId, onWarningCreated = () => {} }) {
-  await mkdir(captureDirectory, { recursive: true });
-  const browser = await chromium.launch({ headless: true, timeout: 15_000 });
+export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guildId, onWarningCreated = () => {}, browserEngine = 'chromium' }) {
+  const browserType = browserEngine === 'firefox' ? firefox : browserEngine === 'chromium' ? chromium : null;
+  assert.ok(browserType, `supported dashboard browser engine: ${browserEngine}`);
+  const captureScreenshots = browserEngine === 'chromium';
+  if (captureScreenshots) await mkdir(captureDirectory, { recursive: true });
+  const browser = await browserType.launch({ headless: true, timeout: 15_000 });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, reducedMotion: 'reduce' });
   const page = await context.newPage();
   page.setDefaultTimeout(10_000);
@@ -78,7 +81,7 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await page.goto(`${baseUrl}/dashboard/user`);
     await page.getByRole('heading', { name: 'Bienvenue sur le panel VeyroBot !' }).waitFor();
     await assertNoSeriousA11y(page, 'desktop user home');
-    await page.screenshot({ path: join(captureDirectory, 'desktop-user-home.png'), fullPage: true, animations: 'disabled' });
+    if (captureScreenshots) await page.screenshot({ path: join(captureDirectory, 'desktop-user-home.png'), fullPage: true, animations: 'disabled' });
 
     await page.goto(`${baseUrl}/dashboard/user/profil`);
     await page.getByRole('heading', { name: 'Profil' }).waitFor();
@@ -93,7 +96,9 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await assertNoHorizontalOverflow(page, '900px account profile');
     await page.setViewportSize({ width: 1440, height: 900 });
 
-    step('keyboard server navigation and Retry-After');
+    step(`keyboard account → server → settings navigation and Retry-After (${browserEngine})`);
+    await page.goto(`${baseUrl}/dashboard/user`);
+    await page.getByRole('heading', { name: 'Bienvenue sur le panel VeyroBot !' }).waitFor();
     const serverLink = page.getByRole('link', { name: /Test 1.*bot en ligne/ });
     await serverLink.focus();
     await page.getByRole('tooltip').filter({ hasText: 'Test 1' }).waitFor();
@@ -102,6 +107,11 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     assert.match(new URL(page.url()).pathname, new RegExp(`/dashboard/${guildId}/overview$`));
     await page.reload();
     await page.getByRole('heading', { name: 'Vue d’ensemble' }).waitFor();
+    const settingsLink = page.getByRole('navigation', { name: 'Pages principales' }).getByRole('link', { name: 'Paramètres' });
+    await settingsLink.focus();
+    await page.keyboard.press('Enter');
+    await page.getByRole('heading', { name: 'Paramètres' }).waitFor();
+    assert.match(new URL(page.url()).pathname, new RegExp(`/dashboard/${guildId}/settings$`), 'keyboard navigation from the selected server opens its settings');
     let guildReads = 0;
     await page.route('**/api/guilds', async route => {
       guildReads++;
@@ -124,7 +134,6 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await page.unroute('**/api/guilds');
 
     step('keyboard settings, color picker, save, reset and dirty navigation');
-    await page.goto(`${baseUrl}/dashboard/${guildId}/settings`);
     await page.getByRole('heading', { name: 'Paramètres' }).waitFor();
     const languageTrigger = page.getByRole('combobox', { name: 'Langue du serveur' });
     const savedLanguage = (await languageTrigger.innerText()).includes('English') ? 'English' : 'Français';
@@ -142,7 +151,7 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await page.keyboard.press('ArrowRight');
     assert.notEqual(await colorTrigger.innerText(), priorColor, 'color picker slider should respond to keyboard input');
     await assertNoSeriousA11y(page, 'desktop settings with color picker open');
-    await page.screenshot({ path: join(captureDirectory, 'desktop-settings-color-picker.png'), fullPage: true, animations: 'disabled' });
+    if (captureScreenshots) await page.screenshot({ path: join(captureDirectory, 'desktop-settings-color-picker.png'), fullPage: true, animations: 'disabled' });
     await page.keyboard.press('Escape');
     await page.locator('.color-popover').waitFor({ state: 'hidden' });
     await page.waitForFunction(() => document.activeElement?.classList.contains('color-trigger'));
@@ -254,7 +263,7 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     assert.equal(await page.getByRole('banner').getByRole('button', { name: 'Fermer la navigation' }).getAttribute('aria-expanded'), 'true');
     await page.getByRole('navigation', { name: 'Espace utilisateur' }).waitFor();
     await assertNoSeriousA11y(page, 'mobile user home with navigation open');
-    await page.screenshot({ path: join(captureDirectory, 'mobile-user-navigation.png'), fullPage: true, animations: 'disabled' });
+    if (captureScreenshots) await page.screenshot({ path: join(captureDirectory, 'mobile-user-navigation.png'), fullPage: true, animations: 'disabled' });
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Ouvrir la navigation' }).waitFor();
     assert.equal(await page.getByRole('banner').getByRole('button', { name: 'Ouvrir la navigation' }).evaluate(element => element === document.activeElement), true, 'closing the mobile navigation returns focus to its trigger');

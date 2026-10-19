@@ -480,11 +480,12 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
         try { if ((await fetch(`${dashboardBaseUrl}/`)).ok) { browserDashboardReady = true; break; } } catch { /* wait for built Next */ }
         await delay(100);
       }
-      assert.equal(browserDashboardReady, true, 'built Next server must be ready before launching Chromium');
+      assert.equal(browserDashboardReady, true, 'built Next server must be ready before launching a dashboard browser journey');
       const browserCookie = await createSessionCookie();
       const { runDashboardBrowserJourney } = await import('../../dashboard/tools/browser-journey.mjs');
-      browserWarningIds = await runDashboardBrowserJourney({ baseUrl: dashboardBaseUrl, sessionCookie: browserCookie, guildId: guildA, onWarningCreated: id => browserWarningIds.push(id) });
-      console.log('Dashboard browser integration passed: OAuth-backed session fixture, routes/history, keyboard settings, module save/reset, draft guards, simulated history 429 after warning writes, mobile layout, axe, focus and logout. Discord OAuth and guild data were simulated; no Discord mutation was sent.');
+      const browserEngine = process.env.DASHBOARD_BROWSER_ENGINE ?? 'chromium';
+      browserWarningIds = await runDashboardBrowserJourney({ baseUrl: dashboardBaseUrl, sessionCookie: browserCookie, guildId: guildA, onWarningCreated: id => browserWarningIds.push(id), browserEngine });
+      console.log(`Dashboard ${browserEngine} integration passed: OAuth-backed session fixture, routes/history, keyboard settings, module save/reset, draft guards, simulated history 429 after warning writes, mobile layout, axe, focus and logout. Discord OAuth and guild data were simulated; no Discord mutation was sent.`);
     }
     console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
   } finally {

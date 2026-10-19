@@ -50,8 +50,8 @@ jobs:
         shell: pwsh
         run: ./deploy/test-backup-postgres.ps1
       - run: pnpm install --frozen-lockfile
-      - name: Install Chromium for dashboard end-to-end tests
-        run: pnpm --filter @veyrobot/dashboard exec playwright install --with-deps chromium
+      - name: Install Chromium and Firefox for dashboard end-to-end tests
+        run: pnpm --filter @veyrobot/dashboard exec playwright install --with-deps chromium firefox
       - run: pnpm db:generate
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
@@ -79,6 +79,14 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           RUN_DASHBOARD_ROUTE_INTEGRATION: '1'
           RUN_DASHBOARD_BROWSER_INTEGRATION: '1'
+      - name: Run dashboard keyboard, focus and error journey in Firefox
+        run: pnpm exec node apps/api/test/integration.mjs
+        env:
+          DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
+          RUN_POSTGRES_INTEGRATION: '1'
+          RUN_DASHBOARD_ROUTE_INTEGRATION: '1'
+          RUN_DASHBOARD_BROWSER_INTEGRATION: '1'
+          DASHBOARD_BROWSER_ENGINE: firefox
       - name: Verify a real PostgreSQL 17 backup, restore and recovery gate
         run: node deploy/backup-restore.integration.mjs
       - name: Verify Redis refusals and OOM recovery with live production BullMQ clients

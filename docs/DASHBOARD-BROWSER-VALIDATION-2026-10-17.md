@@ -4,12 +4,12 @@
 
 Le parcours Playwright a utilisé Chromium réel contre le serveur Next.js construit et l’API locale, avec PostgreSQL 17 jetable. OAuth et les réponses Discord (profil et guildes) étaient simulés dans l’intégration. Les écritures d’avertissement ont été réellement insérées dans la base de test, puis nettoyées. Aucune requête de modération n’a été envoyée à Discord.
 
-Environnement : Node `24.21.0`, pnpm `10.18.3`, Next.js `16.4.0`, Playwright `1.62.1`, axe-core `4.14.0`, Chrome for Testing/Chromium `151.0.7922.34`, PostgreSQL `17`. Les captures utilisent Chromium à l’échelle 1 : bureau `1440×900`, mobile `390×844`; une vue de profil a également été vérifiée à `900×800`.
+Environnement : Node `24.21.0`, pnpm `10.18.3`, Next.js `16.4.0`, Playwright `1.62.1`, axe-core `4.14.0`, Chromium `151.0.7922.34`, Firefox `153.0` fourni par Playwright, PostgreSQL `17`. Les captures de référence utilisent Chromium à l’échelle 1 : bureau `1440×900`, mobile `390×844`; une vue de profil a également été vérifiée à `900×800`.
 
 ## Parcours vérifiés
 
 - Redirection d’un visiteur d’une route protégée; ouverture OAuth simulée; accès à l’accueil utilisateur et aux pages Profil par navigation directe, actualisation, précédent et suivant.
-- Navigation clavier depuis le compte vers un serveur; ouverture directe et actualisation de sa vue d’ensemble; infobulle de serveur au focus.
+- Navigation clavier compte → serveur → paramètres, noms accessibles des liens et commandes, ouverture directe et actualisation de la vue d’ensemble, infobulle de serveur au focus. Le même parcours automatisé s’exécute sous Chromium et Firefox.
 - Chargement de la liste de serveurs en erreur 429 simulée, respect de `Retry-After`, nouvelle tentative manuelle après le délai et conservation de la session.
 - Réglages de langue au clavier, contrôle de couleur au clavier, sauvegarde réelle en PostgreSQL, rechargement, réinitialisation d’un brouillon, puis confirmation d’abandon avant de changer de page.
 - Activation et sauvegarde du module Avertissements dans la base isolée. Un avertissement créé par le navigateur apparaît dans l’historique. Une seconde écriture réussit alors que la lecture suivante reçoit un 429 simulé; le succès est visible, l’ancien historique reste affiché, une seule écriture a lieu par clic et aucune nouvelle lecture automatique ne part pendant le délai.
@@ -28,7 +28,7 @@ $env:VEYROBOT_RECOVERY_EPOCH = '<epoch de test uniquement>'
 corepack pnpm exec node apps/api/test/integration.mjs
 ```
 
-En CI, le même parcours est lancé par `pnpm test` avec les services PostgreSQL/Redis isolés, après installation de Chromium par Playwright. Le flag navigateur exige le flag d’intégration API/Next; sans ces flags, il n’est pas exécuté.
+En CI, `pnpm test` lance le parcours Chromium avec PostgreSQL/Redis isolés. Une étape dédiée relance l’intégration API/Next et le parcours complet avec Firefox. Playwright installe Chromium et Firefox sur le runner; l’intégration utilise `DASHBOARD_BROWSER_ENGINE=firefox`. Le flag navigateur exige le flag d’intégration API/Next; sans ces flags, il n’est pas exécuté.
 
 ## Défauts reproduits et corrigés
 
@@ -37,12 +37,19 @@ En CI, le même parcours est lancé par `pnpm test` avec les services PostgreSQL
 - axe-core a relevé des contrastes insuffisants sur le bouton principal, les catégories et l’onglet actif, l’aperçu, les en-têtes et métadonnées du tableau ainsi que le compteur du formulaire. Les couleurs concernées utilisent maintenant des tons plus lisibles dans la palette existante. La couleur de fond de marque reste inchangée.
 - Le parcours E2E utilise des états d’attente déterministes et nettoie chaque dossier créé même si un test échoue.
 - La vérification du défilement `End` mobile lisait `window.scrollY` juste après l’envoi de la touche, sans attendre que le navigateur applique son déplacement. Le diagnostic Chromium a trouvé le focus sur `BODY` et le document comme conteneur réellement défilant (`HTML`: `scrollHeight=844`, `clientHeight=600`, `scrollTop=0`; `BODY`: `scrollHeight=844`, `clientHeight=844`). Dans le run local, `window.scrollY` est passé de `0` à `244` immédiatement après `End`; aucun défilement interne de panneau n’était impliqué. Le test attend maintenant, au maximum 1 seconde, la condition observable `window.scrollY > valeurAvant`, puis conserve une assertion avec focus, dimensions et positions dans son message d’échec. Le diagnostic local n’a pas observé de mouvement différé; les échecs CI étaient compatibles avec une lecture trop précoce, mais leurs traces ne permettent pas d’affirmer le délai exact sur ces runners. Une mutation temporaire qui empêchait le défaut clavier avec `preventDefault()` a bien fait échouer cette même assertion (`0→0`), confirmant qu’elle ne peut pas réussir sans défilement réel.
+- Le parcours compte → serveur → paramètres est maintenant exercé par clavier dans les deux moteurs. Sous Firefox, les sélecteurs Playwright basés sur rôles et noms accessibles couvrent les liens, combobox, interrupteur, commandes de reprise et boutons; axe-core s’exécute sur les états pertinents. L’intégration vérifie la conservation des dossiers après un 429 de lecture, l’absence de nouvelle écriture, le nom du dialogue, l’entrée du focus dans celui-ci et son retour après Échap ou Annuler. Le menu mobile et le sélecteur de couleur vérifient également leur état et le retour du focus.
 
 Les tests et corrections sont dans `apps/dashboard/tools/browser-journey.mjs`, `apps/api/test/integration.mjs`, `apps/dashboard/app/navigation.tsx`, `apps/dashboard/app/configuration.tsx` et `apps/dashboard/app/style.css`.
 
 ## Reproduction de la régression CI — 17 octobre 2026
 
 Les runs push `39050260256` et PR `39050263425` ont échoué au même contrôle après `End`. Le parcours complet a été rejoué avec Node `24.21.0`, pnpm `10.18.3`, Chromium/Playwright `1.62.1` et PostgreSQL `17` isolé. La nouvelle attente ne déclenche pas le défilement : elle attend uniquement la modification réelle de `window.scrollY` après la touche et est bornée à 1 seconde. Le parcours complet passe après la correction; l’expérience de mutation ci-dessus confirme que bloquer l’action clavier entraîne un échec explicite. Aucun changement de comportement du dashboard n’a été nécessaire.
+
+## Parcours Firefox et contrôle NVDA — 19 octobre 2026
+
+Le parcours Firefox a été exécuté localement avec Firefox `153.0` téléchargé dans un répertoire temporaire Playwright, Node `24.21.0`, Next.js construit et PostgreSQL 17 dans un conteneur jetable. Le parcours complet a réussi : compte → serveur → paramètres par clavier; noms accessibles utilisés par les rôles/noms Playwright; `Retry-After` simulé et données affichées conservées; menu mobile, sélecteur et confirmation; focus placé et rendu aux déclencheurs; déconnexion. L’API locale était réelle; OAuth et les réponses Discord étaient simulés. Aucun appel Discord réel ni aucune sanction n’ont eu lieu. Les captures canoniques restent celles de Chromium.
+
+NVDA n’est pas installé dans l’environnement vérifié (`PATH`, processus et emplacements standards utilisateur/système), et l’outil de contrôle ne permet pas d’observer une sortie vocale. **Aucune validation NVDA n’est revendiquée.** Contrôle manuel restant, sans action Discord : dans Firefox avec NVDA actif et Speech Viewer ouvert, utiliser une session de test locale; parcourir avec Tab/Entrée compte → serveur → paramètres et noter les noms/états annoncés; provoquer le 429 simulé de la liste ou de l’historique et vérifier que l’annonce décrit l’indisponibilité sans faire disparaître les données existantes; ouvrir puis fermer menu, sélecteur et confirmation par Échap/Annuler, et vérifier l’annonce du dialogue ainsi que le retour du focus au déclencheur. Aucun achat ou installation de NVDA n’a été effectué.
 
 ## Captures de contrôle
 
@@ -62,7 +69,7 @@ Les images sont des captures d’un jeu de test synthétique et peuvent être r�
 
 ## Limites
 
-- Le vrai moteur navigateur est Chromium; Firefox, WebKit, zoom navigateur, lecteurs d’écran et navigation manuelle exhaustive n’ont pas été testés ici. axe-core complète les contrôles interactifs mais ne les remplace pas.
+- Les moteurs automatisés sont Chromium et Firefox; WebKit, zoom navigateur et lecteurs d’écran (dont NVDA) ne sont pas validés. axe-core et les noms/rôles Playwright complètent les contrôles interactifs; ils ne prouvent pas la parole d’un lecteur d’écran.
 - Les 429 et les réponses OAuth/Discord sont des fixtures Playwright ou API; aucun 429 public réel ni OAuth Discord réel n’a été reproduit pendant cette tranche.
 - La base PostgreSQL est réelle mais jetable. Le bot/Gateway n’a pas été connecté et aucun résultat ne démontre un comportement Discord réel.
 - Les parcours manuels déjà rapportés par le propriétaire restent des validations séparées; ce rapport ne les revendique pas comme exécutions de l’agent.
