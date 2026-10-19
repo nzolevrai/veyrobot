@@ -358,3 +358,72 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await browser.close();
   }
 }
+
+export async function runDashboardNvdaManualSession({ baseUrl, sessionCookie, guildId, retainedCaseId }) {
+  const browser = await firefox.launch({ headless: false, timeout: 15_000 });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce' });
+  const page = await context.newPage();
+  page.setDefaultTimeout(10_000);
+  page.setDefaultNavigationTimeout(15_000);
+  const { name, value } = cookieParts(sessionCookie);
+  let historyReads = 0;
+  let simulated429Count = 0;
+  let forbiddenWrites = 0;
+
+  await context.addCookies([{ name, value, url: baseUrl, httpOnly: true, sameSite: 'Lax' }]);
+  await page.addInitScript(() => {
+    document.addEventListener('click', event => {
+      const button = (event.target instanceof Element ? event.target : null)?.closest('button');
+      if (button?.textContent?.trim() === 'Actualiser') window.__veyrobotNvda429Armed = true;
+    }, true);
+  });
+  await page.route(`**/api/guilds/${guildId}/cases*`, async route => {
+    historyReads++;
+    const manuallyArmed = await route.request().frame().evaluate(() => window.__veyrobotNvda429Armed === true);
+    if (!manuallyArmed) {
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, 'the manual 429 scenario begins with a real fixture history response');
+      const body = await response.json();
+      assert.ok(body.items.some(item => item.id === retainedCaseId), 'the isolated history fixture is present before the simulated failure');
+      await route.fulfill({ response });
+      return;
+    }
+    simulated429Count++;
+    await route.request().frame().evaluate(() => { window.__veyrobotNvda429Armed = false; });
+    await route.fulfill({
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '120', 'x-request-id': 'nvda-manual-history-429' },
+      body: JSON.stringify({ error: 'Limite simulée pour le contrôle NVDA.', requestId: 'nvda-manual-history-429', retryAfter: '120' }),
+    });
+    assert.equal(simulated429Count, 1, 'only the deliberate Actualiser click triggers the manual 429');
+    await page.getByRole('status').filter({ hasText: 'Historique temporairement impossible à actualiser' }).waitFor();
+    await page.getByText(retainedCaseId.slice(0, 8), { exact: true }).waitFor({ state: 'visible' });
+    assert.equal(await page.getByRole('button', { name: 'Attente de Retry-After…' }).isDisabled(), true, 'manual retry remains blocked during the fixture Retry-After');
+  });
+  for (const path of ['warnings', 'actions']) {
+    await page.route(`**/api/guilds/${guildId}/${path}`, async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      forbiddenWrites++;
+      await route.fulfill({ status: 405, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'Les écritures sont désactivées dans cette fixture.' }) });
+    });
+  }
+
+  try {
+    await page.goto(`${baseUrl}/dashboard/user`);
+    await page.getByRole('heading', { name: 'Bienvenue sur le panel VeyroBot !' }).waitFor();
+    console.log('\nFirefox est ouvert avec une session et des dossiers de test isolés. Aucune écriture Discord n’est possible.');
+    console.log('Dans NVDA Speech Viewer, effectue les trois contrôles du protocole, puis appuie sur Entrée dans ce terminal pour fermer la session de test.');
+    await new Promise(resolve => {
+      const finish = () => resolve();
+      process.stdin.once('data', finish);
+      process.stdin.resume();
+      browser.once('disconnected', finish);
+    });
+    assert.ok(historyReads >= 2, 'the manual scenario must load the existing record and then request the simulated 429 via Actualiser');
+    assert.equal(simulated429Count, 1, 'the deliberate manual refresh produced exactly one simulated 429');
+    assert.equal(forbiddenWrites, 0, 'manual accessibility checks must not submit a warning or moderation action');
+    console.log('Vérification fixture : le 429 simulé a été déclenché après le chargement du dossier; aucune écriture n’a été envoyée.');
+  } finally {
+    await browser.close();
+  }
+}

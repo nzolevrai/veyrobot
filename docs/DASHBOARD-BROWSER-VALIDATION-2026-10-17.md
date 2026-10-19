@@ -49,7 +49,31 @@ Les runs push `39050260256` et PR `39050263425` ont échoué au même contrôle 
 
 Le parcours Firefox a été exécuté localement avec Firefox `153.0` téléchargé dans un répertoire temporaire Playwright, Node `24.21.0`, Next.js construit et PostgreSQL 17 dans un conteneur jetable. Le parcours complet a réussi : compte → serveur → paramètres par clavier; noms accessibles utilisés par les rôles/noms Playwright; `Retry-After` simulé et données affichées conservées; menu mobile, sélecteur et confirmation; focus placé et rendu aux déclencheurs; déconnexion. L’API locale était réelle; OAuth et les réponses Discord étaient simulés. Aucun appel Discord réel ni aucune sanction n’ont eu lieu. Les captures canoniques restent celles de Chromium.
 
-NVDA n’est pas installé dans l’environnement vérifié (`PATH`, processus et emplacements standards utilisateur/système), et l’outil de contrôle ne permet pas d’observer une sortie vocale. **Aucune validation NVDA n’est revendiquée.** Contrôle manuel restant, sans action Discord : dans Firefox avec NVDA actif et Speech Viewer ouvert, utiliser une session de test locale; parcourir avec Tab/Entrée compte → serveur → paramètres et noter les noms/états annoncés; provoquer le 429 simulé de la liste ou de l’historique et vérifier que l’annonce décrit l’indisponibilité sans faire disparaître les données existantes; ouvrir puis fermer menu, sélecteur et confirmation par Échap/Annuler, et vérifier l’annonce du dialogue ainsi que le retour du focus au déclencheur. Aucun achat ou installation de NVDA n’a été effectué.
+NVDA n’est pas installé dans l’environnement d’exécution vérifié (`PATH`, processus et emplacements standards utilisateur/système). L’inventaire Computer Use du PC Windows ne retourne pas d’application ni de navigateur, donc cet environnement d’exécution ne permet pas de déterminer les installations du PC interactif de l’utilisateur. **Aucune validation NVDA n’est revendiquée.**
+
+Le contrôle manuel dispose maintenant d’un lanceur isolé, à exécuter depuis la racine du dépôt :
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\apps\dashboard\tools\run-nvda-manual.ps1
+```
+
+Il exige Docker, Node `24.17+`, pnpm `10.18.3` et le navigateur Firefox de Playwright en cache. Il démarre un conteneur PostgreSQL 17 unique, temporaire et lié seulement à `127.0.0.1`, applique les migrations, construit les applications et démarre l’intégration API/Next avec OAuth/Discord simulés. Une session et un dossier fictifs sont créés dans cette base. Firefox s’ouvre visiblement sur l’accueil du compte. Les POST d’avertissement et d’action sont bloqués par le navigateur de test; aucune connexion bot/Gateway ni action Discord ne peut partir. Dans la page Dossiers, le premier GET charge le dossier fixture depuis l’API; le bouton **Actualiser** déclenche le 429 simulé avec `Retry-After: 120`. Le harnais vérifie l’annonce d’erreur dans le DOM, la conservation du dossier, le bouton de nouvelle tentative désactivé et l’absence de POST. Appuyer sur Entrée dans le terminal lanceur ferme Firefox et supprime le conteneur jetable. Le script ne lit ni n’écrase le `.env` ou la base de développement.
+
+Si le cache Playwright Firefox est absent, l’installer dans le cache utilisateur, sans installation globale, puis relancer le lanceur :
+
+```powershell
+corepack pnpm --filter @veyrobot/dashboard exec playwright install firefox
+```
+
+Pour NVDA, utiliser la [page officielle de téléchargement NV Access](https://www.nvaccess.org/download/), démarrer NVDA et ouvrir **Tools → Speech Viewer**.
+
+### Protocole NVDA manuel
+
+1. À l’accueil compte, écouter au Speech Viewer en utilisant Tab puis Entrée sur le lien du serveur de test. Depuis le serveur, atteindre **Paramètres** dans **Pages principales**. Dans les réglages, parcourir **Langue du serveur** et le commutateur **Avertissements** sans les modifier ni sauvegarder; noter nom, rôle et état annoncés (la formulation exacte dépend de la version NVDA/Firefox).
+2. Ouvrir **Dossiers**. Vérifier qu’une ligne de dossier de test est présente, puis activer **Actualiser** une seule fois. Le Speech Viewer doit annoncer l’erreur temporaire de l’historique; la ligne déjà affichée doit rester présente et **Attente de Retry-After** être désactivé. Ne pas créer d’avertissement ni envoyer d’action.
+3. Dans Paramètres, ouvrir et fermer le menu de langue avec Échap; ouvrir et fermer le sélecteur de couleur avec Échap; vérifier que le focus revient à chaque déclencheur. Ouvrir **Actions membres**, saisir uniquement l’ID fictif `123456789012345678` (le placeholder du champ) et une raison de test, choisir BAN et ouvrir la confirmation. Vérifier l’annonce du dialogue et le retour du focus à **Envoyer la demande** après Échap ou **Annuler**. Ne jamais confirmer l’action; le harnais bloque aussi les requêtes POST.
+
+Après les trois contrôles, appuyer sur Entrée dans le terminal. Rapporter la version NVDA/Firefox et les annonces effectivement entendues. Ce résultat sera consigné comme validation manuelle rapportée, distincte des tests automatisés.
 
 ## Captures de contrôle
 
