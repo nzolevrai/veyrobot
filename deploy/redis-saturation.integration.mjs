@@ -257,7 +257,6 @@ try {
   await within('test guild setup', prisma.guildConfig.createMany({
     data: [activeGuildId, pendingGuildId].map(guildId => ({ guildId, updatedBy: actorId, memberActionsEnabled: true })),
   }), 10_000);
-  await createRequest(activeGuildId, activeTargetId, activeOperationId, 'Controlled active action during Redis saturation');
   port = await reserveLoopbackPort();
   oomVolume = `veyrobot-pressure-aof-${suffix.slice(0, 12)}`;
   docker(['volume', 'create', oomVolume]);
@@ -294,8 +293,6 @@ try {
   });
   worker.on('completed', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.completions++; });
   worker.on('error', error => workerErrors.push({ at: Date.now(), source: 'worker', name: error?.name ?? 'unknown' }));
-  await within('initial BullMQ job enqueue', queue.add('moderation-action', { guildId: activeGuildId, operationId: activeOperationId }, { jobId: activeOperationId, attempts: 1, removeOnComplete: true, removeOnFail: true }), 15_000);
-  await within('initial controlled Discord mutation gate', enteredGate, 15_000);
 
   let dispatcherQueryCount = 0;
   const dispatchStore = {
@@ -359,8 +356,19 @@ try {
   await runRecoveryScenario({ operationId: preExpiryOperationId, guildId: preExpiryGuildId, targetId: preExpiryTargetId, label: 'restart_before_lock_expiry', outageMs: 1_000, expectStalled: false });
   await runRecoveryScenario({ operationId: postExpiryOperationId, guildId: postExpiryGuildId, targetId: postExpiryTargetId, label: 'restart_after_lock_expiry', outageMs: 13_000, expectStalled: true });
 
-  // Add the durable backlog only after the live-client restart scenarios, so
-  // their dispatcher calls cannot publish the request before maxmemory refusal.
+  // Start the separate held action after the long stalled-recovery scenario.
+  // Otherwise that outage can expire this unrelated job's lease, redeliver it,
+  // and remove its Redis keys through the per-guild busy guard while the action
+  // is still held. This made the pressure setup depend on background cleanup.
+  const queueCountsBeforePressure = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed');
+  assert.deepEqual(queueCountsBeforePressure, { waiting: 0, active: 0, delayed: 0, failed: 0 }, 'both earlier restart scenarios are drained before the pressure scenario starts');
+  assert.equal(pendingKickCount, 0, 'no prior recovery scenario left work for the worker to consume');
+  await createRequest(activeGuildId, activeTargetId, activeOperationId, 'Controlled active action during Redis saturation');
+  await within('initial BullMQ job enqueue', queue.add('moderation-action', { guildId: activeGuildId, operationId: activeOperationId }, { jobId: activeOperationId, attempts: 1, removeOnComplete: true, removeOnFail: true }), 15_000);
+  await within('initial controlled Discord mutation gate', enteredGate, 15_000);
+  assert.equal(activeKickCount, 1, 'the only active worker is held inside the controlled Discord adapter before pressure is applied');
+  const queueCountsAfterPressureGate = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed');
+  assert.deepEqual(queueCountsAfterPressureGate, { waiting: 0, active: 1, delayed: 0, failed: 0 }, 'the held action remains the sole active job when pressure begins');
   await createRequest(pendingGuildId, pendingTargetId, pendingOperationId, 'Must remain durable while Redis refuses writes');
   expiryMarker = `pressure-marker-${suffix}`;
   await within('due expiry guild setup', prisma.guildConfig.create({ data: { guildId: expiryGuildId, updatedBy: actorId, memberActionsEnabled: true } }), 10_000);
@@ -387,26 +395,53 @@ try {
     }
   }
   assert.ok(largeChunkRejected, 'a 1 MiB write proves the isolated Redis 7 instance reached noeviction maxmemory');
-  const smallFiller = 'x'.repeat(1024);
   let smallChunkRejected = false;
-  for (let i = 40; i < 32_040; i++) {
-    const key = `pressure:filler:${i}`;
-    try { await rawRedis.command(['SET', key, smallFiller]); fillerKeys.push(key); }
-    catch (error) {
-      assert.match(error.message, /^OOM /, 'Redis rejects even a small write when effectively full');
+  let fillerIndex = 40;
+  // Refine the remaining headroom geometrically. The old 1 KiB loop could
+  // issue thousands of round trips, leaving a long window for background Redis
+  // key cleanup to change the free-memory boundary between the refusal probe
+  // and BullMQ publication. Small bounded stages keep that interval short; the
+  // explicit pre-publication probe and operation-attempt assertion make any
+  // remaining race fail as a synchronization error rather than pass silently.
+  for (const chunkSize of [64 * 1024, 4 * 1024, 256, 16, 1]) {
+    const smallFiller = 'x'.repeat(chunkSize);
+    let rejectedThisStage = false;
+    for (let attempt = 0; attempt < 64; attempt++, fillerIndex++) {
+      const key = `pressure:filler:${fillerIndex}`;
+      try { await rawRedis.command(['SET', key, smallFiller]); fillerKeys.push(key); }
+      catch (error) {
+        assert.match(error.message, /^OOM /, 'Redis rejects progressively smaller writes because maxmemory/noeviction is active');
+        rejectedThisStage = true;
+        break;
+      }
+    }
+    if (rejectedThisStage && chunkSize === 1) {
       smallChunkRejected = true;
       break;
     }
   }
-  assert.ok(smallChunkRejected, 'fine-grained filling leaves less than 1 KiB for a BullMQ write');
+  assert.ok(smallChunkRejected, 'a one-byte payload is refused at the final maxmemory boundary');
+  const heldJobBeforeDispatch = await queue.getJob(activeOperationId);
+  assert.equal(await heldJobBeforeDispatch?.getState(), 'active', 'the controlled in-flight job was not stalled or removed while Redis was filled');
+  assert.equal(activeKickCount, 1, 'the held Discord adapter remains in flight while Redis is filled');
   const oomRejectedWrites = 2;
   const firstFailureAt = Date.now();
-  await within('production dispatcher wake before maxmemory refusal', dispatch(), 15_000);
-  assert.equal(dispatchErrors.length, 1, 'a refused publish is diagnosed once');
-  assert.equal(dispatchErrors[0].key, 'moderation-queue-dispatch');
-  assert.match(dispatchErrors[0].message, /PostgreSQL request remains durable/);
-  assert.match(dispatchErrors[0].errorName, /Error/);
-  assert.match(dispatchErrors[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
+  const producer = await queue.getBackend().client;
+  assert.equal(producer.status, 'ready', 'the production BullMQ producer is connected immediately before the OOM publication attempt');
+  await assert.rejects(rawRedis.command(['SET', `pressure:pre-dispatch-probe:${suffix}`, 'x']), error => /^OOM /.test(error?.message ?? ''), 'Redis still refuses a fresh write immediately before invoking the dispatcher');
+  const attemptsBeforeRefusedPublish = dispatchAttempts.length;
+  const dispatchPromise = dispatch();
+  await within('production dispatcher wake before maxmemory refusal', dispatchPromise, 15_000);
+  const refusedPublishAttempt = dispatchAttempts.slice(attemptsBeforeRefusedPublish).find(attempt => attempt.operationId === pendingOperationId && attempt.kind === 'action');
+  assert.ok(refusedPublishAttempt, 'the production dispatcher selected the durable PostgreSQL request and entered BullMQ publication');
+  assert.ok(refusedPublishAttempt.queueAddStartedAt >= firstFailureAt, 'the selected request reached queue.add after the Redis OOM probes');
+  await until('diagnostic emitted after the selected BullMQ publication attempt settled', () => dispatchErrors.some(error => error.at >= refusedPublishAttempt.queueAddStartedAt), 5_000);
+  const refusedPublishDiagnostics = dispatchErrors.filter(error => error.at >= refusedPublishAttempt.queueAddStartedAt);
+  assert.equal(refusedPublishDiagnostics.length, 1, 'a refused publish is diagnosed once after the dispatcher attempt completes');
+  assert.equal(refusedPublishDiagnostics[0].key, 'moderation-queue-dispatch');
+  assert.match(refusedPublishDiagnostics[0].message, /PostgreSQL request remains durable/);
+  assert.match(refusedPublishDiagnostics[0].errorName, /Error/);
+  assert.match(refusedPublishDiagnostics[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
   assert.equal((await row(pendingOperationId)).status, 'requested', 'failed Redis enqueue does not lose accepted PostgreSQL work');
   assert.equal((await within('read due expiry after refused publication', prisma.moderationCase.findUnique({ where: { id: expiryCaseId } }), 10_000)).expiryStatus, 'scheduled', 'due expiry remains durable');
   assert.equal(activeKickCount, 1, 'the already active controlled Discord operation was not repeated');
