@@ -20,6 +20,15 @@ const { createDispatcher } = await import('../apps/bot/dist/dispatcher.js');
 const { createModerationWorker } = await import('../apps/bot/dist/worker.js');
 const suffix = randomUUID().replaceAll('-', '');
 const testStartedAt = Date.now();
+const mib = 1024 * 1024;
+const minimumPressureMarginBytes = 4 * mib;
+// Earlier runs observed up to 1.39 MiB variation in normal-client buffers.
+// Keep an 8 MiB preparation reserve (over 5x that observation) above the
+// required 4 MiB floor, instead of positioning maxmemory at that exact edge.
+const pressurePreparationReserveBytes = 8 * mib;
+const pressurePreparationTargetBytes = minimumPressureMarginBytes + pressurePreparationReserveBytes;
+const minimumPressureMaxMemoryBytes = 8 * mib;
+const maximumPressureAdjustments = 3;
 const container = `veyrobot-redis-pressure-${suffix.slice(0, 10)}`;
 const queueName = `veyrobot-pressure-${suffix.slice(0, 18)}`;
 const activeGuildId = snowflake();
@@ -240,6 +249,7 @@ async function logRedisPressureSnapshot(label) {
     allocatorAllocatedBytes: value('allocator_allocated'), normalClientBufferBytes: value('mem_clients_normal'),
     aofBufferBytes: value('mem_aof_buffer'),
     memoryHeadroomBytes: value('maxmemory') - value('used_memory'),
+    minimumPressureMarginBytes, pressurePreparationTargetBytes, pressurePreparationReserveBytes,
     databaseKeys,
     trackedFillerKeys: fillerKeys.length,
     nonFillerKeys: databaseKeys - fillerKeys.length,
@@ -471,23 +481,37 @@ try {
   assert.ok(smallChunkRejected, 'a one-byte payload is refused at the final maxmemory boundary');
   await logRedisPressureSnapshot('after_fill_refusal');
 
-  // A rejected one-byte SET only establishes a boundary condition: a key may
-  // expire between that command and Queue.add. Keep all filler keys, then lower
-  // the isolated noeviction ceiling by 4 MiB. This creates a measured margin
-  // larger than BullMQ's job publication and small BullMQ housekeeping changes.
+  // A rejected one-byte SET only establishes a boundary condition. Keep all
+  // filler keys, then lower the isolated noeviction ceiling to a measured
+  // preparation target: 4 MiB required minimum + 8 MiB reserve. This avoids
+  // placing the later BullMQ write at the exact threshold while keeping enough
+  // headroom for the observations made around normal client-buffer variation.
   const originalMemoryInfo = await rawRedis.command(['INFO', 'memory']);
   const originalMaxMemory = Number(originalMemoryInfo.match(/^maxmemory:(\d+)/m)?.[1]);
   assert.equal(originalMaxMemory, 24 * 1024 * 1024, 'the saturation phase starts with its documented 24 MiB noeviction ceiling');
-  const pressureMaxMemory = originalMaxMemory - 4 * 1024 * 1024;
-  assert.equal(await rawRedis.command(['CONFIG', 'SET', 'maxmemory', `${pressureMaxMemory}`]), 'OK', 'isolated Redis accepts the explicit pressure ceiling');
-  await logRedisPressureSnapshot('after_margin_ceiling');
-  const pressureInfo = await rawRedis.command(['INFO', 'memory']);
-  const pressureUsedMemoryAtCeiling = Number(pressureInfo.match(/^used_memory:(\d+)/m)?.[1]);
-  const pressureMaxMemoryObserved = Number(pressureInfo.match(/^maxmemory:(\d+)/m)?.[1]);
-  const pressureMarginBytesAtCeiling = pressureUsedMemoryAtCeiling - pressureMaxMemoryObserved;
-  assert.ok(pressureMarginBytesAtCeiling >= 4 * 1024 * 1024, `retained Redis data exceeds the noeviction ceiling by a wide margin (${pressureMarginBytesAtCeiling} bytes)`);
-  assert.equal(pressureMaxMemoryObserved, pressureMaxMemory, 'INFO confirms the isolated pressure ceiling actually changed');
-  const firstFailureAt = Date.now();
+  const usedMemoryBeforeAdjustment = Number(originalMemoryInfo.match(/^used_memory:(\d+)/m)?.[1]);
+  let pressureMaxMemoryObserved = originalMaxMemory;
+  let pressureUsedMemoryAtCeiling = usedMemoryBeforeAdjustment;
+  let pressureMarginBytesAtCeiling = pressureUsedMemoryAtCeiling - pressureMaxMemoryObserved;
+  const pressureAdjustmentLog = [];
+  await logRedisPressureSnapshot('before_pressure_ceiling_adjustment');
+  for (let adjustment = 1; adjustment <= maximumPressureAdjustments; adjustment++) {
+    if (pressureMarginBytesAtCeiling >= pressurePreparationTargetBytes) break;
+    const requestedMaxMemory = Math.max(minimumPressureMaxMemoryBytes, pressureUsedMemoryAtCeiling - pressurePreparationTargetBytes);
+    assert.ok(requestedMaxMemory < pressureMaxMemoryObserved, `bounded pressure adjustment ${adjustment} lowers the isolated noeviction ceiling`);
+    assert.equal(await rawRedis.command(['CONFIG', 'SET', 'maxmemory', `${requestedMaxMemory}`]), 'OK', `isolated Redis accepts bounded pressure adjustment ${adjustment}`);
+    const adjustmentInfo = await rawRedis.command(['INFO', 'memory']);
+    pressureUsedMemoryAtCeiling = Number(adjustmentInfo.match(/^used_memory:(\d+)/m)?.[1]);
+    pressureMaxMemoryObserved = Number(adjustmentInfo.match(/^maxmemory:(\d+)/m)?.[1]);
+    pressureMarginBytesAtCeiling = pressureUsedMemoryAtCeiling - pressureMaxMemoryObserved;
+    pressureAdjustmentLog.push({ adjustment, requestedMaxMemoryBytes: requestedMaxMemory, usedMemoryBytes: pressureUsedMemoryAtCeiling, observedMaxMemoryBytes: pressureMaxMemoryObserved, observedMarginBytes: pressureMarginBytesAtCeiling });
+    await logRedisPressureSnapshot(`pressure_ceiling_adjustment_${adjustment}`);
+  }
+  assert.ok(pressureMarginBytesAtCeiling >= pressurePreparationTargetBytes,
+    `bounded pressure preparation reaches target margin ${pressurePreparationTargetBytes} bytes (minimum ${minimumPressureMarginBytes}, reserve ${pressurePreparationReserveBytes}, observed ${pressureMarginBytesAtCeiling}; adjustments ${JSON.stringify(pressureAdjustmentLog)})`);
+  assert.ok(pressureMaxMemoryObserved >= minimumPressureMaxMemoryBytes, `isolated pressure ceiling remains above its explicit floor (${pressureMaxMemoryObserved} bytes)`);
+  console.info(JSON.stringify({ event: 'redis_pressure_prepared', minimumMarginBytes: minimumPressureMarginBytes, preparationTargetMarginBytes: pressurePreparationTargetBytes, reserveBytes: pressurePreparationReserveBytes, adjustmentCount: pressureAdjustmentLog.length, adjustments: pressureAdjustmentLog, usedMemoryBytes: pressureUsedMemoryAtCeiling, maxMemoryBytes: pressureMaxMemoryObserved, observedMarginBytes: pressureMarginBytesAtCeiling }));
+  const pressureProbeStartedAt = Date.now();
   await logRedisPressureSnapshot('immediately_before_publish_probe');
   const activeJobAtPressure = await queue.getJob(activeOperationId);
   assert.equal(await activeJobAtPressure?.getState(), 'active', 'the original controlled job remains active at the pressure boundary');
@@ -506,13 +530,13 @@ try {
   assert.match(preDispatchProbeError?.message ?? '', /^OOM /, 'Redis still refuses a fresh write immediately before invoking the dispatcher');
   const probeMemoryInfo = await rawRedis.command(['INFO', 'memory']);
   const probeMarginBytes = Number(probeMemoryInfo.match(/^used_memory:(\d+)/m)?.[1]) - Number(probeMemoryInfo.match(/^maxmemory:(\d+)/m)?.[1]);
-  assert.ok(probeMarginBytes >= 4 * 1024 * 1024, `the fresh-write probe occurs with at least 4 MiB of measured pressure (${probeMarginBytes} bytes)`);
+  assert.ok(probeMarginBytes >= minimumPressureMarginBytes, `the fresh-write probe occurs with the required minimum ${minimumPressureMarginBytes}-byte margin (${probeMarginBytes} bytes; preparation target ${pressurePreparationTargetBytes})`);
   const attemptsBeforeRefusedPublish = dispatchAttempts.length;
   const dispatchPromise = dispatch();
   await within('production dispatcher wake before maxmemory refusal', dispatchPromise, 15_000);
   const refusedPublishAttempt = dispatchAttempts.slice(attemptsBeforeRefusedPublish).find(attempt => attempt.operationId === pendingOperationId && attempt.kind === 'action');
   assert.ok(refusedPublishAttempt, 'the production dispatcher selected the durable PostgreSQL request and entered BullMQ publication');
-  assert.ok(refusedPublishAttempt.queueAddStartedAt >= firstFailureAt, 'the selected request reached queue.add after the Redis OOM probes');
+  assert.ok(refusedPublishAttempt.queueAddStartedAt >= pressureProbeStartedAt, 'the selected request reached queue.add after the Redis OOM probes');
   await until('diagnostic emitted after the selected BullMQ publication attempt settled', () => dispatchErrors.some(error => error.at >= refusedPublishAttempt.queueAddStartedAt), 5_000);
   const refusedPublishDiagnostics = dispatchErrors.filter(error => error.at >= refusedPublishAttempt.queueAddStartedAt);
   assert.equal(refusedPublishDiagnostics.length, 1, 'a refused publish is diagnosed once after the dispatcher attempt completes');
@@ -520,11 +544,12 @@ try {
   assert.match(refusedPublishDiagnostics[0].message, /PostgreSQL request remains durable/);
   assert.match(refusedPublishDiagnostics[0].errorName, /Error/);
   assert.match(refusedPublishDiagnostics[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
+  const dispatcherCooldownStartedAt = refusedPublishDiagnostics[0].at;
   const publishErrorInfo = await rawRedis.command(['INFO', 'memory']);
   const publishErrorUsedMemory = Number(publishErrorInfo.match(/^used_memory:(\d+)/m)?.[1]);
   const publishErrorMaxMemory = Number(publishErrorInfo.match(/^maxmemory:(\d+)/m)?.[1]);
   const publishErrorMarginBytes = publishErrorUsedMemory - publishErrorMaxMemory;
-  assert.ok(publishErrorMarginBytes >= 4 * 1024 * 1024, `the BullMQ OOM occurred while Redis remained at least 4 MiB above its noeviction ceiling (${publishErrorMarginBytes} bytes)`);
+  assert.ok(publishErrorMarginBytes >= minimumPressureMarginBytes, `the BullMQ OOM occurred with the required minimum ${minimumPressureMarginBytes}-byte margin (${publishErrorMarginBytes} bytes; preparation target ${pressurePreparationTargetBytes})`);
   assert.equal(await rawRedis.command(['CONFIG', 'SET', 'maxmemory', `${originalMaxMemory}`]), 'OK', 'restore the initial isolated Redis ceiling after the expected publication refusal');
   assert.equal((await row(pendingOperationId)).status, 'requested', 'failed Redis enqueue does not lose accepted PostgreSQL work');
   assert.equal((await within('read due expiry after refused publication', prisma.moderationCase.findUnique({ where: { id: expiryCaseId } }), 10_000)).expiryStatus, 'scheduled', 'due expiry remains durable');
@@ -542,9 +567,17 @@ try {
   kickRelease();
   await until('active action durable completion while Redis is saturated', async () => (await row(activeOperationId))?.status === 'succeeded');
   await clearFillerKeys();
-  const remainingBackoff = Math.max(0, firstFailureAt + 1_010 - Date.now());
+  // Anchor the wait to the observed refused-publication diagnostic. Starting
+  // it before dispatch begins can wake slightly before redisRetryAt and then
+  // leave the durable request idle because this test deliberately has no timer.
+  const retryDeadlineAt = dispatcherCooldownStartedAt + 1_000;
+  const remainingBackoff = Math.max(0, retryDeadlineAt - Date.now());
   if (remainingBackoff) await within('bounded dispatcher cooldown expiry', delay(remainingBackoff), 1_500);
-  await within('production dispatcher wake after Redis space is released', dispatch(), 15_000);
+  const recoveryAttemptsBefore = dispatchAttempts.length;
+  await until('production dispatcher publishes after observed cooldown and Redis recovery', async () => {
+    await within('dispatcher recovery poll', dispatch(), 5_000);
+    return dispatchAttempts.slice(recoveryAttemptsBefore).some(attempt => attempt.operationId === pendingOperationId && attempt.kind === 'action' && attempt.queueAddStartedAt >= retryDeadlineAt);
+  }, 10_000);
 
   await until('pending operation and due expiry to reconcile after Redis recovers', async () => {
     const [pending, expiry] = await Promise.all([
@@ -681,7 +714,7 @@ try {
     event: 'redis_saturation_integration_passed', elapsedMs: Date.now() - testStartedAt, redisVersion,
     pressureFillRefusals, preDispatchProbeRefused, bullMqPublishRefused: true,
     pressureUsedMemoryBytesAtCeiling: pressureUsedMemoryAtCeiling, pressureMaxMemoryBytes: pressureMaxMemoryObserved,
-    pressureMarginBytesAtCeiling, pressureUsedMemoryBytesAtPublishError: publishErrorUsedMemory, pressureMarginBytesAtPublishError: publishErrorMarginBytes,
+    pressureMarginBytesAtCeiling, pressurePreparationTargetBytes, pressurePreparationReserveBytes, minimumPressureMarginBytes, pressureAdjustmentCount: pressureAdjustmentLog.length, pressureUsedMemoryBytesAtPublishError: publishErrorUsedMemory, pressureMarginBytesAtPublishError: publishErrorMarginBytes,
     usedMemoryBytes, maxMemoryBytes,
     acceptedRows: 2, backpressureAndOomActions: activeKickCount + pendingKickCount, controlledRecoveryMutations: [...recoveryScenarios.values()].reduce((total, scenario) => total + scenario.mutations, 0) + oomKickCount, expiriesAfterRecovery: unbanCount,
     dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringCooldown, dispatcherErrorsDuringBackoff,
