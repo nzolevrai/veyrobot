@@ -53,7 +53,9 @@ export function createDispatcher(prisma: Store, queue: Queue, isReady: () => boo
       const expired = await prisma.moderationCase.findMany({ where: { action: 'TEMPBAN', status: 'succeeded', expiryStatus: 'scheduled', expiresAt: { lte: new Date() } }, orderBy: { expiresAt: 'asc' }, take: 100, select: { id: true, operationId: true, guildId: true } });
       for (const item of expired) {
         try {
-          onEnqueueAttempt?.({ operationId: item.operationId ?? `expiry-${item.id}`, guildId: item.guildId, kind: 'expiry', queueAddStartedAt: Date.now() });
+          // This callback pairs with worker telemetry's expiry-${caseId} key.
+          // Lifecycle logs below use the durable originating operationId.
+          onEnqueueAttempt?.({ operationId: `expiry-${item.id}`, guildId: item.guildId, kind: 'expiry', queueAddStartedAt: Date.now() });
           await queue.add('temporary-ban-expiry', { caseId: item.id, guildId: item.guildId }, { jobId: `tempban-${item.id}`, attempts: 3, priority: 10, removeOnComplete: true, removeOnFail: true });
           onLifecycleEvent?.({ ...(item.operationId ? { operationId: item.operationId } : {}), caseId: item.id, kind: 'expiry', phase: 'queue_publish', outcome: 'published' });
           redisBackoffMs = 1_000;

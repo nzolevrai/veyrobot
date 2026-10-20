@@ -16,6 +16,8 @@ Cette tranche part de `4d89e1c8174517b81bb830172a42ee2b090e0163` et ne met pas e
 
 Une erreur pendant l'écriture finale ne constitue pas une issue persistée. Le worker la journalise comme exception et issue `interrupted`; après expiration du bail, la réconciliation peut produire un événement `running` → `uncertain`. PostgreSQL reste la source de vérité, Redis/BullMQ le transport. L'absence d'un événement de publication ne prouve pas qu'une publication n'a pas eu lieu.
 
+Le callback interne de mesure d'attente BullMQ conserve pour une échéance sa clé synthétique `expiry-<caseId>`, afin de rester apparié à la télémétrie worker existante. Le journal de cycle de vie utilise séparément l'`operationId` source durable (et le `caseId`). Une vérification Redis/OOM a confirmé cette distinction; remplacer la clé de télémétrie par l'`operationId` faisait échouer le contrôle d'appariement sans améliorer les logs.
+
 Les logs ne consignent pas le motif complet, les cookies, tokens, secrets ou textes d'exception bruts. Les codes sont filtrés par l'assainisseur existant. Les journaux par opération ont une cardinalité élevée par nature; les métriques restent agrégées par catégorie/action/état.
 
 ## Incident reproductible
@@ -40,9 +42,9 @@ Le test de corrélation est dans `apps/api/test/integration.mjs`; il importe les
 
 Environnement : Node 24.21.0 sélectionné seulement pour ce terminal, pnpm 10.18.3, PostgreSQL 17 et Redis 7 démarrés dans des conteneurs jetables dédiés à `127.0.0.1`; migrations appliquées à une base vide. Aucun bot local ni dispatcher n'utilisait cette base.
 
-Vérifications réussies : `db:generate`, `db:migrate`, `typecheck`, `build`, `lint`, tests API/intégration (dont route Next construite), tests du package moderation avec toutes les intégrations PostgreSQL, et tests bot avec intégration Redis/BullMQ. Le test API a observé une seule mutation simulée, puis `uncertain` après l'incident et la réconciliation. Les canaris du message d'exception ne figurent pas dans la sortie finale des deux loggers.
+Vérifications réussies : `db:generate`, `db:migrate`, `typecheck`, `build`, `lint`, suite racine avec intégrations PostgreSQL/Redis/Next, et le test ciblé `deploy/redis-saturation.integration.mjs` sur Redis 7.4.11 et PostgreSQL 17 isolés. Ce dernier a terminé en 39,7 s; il a confirmé deux refus maxmemory, un OOMKilled séparé (64 MiB cgroup), reprise des mêmes clients BullMQ et aucune double mutation simulée. Le test API a observé une seule mutation simulée, puis `uncertain` après l'incident et la réconciliation. Les canaris du message d'exception ne figurent pas dans la sortie finale des deux loggers.
 
-Le test PostgreSQL concurrent d'admission produit une sortie Prisma d'échec de contrainte unique attendue par le test et passe; cette sortie n'est pas une fuite du scénario de corrélation. Les checks GitHub doivent être vérifiés séparément sur le SHA poussé.
+Une première exécution CI après la tranche a échoué dans cette intégration Redis : le callback de mesure d'attente utilisait `expiry-<caseId>` pour s'apparier à la clé worker, alors que la publication avait été modifiée pour fournir l'`operationId` durable. La clé synthétique est maintenant conservée uniquement dans ce callback interne, tandis que les journaux de cycle de vie portent l'`operationId` durable; la reproduction complète locale passe après correction. Le test PostgreSQL concurrent d'admission produit une sortie Prisma d'échec de contrainte unique attendue par le test et passe; cette sortie n'est pas une fuite du scénario de corrélation. La CI doit être recontrôlée sur le nouveau SHA poussé.
 
 ## Diagnostic opérateur
 
