@@ -18,7 +18,8 @@ globalThis.fetch = async (input, init) => {
     if (process.env.MOCK_GUILDS_COUNTER_FILE) appendFileSync(process.env.MOCK_GUILDS_COUNTER_FILE, 'request\n');
     const status = Number(process.env.MOCK_GUILDS_STATUS ?? 200);
     if (status !== 200) return Response.json({ message: 'Simulated Discord failure' }, { status, ...(status === 429 ? { headers: { 'retry-after': '2' } } : {}) });
-    return Response.json([process.env.TEST_GUILD_A, process.env.TEST_GUILD_B, process.env.TEST_GUILD_C].map((id, index) => ({ id, name: `Test ${index + 1}`, icon: null, owner: false, permissions: '1099511627812' })));
+    const ids = process.env.TEST_GUILD_IDS?.split(',').filter(Boolean) ?? [process.env.TEST_GUILD_A, process.env.TEST_GUILD_B, process.env.TEST_GUILD_C].filter(Boolean);
+    return Response.json(ids.map((id, index) => ({ id, name: `Test ${index + 1}`, icon: null, owner: false, permissions: '1099511627812' })));
   }
   if (path === `/guilds/${process.env.TEST_GUILD_B}`) {
     if (process.env.MOCK_INSTALLATION_COUNTER_FILE) appendFileSync(process.env.MOCK_INSTALLATION_COUNTER_FILE, 'request\n');

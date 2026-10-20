@@ -105,3 +105,10 @@ jobs:
         env:
           CI: 'true'
           RUN_PRODUCTION_RESOURCE_PROFILE: '1'
+      - name: Measure authenticated HTTP admission through production dispatcher and worker
+        run: node deploy/http-performance.integration.mjs
+        env:
+          CI: 'true'
+          DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
+          REDIS_URL: redis://127.0.0.1:6379
+          RUN_HTTP_PERFORMANCE_INTEGRATION: '1'
