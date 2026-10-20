@@ -68,6 +68,12 @@ jobs:
       - run: pnpm build
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
+      - name: Exercise production bot process Gateway reconnect and shutdown lifecycle
+        run: node deploy/bot-lifecycle.integration.mjs
+        timeout-minutes: 10
+        env:
+          RUN_BOT_LIFECYCLE_INTEGRATION: '1'
+          VEYROBOT_ISOLATED_INTEGRATION: '1'
       - run: pnpm lint
         env:
           DATABASE_URL: postgresql://veyrobot:veyrobot_local@localhost:5432/veyrobot?schema=public
