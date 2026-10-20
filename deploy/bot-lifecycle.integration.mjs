@@ -21,6 +21,8 @@ const dockerName = `vbot-lifecycle-redis-${suffix}`;
 const postgresContainerName = `vbot-lifecycle-pg-${suffix}`;
 let sourceUrl;
 let dbUrl;
+let phase = 'initialization';
+let lastPostgresDiagnostic;
 const inheritedRuntimeKeys = ['PATH', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'COREPACK_HOME', 'PNPM_HOME'];
 const testEnv = Object.fromEntries(inheritedRuntimeKeys.filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 testEnv.VEYROBOT_RECOVERY_EPOCH = epoch;
@@ -45,7 +47,7 @@ let gatewayConnectionsCreated = 0;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', timeout: 120_000, ...options });
-  if (result.error || result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed: ${result.error?.message ?? result.stderr?.slice(-2000) ?? result.status}`);
+  if (result.error || result.status !== 0) throw new Error(sanitizeDiagnosticText(`${command} ${args.join(' ')} failed: ${result.error?.message ?? result.stderr?.slice(-2000) ?? result.status}`));
   return result.stdout.trim();
 }
 function manager(args, options = {}) {
@@ -54,8 +56,30 @@ function manager(args, options = {}) {
 }
 function docker(args, allowFailure = false) {
   const result = spawnSync('docker', args, { cwd: root, encoding: 'utf8', timeout: 30_000 });
-  if (!allowFailure && (result.error || result.status !== 0)) throw new Error(`docker ${args.join(' ')} failed: ${result.error?.message ?? result.stderr?.slice(-1000)}`);
+  if (!allowFailure && (result.error || result.status !== 0)) throw new Error(sanitizeDiagnosticText(`docker ${args.join(' ')} failed: ${result.error?.message ?? result.stderr?.slice(-1000)}`));
   return result.stdout.trim();
+}
+function sanitizeDiagnosticText(value, maxLength = 5_000) {
+  let text = String(value);
+  for (const secret of [epoch, 'lifecycle-test-only', 'lifecycle-test-token', sourceUrl?.toString(), dbUrl?.toString()].filter(Boolean)) {
+    text = text.replaceAll(secret, '[REDACTED]');
+  }
+  return text
+    .replace(/postgres(?:ql)?:\/\/[^\s/@]+(?::[^\s/@]*)?@/gi, 'postgresql://[REDACTED]@')
+    .replace(/\b(password|client_secret|session_key)=([^\s&]+)/gi, '$1=[REDACTED]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(-maxLength);
+}
+function sanitizePostgresDiagnostic(error) {
+  const message = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error), 240);
+  const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : undefined;
+  return { name: error instanceof Error && error.name === 'Error' ? 'Error' : 'PostgresError', ...(code ? { code } : {}), message };
+}
+function containerFailureDiagnostics(containerId) {
+  if (!containerId) return 'not created';
+  const state = sanitizeDiagnosticText(docker(['inspect', '--format', '{{json .State}}', containerId], true), 1200);
+  const logs = sanitizeDiagnosticText(docker(['logs', '--tail', '80', containerId], true));
+  return JSON.stringify({ state, logs });
 }
 async function within(label, promise, timeoutMs = 15_000) {
   let timeout;
@@ -154,8 +178,11 @@ function redisClientCount() {
 }
 
 try {
+  phase = 'start_isolated_postgres_container';
   postgresContainerId = docker(['run', '-d', '--rm', '--name', postgresContainerName, '--memory=768m', '-e', 'POSTGRES_USER=veyrobot_test', '-e', 'POSTGRES_PASSWORD=lifecycle-test-only', '-e', 'POSTGRES_DB=veyrobot', '-p', '127.0.0.1::5432', 'postgres:17-alpine']);
+  phase = 'start_isolated_redis_container';
   redisContainerId = docker(['run', '-d', '--rm', '--name', dockerName, '--memory=256m', '-p', '127.0.0.1::6379', 'redis:7-alpine']);
+  phase = 'resolve_published_container_ports';
   const pgPortText = docker(['port', postgresContainerId, '5432/tcp']);
   const pgPort = Number(pgPortText.slice(pgPortText.lastIndexOf(':') + 1));
   const redisPortText = docker(['port', redisContainerId, '6379/tcp']);
@@ -167,21 +194,55 @@ try {
   dbUrl.pathname = `/${databaseName}`;
   testEnv.DATABASE_URL = dbUrl.toString();
   testEnv.REDIS_URL = `redis://127.0.0.1:${redisPort}`;
-  await until('isolated PostgreSQL 17 readiness', async () => docker(['exec', postgresContainerId, 'pg_isready', '-U', 'veyrobot_test', '-d', 'veyrobot'], true).includes('accepting connections'), 30_000);
+  phase = 'postgres_tcp_readiness_select_1';
+  const postgresReadyDeadline = Date.now() + 30_000;
+  while (Date.now() < postgresReadyDeadline) {
+    const probe = new PgClient({ connectionString: sourceUrl.toString(), connectionTimeoutMillis: 1_500, query_timeout: 2_000 });
+    let connected = false;
+    try {
+      await probe.connect();
+      connected = true;
+      const result = await probe.query('SELECT 1 AS ready');
+      if (result.rows[0]?.ready === 1) { lastPostgresDiagnostic = undefined; break; }
+      lastPostgresDiagnostic = { name: 'PostgresReadinessError', message: 'SELECT 1 returned an unexpected result.' };
+    } catch (error) {
+      lastPostgresDiagnostic = sanitizePostgresDiagnostic(error);
+    } finally {
+      if (connected) await probe.end().catch(error => { lastPostgresDiagnostic = sanitizePostgresDiagnostic(error); });
+      else await probe.end().catch(() => undefined);
+    }
+    if (Date.now() >= postgresReadyDeadline) {
+      throw new Error(`PostgreSQL TCP readiness failed at phase ${phase}; last error: ${JSON.stringify(lastPostgresDiagnostic ?? { message: 'no successful SELECT 1 observed' })}`);
+    }
+    await delay(250);
+  }
+  if (lastPostgresDiagnostic) throw new Error(`PostgreSQL TCP readiness did not complete at phase ${phase}; last error: ${JSON.stringify(lastPostgresDiagnostic)}`);
+  phase = 'redis_readiness';
   await until('isolated Redis 7 readiness', async () => docker(['exec', redisContainerId, 'redis-cli', 'PING'], true) === 'PONG', 20_000);
+  phase = 'postgres_admin_connection';
   const sourceClient = new PgClient({ connectionString: sourceUrl.toString() });
-  await sourceClient.connect();
-  await sourceClient.query(`CREATE DATABASE "${databaseName}"`);
-  isolatedDbCreated = true;
-  await sourceClient.end();
+  try {
+    await sourceClient.connect();
+    const probe = await sourceClient.query('SELECT 1 AS ready');
+    assert.equal(probe.rows[0]?.ready, 1, 'administrative connection uses the published TCP endpoint');
+    phase = 'create_isolated_database';
+    await sourceClient.query(`CREATE DATABASE "${databaseName}"`);
+    isolatedDbCreated = true;
+  } finally {
+    await sourceClient.end().catch(() => undefined);
+  }
+  phase = 'migrations';
   manager(['db:migrate'], { env: testEnv });
   process.env.DATABASE_URL = dbUrl.toString();
+  phase = 'recovery_gate_initialization';
   const { prisma, initializeRecoveryAuthorization } = await import('../apps/bot/node_modules/@veyrobot/db/dist/index.js');
   await initializeRecoveryAuthorization(prisma, epoch);
   await prisma.$disconnect();
 
+  phase = 'gateway_fixture_start';
   await listenGateway();
 
+  phase = 'launch_bot';
   const preload = new URL('../apps/bot/test/lifecycle-observer-preload.mjs', import.meta.url).pathname;
   bot = spawn(process.execPath, ['--import', preload, 'dist/index.js'], {
     cwd: `${root}/apps/bot`,
@@ -294,7 +355,9 @@ try {
     failureSnapshot = await requestChild({ type: 'bot-lifecycle-snapshot' }).catch(() => undefined);
   }
   bot?.kill('SIGKILL');
-  throw new Error(`${error instanceof Error ? error.stack : String(error)}\n--- gateway activity ---\n${JSON.stringify(gatewayActivity)}\n--- bot snapshot ---\n${JSON.stringify(failureSnapshot)}\n--- lifecycle diagnostics ---\n${JSON.stringify(lifecycleDiagnostics)}\n--- bot stdout ---\n${stdout.slice(-4000)}\n--- bot stderr ---\n${stderr.slice(-4000)}`);
+  const postgresFailureDiagnostics = containerFailureDiagnostics(postgresContainerId);
+  const redisFailureDiagnostics = containerFailureDiagnostics(redisContainerId);
+  throw new Error(`phase=${phase}\n${sanitizeDiagnosticText(error instanceof Error ? error.stack : String(error), 4_000)}\n--- postgres container before cleanup ---\n${postgresFailureDiagnostics}\n--- redis container before cleanup ---\n${redisFailureDiagnostics}\n--- last sanitized postgres diagnostic ---\n${JSON.stringify(lastPostgresDiagnostic)}\n--- gateway activity ---\n${JSON.stringify(gatewayActivity)}\n--- bot snapshot ---\n${JSON.stringify(failureSnapshot)}\n--- lifecycle diagnostics ---\n${JSON.stringify(lifecycleDiagnostics)}\n--- bot stdout ---\n${sanitizeDiagnosticText(stdout, 4_000)}\n--- bot stderr ---\n${sanitizeDiagnosticText(stderr, 4_000)}`);
 } finally {
   if (bot && bot.exitCode === null) { bot.kill('SIGKILL'); await new Promise(resolve => bot.once('exit', resolve)); }
   await closeGateway().catch(() => undefined);
