@@ -85,6 +85,15 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           RUN_DASHBOARD_ROUTE_INTEGRATION: '1'
           RUN_DASHBOARD_BROWSER_INTEGRATION: '1'
+          DASHBOARD_DIAGNOSTIC_DIR: ${{ runner.temp }}/veyrobot-dashboard-diagnostics
+      - name: Upload sanitized dashboard browser diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-browser-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/veyrobot-dashboard-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Run dashboard keyboard, focus and error journey in Firefox
         run: pnpm exec node apps/api/test/integration.mjs
         env:

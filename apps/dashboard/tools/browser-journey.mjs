@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import axe from 'axe-core';
@@ -49,6 +50,65 @@ async function selectByKeyboard(page, label, direction, expectedText) {
     const control = [...document.querySelectorAll('button')].find(button => button.getAttribute('aria-label') === accessibleName);
     return Boolean(control?.innerText.includes(text));
   }, { accessibleName: label, text: expectedText });
+}
+
+async function colorPickerState(page) {
+  return page.evaluate(() => {
+    const visible = element => Boolean(element && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
+    const active = document.activeElement;
+    const language = document.querySelector('[role="combobox"][aria-label="Langue du serveur"]');
+    const colorTrigger = document.querySelector('.color-trigger');
+    const selectContent = document.querySelector('.select-content');
+    const popover = document.querySelector('.color-popover');
+    const slider = document.querySelector('[role="slider"][aria-label="Saturation et luminosité"]');
+    const activeLabel = active?.getAttribute('aria-label');
+    const safeActiveLabel = activeLabel === 'Langue du serveur' || activeLabel === 'Saturation et luminosité'
+      ? activeLabel
+      : activeLabel?.startsWith('Choisir la couleur des embeds') ? 'Choisir la couleur des embeds' : activeLabel ? '<other>' : null;
+    const activeClass = typeof active?.className === 'string' ? active.className.split(/\s+/).find(value => ['custom-select', 'color-trigger', 'color-plane', 'color-preset'].includes(value)) ?? '<other>' : null;
+    return {
+      readyState: document.readyState,
+      activeElement: active ? {
+        tag: active.tagName,
+        role: active.getAttribute('role'),
+        label: safeActiveLabel,
+        className: activeClass,
+      } : null,
+      languageMenu: {
+        triggerExists: Boolean(language),
+        triggerExpanded: language?.getAttribute('aria-expanded') ?? null,
+        contentExists: Boolean(selectContent),
+        contentVisible: visible(selectContent),
+      },
+      colorTrigger: {
+        exists: Boolean(colorTrigger),
+        visible: visible(colorTrigger),
+        enabled: colorTrigger instanceof HTMLButtonElement && !colorTrigger.disabled,
+        focused: colorTrigger === active,
+      },
+      colorPopover: {
+        exists: Boolean(popover),
+        visible: visible(popover),
+        sliderExists: Boolean(slider),
+        sliderVisible: visible(slider),
+      },
+    };
+  });
+}
+
+async function recordColorPickerFailure(page, stages, error) {
+  const state = await colorPickerState(page).catch(() => ({ stateReadFailed: true }));
+  const diagnostic = { event: 'dashboard_color_picker_failure', error: error instanceof Error ? error.name : 'unknown', stages, finalState: state };
+  console.error(JSON.stringify(diagnostic));
+  const directory = process.env.DASHBOARD_DIAGNOSTIC_DIR ?? join(tmpdir(), 'veyrobot-dashboard-diagnostics');
+  const fileBase = `color-picker-${process.pid}-${Date.now()}`;
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, `${fileBase}.json`), `${JSON.stringify(diagnostic, null, 2)}\n`);
+    await page.screenshot({ path: join(directory, `${fileBase}.png`), fullPage: false, animations: 'disabled' });
+  } catch (diagnosticError) {
+    console.error(JSON.stringify({ event: 'dashboard_color_picker_diagnostic_capture_failed', error: diagnosticError instanceof Error ? diagnosticError.name : 'unknown' }));
+  }
 }
 
 export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guildId, onWarningCreated = () => {}, browserEngine = 'chromium' }) {
@@ -142,11 +202,33 @@ export async function runDashboardBrowserJourney({ baseUrl, sessionCookie, guild
     await selectByKeyboard(page, 'Langue du serveur', changedLanguageDirection, changedLanguage);
     await page.getByText('Attention, vous avez des modifications non enregistrées !').waitFor();
 
+    const colorPickerStages = [];
+    const recordColorPickerStage = async stage => {
+      const state = await colorPickerState(page);
+      colorPickerStages.push({ stage, ...state });
+      console.info(JSON.stringify({ event: 'dashboard_color_picker_state', stage, ...state }));
+      return state;
+    };
     const colorTrigger = page.getByRole('button', { name: /Choisir la couleur des embeds/ });
-    await colorTrigger.focus();
-    await page.keyboard.press('Enter');
-    const slider = page.getByRole('slider', { name: 'Saturation et luminosité' });
-    await slider.focus();
+    try {
+      await recordColorPickerStage('after_language_selection');
+      await colorTrigger.waitFor({ state: 'visible' });
+      assert.equal(await colorTrigger.isEnabled(), true, 'color picker trigger is enabled after settings become interactive');
+      await colorTrigger.focus();
+      await recordColorPickerStage('before_enter');
+      await page.keyboard.press('Enter');
+      await recordColorPickerStage('immediately_after_enter');
+      const popover = page.locator('.color-popover');
+      await popover.waitFor({ state: 'visible', timeout: 3_000 });
+      await recordColorPickerStage('popover_visible');
+      const slider = page.getByRole('slider', { name: 'Saturation et luminosité' });
+      await slider.waitFor({ state: 'visible' });
+      await slider.focus();
+      await recordColorPickerStage('slider_focused');
+    } catch (error) {
+      await recordColorPickerFailure(page, colorPickerStages, error);
+      throw error;
+    }
     const priorColor = await colorTrigger.innerText();
     await page.keyboard.press('ArrowRight');
     assert.notEqual(await colorTrigger.innerText(), priorColor, 'color picker slider should respond to keyboard input');
