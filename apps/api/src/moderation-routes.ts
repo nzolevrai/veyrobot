@@ -36,6 +36,7 @@ app.post<{ Params: { guildId: string }; Body: unknown }>('/guilds/:guildId/actio
     if (!await isBotOnlineInGuild(req.params.guildId)) return reply.code(503).send({ error: 'Le bot est installé mais temporairement hors ligne. Réessayez après son retour.' });
     const item = await withModerationAdmission(prisma, req.params.guildId, input.operationId, tx => submitModerationAction(tx, { guildId: req.params.guildId, actorId: s.user.id, targetId: input.targetId, action: input.action, reason: input.reason, ...(input.durationMinutes === undefined ? {} : { durationMinutes: input.durationMinutes }), ...(input.channelId === undefined ? {} : { channelId: input.channelId }), ...(input.filterAuthorId === undefined ? {} : { filterAuthorId: input.filterAuthorId }), ...(input.requestedCount === undefined ? {} : { requestedCount: input.requestedCount }), ...(input.rateLimitSeconds === undefined ? {} : { rateLimitSeconds: input.rateLimitSeconds }), operationId: input.operationId }));
     admissionTotals.accepted++;
+    req.log.info({ event: 'moderation_admitted', requestId: req.id, operationId: item.operationId, phase: 'postgres_admission' }, 'Moderation request durably admitted');
     return reply.code(202).send(item);
   } catch (e) { if ((e as { code?: string }).code === 'MODERATION_BACKLOG_LIMIT') admissionTotals.refused++; return sendError(req, reply, e); }
 });

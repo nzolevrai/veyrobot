@@ -102,15 +102,17 @@ type ExecutionStore = LockStore & {
   $transaction?: (fn: (tx: ExecutionStore) => Promise<void>) => Promise<void>;
 };
 
+export type ModerationExecutionOutcome = 'succeeded' | 'failed' | 'uncertain' | 'not_claimed' | 'lease_lost' | 'completion_conflict';
+
 export async function executeModerationAction(input: {
   operationId: string; guild: Guild; caseRecord: ModerationCase;
   store: ExecutionStore;
-}): Promise<void> {
+}): Promise<ModerationExecutionOutcome> {
   const { caseRecord, guild, store } = input;
   const claimToken = crypto.randomUUID();
   const leaseUntil = () => new Date(Date.now() + 120_000);
   const claimed = await store.moderationCase.updateMany({ where: { id: caseRecord.id, status: 'requested' }, data: { status: 'running', startedAt: new Date(), claimToken, claimLeaseUntil: leaseUntil(), executionPhase: 'preparing' } });
-  if (claimed.count !== 1) return;
+  if (claimed.count !== 1) return 'not_claimed';
   let leaseLost = false;
   let heartbeat: Promise<void> | undefined;
   const renew = async () => {
@@ -196,7 +198,7 @@ export async function executeModerationAction(input: {
     clearInterval(interval);
     await heartbeat;
   }
-  if (!finalStatus || leaseLost) return;
+  if (!finalStatus || leaseLost) return 'lease_lost';
   const where = { id: caseRecord.id, status: 'running', claimToken, claimLeaseUntil: { gt: new Date() } };
   const data = { status: finalStatus, completedAt: new Date(), result: finalResult, ...finalExpiryData };
   const banAction = caseRecord.action === 'BAN' || caseRecord.action === 'TEMPBAN' || caseRecord.action === 'UNBAN';
@@ -223,21 +225,27 @@ export async function executeModerationAction(input: {
         }
       }
     });
-  } else await store.moderationCase.updateMany({ where, data });
+  } else {
+    const completed = await store.moderationCase.updateMany({ where, data });
+    if (completed.count !== 1) return 'completion_conflict';
+  }
+  return finalStatus as 'succeeded' | 'failed' | 'uncertain';
 }
 
 function actionFor(record: ModerationCase): ModerationAction { return record.action as ModerationAction; }
 
+export type TemporaryBanExpiryOutcome = 'succeeded' | 'failed' | 'uncertain' | 'superseded' | 'deferred' | 'not_due' | 'not_claimed' | 'lease_lost';
+
 export async function expireTemporaryBan(input: {
   guild: Guild; caseRecord: ModerationCase;
   store: ExecutionStore;
-}): Promise<void> {
+}): Promise<TemporaryBanExpiryOutcome> {
   const { guild, caseRecord, store } = input;
-  if (caseRecord.action !== 'TEMPBAN' || !caseRecord.expiresAt || caseRecord.expiresAt > new Date() || !caseRecord.banMarker) return;
+  if (caseRecord.action !== 'TEMPBAN' || !caseRecord.expiresAt || caseRecord.expiresAt > new Date() || !caseRecord.banMarker) return 'not_due';
   const expiryClaimToken = crypto.randomUUID();
   const leaseUntil = () => new Date(Date.now() + 120_000);
   const claim = await store.moderationCase.updateMany({ where: { id: caseRecord.id, status: 'succeeded', expiryStatus: 'scheduled', expiresAt: { lte: new Date() } }, data: { expiryStatus: 'running', expiryStartedAt: new Date(), expiryClaimToken, expiryLeaseUntil: leaseUntil() } });
-  if (claim.count !== 1) return;
+  if (claim.count !== 1) return 'not_claimed';
   let leaseLost = false;
   let heartbeat: Promise<void> | undefined;
   const renew = async () => {
@@ -276,7 +284,7 @@ export async function expireTemporaryBan(input: {
           where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } },
           data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Une décision plus récente est en cours; échéance réévaluée après sa conclusion.' },
         });
-        return;
+        return 'deferred';
       }
     }
     if (!ban.reason?.includes(`[${caseRecord.banMarker}]`)) {
@@ -299,7 +307,7 @@ export async function expireTemporaryBan(input: {
           where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } },
           data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Une décision plus récente est arrivée avant le déban; échéance réévaluée après sa conclusion.' },
         });
-        return;
+        return 'deferred';
       }
       if (latest?.some(row => row.status === 'succeeded')) throw new ExpiryTerminal('uncertain', 'Une nouvelle décision réussie ne correspond pas à la génération appliquée; réconciliation humaine requise.');
     }
@@ -316,12 +324,74 @@ export async function expireTemporaryBan(input: {
     clearInterval(interval);
     await heartbeat;
   }
-  if (finalExpiryStatus && !leaseLost) await store.moderationCase.updateMany({ where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } }, data: { expiryStatus: finalExpiryStatus, ...(unbannedAt ? { unbannedAt } : {}), expiryResult: finalExpiryResult } });
+  if (!finalExpiryStatus) return 'lease_lost';
+  if (leaseLost) return 'lease_lost';
+  const completed = await store.moderationCase.updateMany({ where: { id: caseRecord.id, expiryStatus: 'running', expiryClaimToken, expiryLeaseUntil: { gt: new Date() } }, data: { expiryStatus: finalExpiryStatus, ...(unbannedAt ? { unbannedAt } : {}), expiryResult: finalExpiryResult } });
+  if (completed.count !== 1) return 'lease_lost';
+  return finalExpiryStatus as Exclude<TemporaryBanExpiryOutcome, 'deferred' | 'not_due' | 'not_claimed' | 'lease_lost'>;
 }
 
-export async function markInterruptedOperationsUncertain(store: { moderationCase: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<unknown> } }, now = new Date()): Promise<void> {
-  await store.moderationCase.updateMany({ where: { status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'preparing' }, data: { status: 'failed', completedAt: now, result: 'Le bail a expiré avant tout appel Discord. Aucune sanction n’a été envoyée; une nouvelle demande explicite est possible.' } });
-  await store.moderationCase.updateMany({ where: { status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'discord_request_inflight' }, data: { status: 'uncertain', completedAt: now, result: 'Le processus s’est arrêté pendant l’appel Discord. Vérifiez l’état Discord; aucune nouvelle tentative automatique ne sera lancée.' } });
-  await store.moderationCase.updateMany({ where: { action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, expiryResult: 'discord_request_inflight' }, data: { expiryStatus: 'uncertain', expiryResult: 'Le processus s’est arrêté pendant le débannissement. Vérifiez le ban Discord; aucune nouvelle tentative automatique ne sera lancée.' } });
-  await store.moderationCase.updateMany({ where: { action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, NOT: { expiryResult: 'discord_request_inflight' } }, data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Reprise après interruption avant appel Discord.' } });
+export type InterruptedOperationTransition = {
+  operationId: string | null;
+  caseId: string;
+  kind: 'action' | 'expiry';
+  from: 'running';
+  to: 'failed' | 'uncertain' | 'scheduled';
+  phase: 'preparing' | 'discord_request_inflight' | 'before_discord_request';
+};
+
+export async function markInterruptedOperationsUncertain(store: { moderationCase: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<unknown> } }, now = new Date()): Promise<InterruptedOperationTransition[]> {
+  const delegate = store.moderationCase as unknown as {
+    findMany?: (args: { where: Record<string, unknown>; select: Record<string, boolean> }) => Promise<Array<{
+      id: string; operationId: string | null; action: string; status: string; claimLeaseUntil: Date | null; executionPhase: string | null;
+      expiryStatus: string | null; expiryLeaseUntil: Date | null; expiryResult: string | null;
+    }>>;
+    updateMany: (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => Promise<unknown>;
+  };
+  if (!delegate.findMany) {
+    await store.moderationCase.updateMany({ where: { status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'preparing' }, data: { status: 'failed', completedAt: now, result: 'Le bail a expiré avant tout appel Discord. Aucune sanction n’a été envoyée; une nouvelle demande explicite est possible.' } });
+    await store.moderationCase.updateMany({ where: { status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'discord_request_inflight' }, data: { status: 'uncertain', completedAt: now, result: 'Le processus s’est arrêté pendant l’appel Discord. Vérifiez l’état Discord; aucune nouvelle tentative automatique ne sera lancée.' } });
+    await store.moderationCase.updateMany({ where: { action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, expiryResult: 'discord_request_inflight' }, data: { expiryStatus: 'uncertain', expiryResult: 'Le processus s’est arrêté pendant le débannissement. Vérifiez le ban Discord; aucune nouvelle tentative automatique ne sera lancée.' } });
+    await store.moderationCase.updateMany({ where: { action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, NOT: { expiryResult: 'discord_request_inflight' } }, data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Reprise après interruption avant appel Discord.' } });
+    return [];
+  }
+
+  // Only stale active claims are selected. Usually this is empty; after a process
+  // interruption it is bounded by worker concurrency. Update each candidate
+  // conditionally so the returned IDs are the rows this reconciler actually won.
+  const stale = await delegate.findMany({
+    where: { OR: [
+      { status: 'running', claimLeaseUntil: { lt: now } },
+      { action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now } },
+    ] },
+    select: { id: true, operationId: true, action: true, status: true, claimLeaseUntil: true, executionPhase: true, expiryStatus: true, expiryLeaseUntil: true, expiryResult: true },
+  });
+  const transitions: InterruptedOperationTransition[] = [];
+  const changed = async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+    const result = await delegate.updateMany(args);
+    return typeof result === 'object' && result !== null && 'count' in result && result.count === 1;
+  };
+  for (const row of stale) {
+    if (row.status === 'running' && row.claimLeaseUntil && row.claimLeaseUntil < now) {
+      if (row.executionPhase === 'preparing') {
+        if (await changed({ where: { id: row.id, status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'preparing' }, data: { status: 'failed', completedAt: now, result: 'Le bail a expiré avant tout appel Discord. Aucune sanction n’a été envoyée; une nouvelle demande explicite est possible.' } })) {
+          transitions.push({ operationId: row.operationId, caseId: row.id, kind: 'action', from: 'running', to: 'failed', phase: 'preparing' });
+        }
+      } else if (row.executionPhase === 'discord_request_inflight') {
+        if (await changed({ where: { id: row.id, status: 'running', claimLeaseUntil: { lt: now }, executionPhase: 'discord_request_inflight' }, data: { status: 'uncertain', completedAt: now, result: 'Le processus s’est arrêté pendant l’appel Discord. Vérifiez l’état Discord; aucune nouvelle tentative automatique ne sera lancée.' } })) {
+          transitions.push({ operationId: row.operationId, caseId: row.id, kind: 'action', from: 'running', to: 'uncertain', phase: 'discord_request_inflight' });
+        }
+      }
+    }
+    if (row.action === 'TEMPBAN' && row.expiryStatus === 'running' && row.expiryLeaseUntil && row.expiryLeaseUntil < now) {
+      if (row.expiryResult === 'discord_request_inflight') {
+        if (await changed({ where: { id: row.id, action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, expiryResult: 'discord_request_inflight' }, data: { expiryStatus: 'uncertain', expiryResult: 'Le processus s’est arrêté pendant le débannissement. Vérifiez le ban Discord; aucune nouvelle tentative automatique ne sera lancée.' } })) {
+          transitions.push({ operationId: row.operationId, caseId: row.id, kind: 'expiry', from: 'running', to: 'uncertain', phase: 'discord_request_inflight' });
+        }
+      } else if (await changed({ where: { id: row.id, action: 'TEMPBAN', expiryStatus: 'running', expiryLeaseUntil: { lt: now }, expiryResult: row.expiryResult }, data: { expiryStatus: 'scheduled', expiryClaimToken: null, expiryLeaseUntil: null, expiryResult: 'Reprise après interruption avant appel Discord.' } })) {
+        transitions.push({ operationId: row.operationId, caseId: row.id, kind: 'expiry', from: 'running', to: 'scheduled', phase: 'before_discord_request' });
+      }
+    }
+  }
+  return transitions;
 }

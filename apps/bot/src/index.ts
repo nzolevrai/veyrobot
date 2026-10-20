@@ -6,7 +6,8 @@ import { createDispatcher } from './dispatcher.js';
 import { z } from 'zod';
 import { acquireSingleBotLease } from './single-instance.js';
 import { registerInteractionHandler } from './interactions.js';
-import { logBotError } from './error-log.js';
+import { logBotError, logBotOperation } from './error-log.js';
+import { reconcileInterruptedModeration } from './reconciliation.js';
 import { readBotCacheCounts } from './resource-snapshot.js';
 import { destroyClientBeforeReleasingLease } from './shutdown-order.js';
 
@@ -48,7 +49,7 @@ const releaseBotLease = await acquireSingleBotLease(env.DATABASE_URL, () => {
   process.exit(1);
 });
 const [{ rejectPendingAfterDisable, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
-const { markInterruptedOperationsUncertain, redisConnection } = moderation;
+const { redisConnection } = moderation;
 // Uncertain network/5xx responses must reach our durable state machine; avoid
 // the REST layer automatically repeating non-idempotent moderation requests.
 const client = new Client({ intents: [GatewayIntentBits.Guilds], rest: { retries: 0, timeout: 15_000 } });
@@ -77,7 +78,7 @@ process.on('uncaughtException', error => failProcess(error, 'uncaught-exception'
 
 client.once(Events.ClientReady, async ready => {
   console.info(`Connecté comme ${ready.user.tag}`);
-  await markInterruptedOperationsUncertain(prisma).catch(error => logBotError('reconcile_failed', 'startup_reconcile', 'Could not reconcile interrupted moderation actions', error));
+  await reconcileInterruptedModeration(prisma).catch(error => logBotError('reconcile_failed', 'startup_reconcile', 'Could not reconcile interrupted moderation actions', error, { phase: 'lease_reconciliation' }));
   const ownedShardIds = client.shard?.ids ?? [0];
   const publishPresence = async () => {
     if (!client.isReady()) return;
@@ -110,14 +111,16 @@ client.once(Events.ClientReady, async ready => {
     } finally { membershipSyncing = false; }
   };
   await syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync failed; retry scheduled', error));
-  const dispatchRequested = createDispatcher(prisma, queue, () => client.isReady(), logThrottled);
+  const dispatchRequested = createDispatcher(prisma, queue, () => client.isReady(), logThrottled, undefined, event => logBotOperation({
+    event: 'moderation_dispatch', ...event,
+  }));
   wakeRequestDispatcher = dispatchRequested;
   await publishPresence().catch(err => logThrottled('presence-heartbeat', 'initial presence sync failed', err));
   const timer = setInterval(() => void publishPresence().catch(err => logThrottled('presence-heartbeat', 'presence heartbeat failed', err)), 30_000);
   if (!membershipsSynced) membershipRetryTimer = setInterval(() => void syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync retry failed', error)), 30_000);
   await dispatchRequested();
   const dispatchTimer = setInterval(() => void dispatchRequested(), 1_000);
-  const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => logBotError('reconcile_failed', 'stale_operation_reconcile', 'Stale moderation operation reconciliation failed', error)), 60_000);
+  const staleOperationTimer = setInterval(() => void reconcileInterruptedModeration(prisma).catch(error => logBotError('reconcile_failed', 'stale_operation_reconcile', 'Stale moderation operation reconciliation failed', error, { phase: 'lease_reconciliation' })), 60_000);
   const loopDelay = monitorEventLoopDelay({ resolution: 20 });
   loopDelay.enable();
   let previousElu = performance.eventLoopUtilization();

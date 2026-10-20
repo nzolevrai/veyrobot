@@ -329,6 +329,132 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
     assert.equal(actionResponse.status, 202);
     actionCaseId = (await actionResponse.json()).id;
     assert.equal((await (await post(`/guilds/${guildA}/actions`, actionInput)).json()).id, actionCaseId);
+    const actionRequestId = actionResponse.headers.get('x-request-id');
+    assert.ok(actionRequestId, 'accepted action response exposes its HTTP attempt requestId');
+    const waitFor = async (predicate, description, timeoutMs = 10_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await delay(20);
+      }
+      throw new Error(`Timed out waiting for ${description}`);
+    };
+    const apiLogEntries = () => apiLogs.split(/\r?\n/).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    const apiAdmissionLog = await waitFor(() => apiLogEntries().find(entry => entry?.event === 'moderation_admitted' && entry?.requestId === actionRequestId), 'API admission correlation log');
+    assert.equal(apiAdmissionLog.operationId, operationId);
+    assert.notEqual(apiAdmissionLog.requestId, operationId, 'HTTP requestId and durable operationId remain distinct identifiers');
+
+    // The live production dispatcher/worker use isolated PostgreSQL and Redis;
+    // only the final SQL write is fault-injected after the controlled Discord adapter succeeds.
+    const [{ Queue }, { createDispatcher }, { createModerationWorker }, { logBotOperation }, { reconcileInterruptedModeration }, moderationRuntime, dbRuntime] = await Promise.all([
+      import('bullmq'), import('../../bot/dist/dispatcher.js'), import('../../bot/dist/worker.js'), import('../../bot/dist/error-log.js'),
+      import('../../bot/dist/reconciliation.js'), import('@veyrobot/moderation'), import('@veyrobot/db'),
+    ]);
+    const queueName = `veyrobot-correlation-${randomUUID()}`;
+    const redis = moderationRuntime.redisConnection(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379');
+    const queue = new Queue(queueName, { connection: redis });
+    const botLogs = [];
+    const originalInfo = console.info;
+    const originalError = console.error;
+    console.info = (...values) => botLogs.push(values.map(String).join(' '));
+    console.error = (...values) => botLogs.push(values.map(String).join(' '));
+    let simulatedDiscordMutations = 0;
+    let failFinalWrite = true;
+    const finalWriteCanary = 'Moderation final SQL diagnostic failure: SESSION_KEY=diagnostic-secret-canary client_secret="DIAG_CLIENT_SECRET_CANARY"\nBearer DIAG_BEARER_CANARY';
+    const faultStore = new Proxy(prisma, {
+      get(target, property) {
+        if (property === 'moderationCase') {
+          const delegate = target.moderationCase;
+          return new Proxy(delegate, {
+            get(model, method) {
+              if (method === 'updateMany') return async args => {
+                if (failFinalWrite && args?.where?.id === actionCaseId && args?.data?.completedAt && args?.data?.status) {
+                  failFinalWrite = false;
+                  throw Object.assign(new Error(finalWriteCanary), { code: 'P1001' });
+                }
+                return model.updateMany(args);
+              };
+              const value = Reflect.get(model, method, model);
+              return typeof value === 'function' ? value.bind(model) : value;
+            },
+          });
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const highRole = { comparePositionTo: () => 1 };
+    const actor = { id: actorId, permissions: { bitfield: 1n << 40n }, roles: { highest: highRole } };
+    const botMember = { permissions: { bitfield: 1n << 40n }, roles: { highest: highRole } };
+    const target = { id: targetId, roles: { highest: highRole }, timeout: async () => { simulatedDiscordMutations++; } };
+    const controlledGuild = { id: guildA, ownerId: guildC, members: {
+      fetch: async ({ user }) => user === actorId ? actor : target,
+      fetchMe: async () => botMember,
+    } };
+    const controlledClient = { isReady: () => true, guilds: { cache: new Map([[guildA, controlledGuild]]) } };
+    const worker = createModerationWorker(controlledClient, redis, faultStore, moderationRuntime, dbRuntime.rejectPendingAfterDisable, () => undefined, undefined, queueName);
+    try {
+      await Promise.all([queue.waitUntilReady(), worker.waitUntilReady()]);
+      const dispatch = createDispatcher(prisma, queue, () => true, () => undefined, undefined,
+        event => logBotOperation({ event: 'moderation_dispatch', ...event }));
+      const botLogEntries = () => botLogs.map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+      const dispatchDeadline = Date.now() + 10_000;
+      let dispatchLog;
+      while (!dispatchLog && Date.now() < dispatchDeadline) {
+        await queue.getBackend().client;
+        await dispatch();
+        dispatchLog = botLogEntries().find(entry => entry?.event === 'moderation_dispatch' && entry?.operationId === operationId && entry?.outcome === 'published');
+        if (!dispatchLog) await delay(20);
+      }
+      assert.ok(dispatchLog, 'dispatcher should publish the durable operation through BullMQ');
+      assert.equal(dispatchLog.phase, 'queue_publish');
+      await waitFor(() => botLogs.some(line => {
+        try { const entry = JSON.parse(line); return entry?.event === 'moderation_execution_error' && entry?.operationId === operationId; }
+        catch { return false; }
+      }), 'worker persistence incident log');
+
+      const running = await prisma.moderationCase.findUniqueOrThrow({ where: { id: actionCaseId } });
+      assert.equal(running.status, 'running', 'failed final SQL write leaves the durable claim for the reaper');
+      assert.equal(running.executionPhase, 'discord_request_inflight');
+      assert.equal(simulatedDiscordMutations, 1, 'controlled Discord adapter acknowledged exactly one mutation');
+      await prisma.moderationCase.update({ where: { id: actionCaseId }, data: { claimLeaseUntil: new Date(Date.now() - 1_000) } });
+      await reconcileInterruptedModeration(prisma);
+      const reconciled = await prisma.moderationCase.findUniqueOrThrow({ where: { id: actionCaseId } });
+      assert.equal(reconciled.status, 'uncertain');
+      assert.equal(reconciled.executionPhase, 'discord_request_inflight');
+
+      const lifecycleLogs = botLogEntries();
+      const executionError = lifecycleLogs.find(entry => entry.event === 'moderation_execution_error' && entry.operationId === operationId);
+      assert.equal(executionError.phase, 'discord_execution');
+      assert.equal(executionError.exception.message, 'Exception text omitted.');
+      assert.equal(executionError.exception.code, 'P1001');
+      const executionLog = lifecycleLogs.find(entry => entry.event === 'moderation_execution' && entry.operationId === operationId && entry.outcome === 'interrupted');
+      const reconciliationLog = lifecycleLogs.find(entry => entry.event === 'moderation_reconciliation' && entry.operationId === operationId && entry.phase === 'lease_reconciliation' && entry.status === 'uncertain');
+      assert.ok(executionLog);
+      assert.equal(executionLog.caseId, actionCaseId);
+      assert.ok(reconciliationLog);
+      assert.equal(reconciliationLog.caseId, actionCaseId);
+      assert.equal(reconciliationLog.from, 'running');
+      const eventOrder = [dispatchLog, executionError, executionLog, reconciliationLog].map(entry => lifecycleLogs.indexOf(entry));
+      assert.ok(eventOrder.every((position, index) => index === 0 || position > eventOrder[index - 1]), 'bot logs expose publication, processing failure, worker outcome, then reconciliation in event order');
+      assert.equal(lifecycleLogs.filter(entry => entry.event === 'moderation_dispatch' && entry.operationId === operationId && entry.outcome === 'published').length, 1);
+
+      await dispatch();
+      assert.equal(simulatedDiscordMutations, 1, 'uncertain PostgreSQL state is not redispatched after reconciliation');
+      const allCapturedLogs = `${apiLogs}\n${botLogs.join('\n')}`;
+      for (const canary of ['diagnostic-secret-canary', 'DIAG_CLIENT_SECRET_CANARY', 'DIAG_BEARER_CANARY', finalWriteCanary]) {
+        assert.equal(allCapturedLogs.includes(canary), false, `captured logger output must not contain ${canary}`);
+      }
+      assert.ok(!allCapturedLogs.includes('Moderation final SQL diagnostic failure'), 'raw exception message must not appear in logs');
+      assert.ok(allCapturedLogs.includes(actionRequestId) && allCapturedLogs.includes(operationId), 'the HTTP and durable operation IDs are searchable in emitted logs');
+    } finally {
+      await worker.close();
+      await queue.obliterate({ force: true }).catch(() => undefined);
+      await queue.close();
+      console.info = originalInfo;
+      console.error = originalError;
+    }
     assert.equal((await post(`/guilds/${guildA}/actions`, { ...actionInput, reason: 'changed payload' })).status, 400);
     assert.equal((await put(`/guilds/${guildA}/config`, { kind: 'patch', version: settings.version, changes: { warningsEnabled: false } })).status, 409);
     assert.equal((await put(`/guilds/${guildA}/config`, { kind: 'patch', version: patch.version, changes: { timeZone: 'Mars/Base' } })).status, 400);
@@ -493,7 +619,7 @@ if (process.env.RUN_POSTGRES_INTEGRATION !== '1') {
         console.log(`Dashboard ${browserEngine} integration passed: OAuth-backed session fixture, routes/history, keyboard settings, module save/reset, draft guards, simulated history 429 after warning writes, mobile layout, axe, focus and logout. Discord OAuth and guild data were simulated; no Discord mutation was sent.`);
       }
     }
-    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, and public-route limits.');
+    console.log('API integration passed: OAuth, IPv4/IPv6 canonical quota keys, two-source signed quotas through a local ingress and built Next→API, valid-session and revoked/expired/incomplete quotas, forged/duplicate headers, bounded pre-auth grants, public-route limits, and HTTP→PostgreSQL→BullMQ→production worker→reconciliation correlation with sanitized logs.');
   } finally {
     await stop();
     if (grantTableRenamed) await prisma.$executeRawUnsafe('ALTER TABLE "SessionGrant_unavailable_fixture" RENAME TO "SessionGrant"');

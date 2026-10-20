@@ -1,5 +1,6 @@
 import { DiscordAPIError, type Client } from 'discord.js';
 import { Worker, type ConnectionOptions, type WorkerOptions } from 'bullmq';
+import { logBotError, logBotOperation } from './error-log.js';
 
 type Store = typeof import('@veyrobot/db').prisma;
 type Services = typeof import('@veyrobot/moderation');
@@ -35,8 +36,17 @@ const activeGuilds = new Set<string>();
       return;
     }
     const began = performance.now();
-    try { await expireTemporaryBan({ guild, caseRecord: row, store: prisma }); }
-    finally { console.info(JSON.stringify({ event: 'moderation_expiry_attempt', operationId: row.operationId, caseId: row.id, durationMs: +(performance.now() - began).toFixed(2) })); telemetry?.onAttemptFinished?.(guildId, `expiry-${row.id}`); }
+    let outcome: 'succeeded' | 'failed' | 'uncertain' | 'superseded' | 'deferred' | 'not_claimed' | 'lease_lost' | 'interrupted' = 'interrupted';
+    try {
+      const result = await expireTemporaryBan({ guild, caseRecord: row, store: prisma });
+      outcome = result === 'not_due' ? 'not_claimed' : result;
+    } catch (error) {
+      logBotError('moderation_execution_error', 'worker', 'Temporary ban expiry did not finalize', error, { ...(row.operationId ? { operationId: row.operationId } : {}), caseId: row.id, phase: 'expiry_execution', kind: 'expiry' });
+      throw error;
+    } finally {
+      logBotOperation({ event: 'moderation_execution', ...(row.operationId ? { operationId: row.operationId } : {}), caseId: row.id, phase: 'expiry_execution', kind: 'expiry', outcome, ...(outcome === 'succeeded' || outcome === 'failed' || outcome === 'uncertain' || outcome === 'superseded' ? { status: outcome } : {}), action: 'TEMPBAN', durationMs: performance.now() - began });
+      telemetry?.onAttemptFinished?.(guildId, `expiry-${row.id}`);
+    }
     return;
   }
   const { operationId } = job.data as { operationId: string; guildId: string };
@@ -63,8 +73,16 @@ const activeGuilds = new Set<string>();
   }
   telemetry?.onAttemptStarted?.({ operationId, guildId, kind: 'action', createdAt: row.createdAt });
   const began = performance.now();
-  try { await executeModerationAction({ operationId, guild, caseRecord: row, store: prisma }); }
-  finally { console.info(JSON.stringify({ event: 'moderation_action_attempt', operationId, caseId: row.id, action: row.action, durationMs: +(performance.now() - began).toFixed(2) })); telemetry?.onAttemptFinished?.(guildId, operationId); }
+  let outcome: 'succeeded' | 'failed' | 'uncertain' | 'not_claimed' | 'lease_lost' | 'completion_conflict' | 'interrupted' = 'interrupted';
+  try {
+    outcome = await executeModerationAction({ operationId, guild, caseRecord: row, store: prisma });
+  } catch (error) {
+    logBotError('moderation_execution_error', 'worker', 'Moderation action did not finalize', error, { operationId, caseId: row.id, phase: 'discord_execution', kind: 'action' });
+    throw error;
+  } finally {
+    logBotOperation({ event: 'moderation_execution', operationId, caseId: row.id, phase: 'discord_execution', kind: 'action', outcome, ...(outcome === 'succeeded' || outcome === 'failed' || outcome === 'uncertain' ? { status: outcome } : {}), action: row.action, durationMs: performance.now() - began });
+    telemetry?.onAttemptFinished?.(guildId, operationId);
+  }
   } finally {
     activeGuilds.delete(guildId);
     onDrained();
