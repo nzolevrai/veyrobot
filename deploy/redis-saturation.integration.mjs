@@ -55,6 +55,10 @@ let dispatch;
 let kickRelease;
 let activeKickEntered;
 let activeKickCount = 0;
+let pressureActiveDeliveries = 0;
+let pressureActiveStalled = 0;
+let pressureActiveCompletions = 0;
+let pressureActiveFailures = 0;
 let pendingKickCount = 0;
 let unbanCount = 0;
 let expiryMarker;
@@ -223,6 +227,28 @@ async function clearFillerKeys() {
   }
   fillerKeys.length = 0;
 }
+async function logRedisPressureSnapshot(label) {
+  const info = await rawRedis.command(['INFO', 'memory']);
+  const stats = await rawRedis.command(['INFO', 'stats']);
+  const value = name => Number(info.match(new RegExp(`^${name}:(\\d+)`, 'm'))?.[1] ?? 0);
+  const stat = name => Number(stats.match(new RegExp(`^${name}:(\\d+)`, 'm'))?.[1] ?? 0);
+  const databaseKeys = await rawRedis.command(['DBSIZE']);
+  const snapshot = {
+    event: 'redis_pressure_checkpoint', label,
+    usedMemoryBytes: value('used_memory'), maxMemoryBytes: value('maxmemory'),
+    usedMemoryDatasetBytes: value('used_memory_dataset'), usedMemoryOverheadBytes: value('used_memory_overhead'),
+    allocatorAllocatedBytes: value('allocator_allocated'), normalClientBufferBytes: value('mem_clients_normal'),
+    aofBufferBytes: value('mem_aof_buffer'),
+    memoryHeadroomBytes: value('maxmemory') - value('used_memory'),
+    databaseKeys,
+    trackedFillerKeys: fillerKeys.length,
+    nonFillerKeys: databaseKeys - fillerKeys.length,
+    expiredKeys: stat('expired_keys'), evictedKeys: stat('evicted_keys'),
+    pressureActiveDeliveries, pressureActiveStalled, pressureActiveCompletions, pressureActiveFailures,
+  };
+  console.info(JSON.stringify(snapshot));
+  return snapshot;
+}
 function makeRecoveryGate(operationId) {
   let enter;
   let release;
@@ -283,15 +309,21 @@ try {
   worker = createModerationWorker(client, consumerConnection, prisma, moderation, rejectPendingAfterDisable, () => undefined, {
     onGuildBusySkip: (guildId, operationId) => guildBusySkips.push({ guildId, operationId, at: Date.now() }),
   }, queueName, { lockDuration: 12_000, stalledInterval: 500 });
-  worker.on('active', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.deliveries++; if (job.id === oomOperationId) oomQueueDeliveries++; });
-  worker.on('stalled', jobId => { const scenario = recoveryScenarios.get(jobId); if (scenario) scenario.stalled++; });
+  worker.on('active', job => {
+    const scenario = recoveryScenarios.get(job.id);
+    if (scenario) scenario.deliveries++;
+    if (job.id === oomOperationId) oomQueueDeliveries++;
+    if (job.id === activeOperationId) pressureActiveDeliveries++;
+  });
+  worker.on('stalled', jobId => { const scenario = recoveryScenarios.get(jobId); if (scenario) scenario.stalled++; if (jobId === activeOperationId) pressureActiveStalled++; });
   worker.on('failed', (job, error) => {
     const scenario = recoveryScenarios.get(job?.id);
     const failure = { jobId: job?.id, name: error?.name ?? 'unknown', message: String(error?.message ?? 'unknown').slice(0, 300) };
     workerFailures.push(failure);
     scenario?.failures.push(failure);
+    if (job?.id === activeOperationId) pressureActiveFailures++;
   });
-  worker.on('completed', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.completions++; });
+  worker.on('completed', job => { const scenario = recoveryScenarios.get(job.id); if (scenario) scenario.completions++; if (job.id === activeOperationId) pressureActiveCompletions++; });
   worker.on('error', error => workerErrors.push({ at: Date.now(), source: 'worker', name: error?.name ?? 'unknown' }));
 
   let dispatcherQueryCount = 0;
@@ -383,18 +415,33 @@ try {
   } }), 10_000);
   createGuild(expiryGuildId, expiryTargetId, { banReason: `temporary ban [${expiryMarker}]` });
 
+  // Complete Redis/BullMQ reads before saturating. The job must be active and
+  // its lock live before pressure starts; reads after the final fill could run
+  // BullMQ's own housekeeping at the exact boundary this test is measuring.
+  const heldJobBeforeFill = await queue.getJob(activeOperationId);
+  assert.equal(await heldJobBeforeFill?.getState(), 'active', 'the controlled in-flight job is active before Redis is filled');
+  const lockTtlBeforeFill = Number(await rawRedis.command(['PTTL', `${queue.toKey(activeOperationId)}:lock`]));
+  assert.ok(lockTtlBeforeFill > 0, `the controlled in-flight BullMQ lock is live before filling (PTTL=${lockTtlBeforeFill})`);
+  assert.equal(activeKickCount, 1, 'the controlled Discord adapter remains in flight before Redis is filled');
+  const producer = await queue.getBackend().client;
+  assert.equal(producer.status, 'ready', 'the production BullMQ producer is connected before the OOM publication attempt');
+
+  await logRedisPressureSnapshot('before_fill');
   const filler = 'x'.repeat(1024 * 1024);
+  let pressureFillRefusals = 0;
   let largeChunkRejected = false;
   for (let i = 0; i < 40; i++) {
     const key = `pressure:filler:${i}`;
     try { await rawRedis.command(['SET', key, filler]); fillerKeys.push(key); }
     catch (error) {
       assert.match(error.message, /^OOM /, 'Redis refused a write because maxmemory was reached');
+      pressureFillRefusals++;
       largeChunkRejected = true;
       break;
     }
   }
   assert.ok(largeChunkRejected, 'a 1 MiB write proves the isolated Redis 7 instance reached noeviction maxmemory');
+  await logRedisPressureSnapshot('after_megabyte_fill');
   let smallChunkRejected = false;
   let fillerIndex = 40;
   // Refine the remaining headroom geometrically. The old 1 KiB loop could
@@ -411,6 +458,7 @@ try {
       try { await rawRedis.command(['SET', key, smallFiller]); fillerKeys.push(key); }
       catch (error) {
         assert.match(error.message, /^OOM /, 'Redis rejects progressively smaller writes because maxmemory/noeviction is active');
+        pressureFillRefusals++;
         rejectedThisStage = true;
         break;
       }
@@ -421,14 +469,44 @@ try {
     }
   }
   assert.ok(smallChunkRejected, 'a one-byte payload is refused at the final maxmemory boundary');
-  const heldJobBeforeDispatch = await queue.getJob(activeOperationId);
-  assert.equal(await heldJobBeforeDispatch?.getState(), 'active', 'the controlled in-flight job was not stalled or removed while Redis was filled');
-  assert.equal(activeKickCount, 1, 'the held Discord adapter remains in flight while Redis is filled');
-  const oomRejectedWrites = 2;
+  await logRedisPressureSnapshot('after_fill_refusal');
+
+  // A rejected one-byte SET only establishes a boundary condition: a key may
+  // expire between that command and Queue.add. Keep all filler keys, then lower
+  // the isolated noeviction ceiling by 4 MiB. This creates a measured margin
+  // larger than BullMQ's job publication and small BullMQ housekeeping changes.
+  const originalMemoryInfo = await rawRedis.command(['INFO', 'memory']);
+  const originalMaxMemory = Number(originalMemoryInfo.match(/^maxmemory:(\d+)/m)?.[1]);
+  assert.equal(originalMaxMemory, 24 * 1024 * 1024, 'the saturation phase starts with its documented 24 MiB noeviction ceiling');
+  const pressureMaxMemory = originalMaxMemory - 4 * 1024 * 1024;
+  assert.equal(await rawRedis.command(['CONFIG', 'SET', 'maxmemory', `${pressureMaxMemory}`]), 'OK', 'isolated Redis accepts the explicit pressure ceiling');
+  await logRedisPressureSnapshot('after_margin_ceiling');
+  const pressureInfo = await rawRedis.command(['INFO', 'memory']);
+  const pressureUsedMemoryAtCeiling = Number(pressureInfo.match(/^used_memory:(\d+)/m)?.[1]);
+  const pressureMaxMemoryObserved = Number(pressureInfo.match(/^maxmemory:(\d+)/m)?.[1]);
+  const pressureMarginBytesAtCeiling = pressureUsedMemoryAtCeiling - pressureMaxMemoryObserved;
+  assert.ok(pressureMarginBytesAtCeiling >= 4 * 1024 * 1024, `retained Redis data exceeds the noeviction ceiling by a wide margin (${pressureMarginBytesAtCeiling} bytes)`);
+  assert.equal(pressureMaxMemoryObserved, pressureMaxMemory, 'INFO confirms the isolated pressure ceiling actually changed');
   const firstFailureAt = Date.now();
-  const producer = await queue.getBackend().client;
-  assert.equal(producer.status, 'ready', 'the production BullMQ producer is connected immediately before the OOM publication attempt');
-  await assert.rejects(rawRedis.command(['SET', `pressure:pre-dispatch-probe:${suffix}`, 'x']), error => /^OOM /.test(error?.message ?? ''), 'Redis still refuses a fresh write immediately before invoking the dispatcher');
+  await logRedisPressureSnapshot('immediately_before_publish_probe');
+  const activeJobAtPressure = await queue.getJob(activeOperationId);
+  assert.equal(await activeJobAtPressure?.getState(), 'active', 'the original controlled job remains active at the pressure boundary');
+  const lockTtlImmediatelyBeforeDispatch = Number(await rawRedis.command(['PTTL', `${queue.toKey(activeOperationId)}:lock`]));
+  assert.ok(lockTtlImmediatelyBeforeDispatch > 0, `the original active BullMQ lock remains live before dispatch (PTTL=${lockTtlImmediatelyBeforeDispatch})`);
+  assert.equal(pressureActiveDeliveries, 1, 'no stalled redelivery occurred while memory was saturated');
+  assert.equal(pressureActiveStalled, 0, 'the active pressure job was not marked stalled');
+  assert.equal(pressureActiveCompletions, 0, 'the active pressure job was not completed and removed during saturation');
+  assert.equal(pressureActiveFailures, 0, 'the active pressure job did not fail during saturation');
+  assert.equal(activeKickCount, 1, 'the first simulated Discord mutation is still held while dispatch is attempted');
+  let preDispatchProbeError;
+  try { await rawRedis.command(['SET', `pressure:pre-dispatch-probe:${suffix}`, 'x']); }
+  catch (error) { preDispatchProbeError = error; }
+  const preDispatchProbeRefused = Boolean(preDispatchProbeError);
+  await logRedisPressureSnapshot(preDispatchProbeError ? 'after_rejected_publish_probe' : 'after_accepted_publish_probe');
+  assert.match(preDispatchProbeError?.message ?? '', /^OOM /, 'Redis still refuses a fresh write immediately before invoking the dispatcher');
+  const probeMemoryInfo = await rawRedis.command(['INFO', 'memory']);
+  const probeMarginBytes = Number(probeMemoryInfo.match(/^used_memory:(\d+)/m)?.[1]) - Number(probeMemoryInfo.match(/^maxmemory:(\d+)/m)?.[1]);
+  assert.ok(probeMarginBytes >= 4 * 1024 * 1024, `the fresh-write probe occurs with at least 4 MiB of measured pressure (${probeMarginBytes} bytes)`);
   const attemptsBeforeRefusedPublish = dispatchAttempts.length;
   const dispatchPromise = dispatch();
   await within('production dispatcher wake before maxmemory refusal', dispatchPromise, 15_000);
@@ -442,6 +520,12 @@ try {
   assert.match(refusedPublishDiagnostics[0].message, /PostgreSQL request remains durable/);
   assert.match(refusedPublishDiagnostics[0].errorName, /Error/);
   assert.match(refusedPublishDiagnostics[0].errorMessage, /^OOM /, 'BullMQ publication failed with Redis maxmemory OOM, not a connection failure');
+  const publishErrorInfo = await rawRedis.command(['INFO', 'memory']);
+  const publishErrorUsedMemory = Number(publishErrorInfo.match(/^used_memory:(\d+)/m)?.[1]);
+  const publishErrorMaxMemory = Number(publishErrorInfo.match(/^maxmemory:(\d+)/m)?.[1]);
+  const publishErrorMarginBytes = publishErrorUsedMemory - publishErrorMaxMemory;
+  assert.ok(publishErrorMarginBytes >= 4 * 1024 * 1024, `the BullMQ OOM occurred while Redis remained at least 4 MiB above its noeviction ceiling (${publishErrorMarginBytes} bytes)`);
+  assert.equal(await rawRedis.command(['CONFIG', 'SET', 'maxmemory', `${originalMaxMemory}`]), 'OK', 'restore the initial isolated Redis ceiling after the expected publication refusal');
   assert.equal((await row(pendingOperationId)).status, 'requested', 'failed Redis enqueue does not lose accepted PostgreSQL work');
   assert.equal((await within('read due expiry after refused publication', prisma.moderationCase.findUnique({ where: { id: expiryCaseId } }), 10_000)).expiryStatus, 'scheduled', 'due expiry remains durable');
   assert.equal(activeKickCount, 1, 'the already active controlled Discord operation was not repeated');
@@ -594,7 +678,11 @@ try {
   const usedMemoryBytes = Number(memoryInfo.match(/used_memory:(\d+)/)?.[1]);
   const maxMemoryBytes = Number(memoryInfo.match(/maxmemory:(\d+)/)?.[1]);
   console.info(JSON.stringify({
-    event: 'redis_saturation_integration_passed', elapsedMs: Date.now() - testStartedAt, redisVersion, oomRejectedWrites, usedMemoryBytes, maxMemoryBytes,
+    event: 'redis_saturation_integration_passed', elapsedMs: Date.now() - testStartedAt, redisVersion,
+    pressureFillRefusals, preDispatchProbeRefused, bullMqPublishRefused: true,
+    pressureUsedMemoryBytesAtCeiling: pressureUsedMemoryAtCeiling, pressureMaxMemoryBytes: pressureMaxMemoryObserved,
+    pressureMarginBytesAtCeiling, pressureUsedMemoryBytesAtPublishError: publishErrorUsedMemory, pressureMarginBytesAtPublishError: publishErrorMarginBytes,
+    usedMemoryBytes, maxMemoryBytes,
     acceptedRows: 2, backpressureAndOomActions: activeKickCount + pendingKickCount, controlledRecoveryMutations: [...recoveryScenarios.values()].reduce((total, scenario) => total + scenario.mutations, 0) + oomKickCount, expiriesAfterRecovery: unbanCount,
     dispatcherErrors: dispatchErrors.length, dispatcherOutboxQueriesDuringCooldown, dispatcherErrorsDuringBackoff,
     workerRedisErrors: workerErrors.length, queueRedisErrors: queueErrors.length, oomQueueDeliveries,
