@@ -2,9 +2,10 @@ import { Client, EmbedBuilder, Events, PermissionFlagsBits, type ChatInputComman
 import { createWarningCase, withModerationAdmission, prisma } from '@veyrobot/db';
 import { submitModerationAction, type ModerationAction } from '@veyrobot/moderation';
 import { warn, actionCommands } from './commands.js';
+import { logBotError } from './error-log.js';
 
 function logInteractionFailure(error: unknown): void {
-  console.error(JSON.stringify({ event: 'interaction_handler_failed', errorName: error instanceof Error ? error.name : 'unknown' }));
+  logBotError('interaction_handler_failed', 'interaction', 'Interaction handling failed', error);
 }
 
 export async function respondSafely(interaction: Pick<ChatInputCommandInteraction, 'deferred' | 'replied' | 'reply' | 'editReply' | 'followUp'>, payload: InteractionReplyOptions): Promise<void> {

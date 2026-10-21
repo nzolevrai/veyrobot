@@ -4,7 +4,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-if (!process.env.DATABASE_URL?.includes('veyrobot_arch_bench')) throw new Error('Use isolated veyrobot_arch_bench database.');
+if (!process.env.DATABASE_URL?.includes('veyrobot_foundation_bench')) throw new Error('Use isolated veyrobot_foundation_bench database.');
 const rps = Number(process.env.BENCH_OFFERED_RPS ?? 10);
 const seconds = Number(process.env.BENCH_SECONDS ?? 5);
 if (!Number.isInteger(rps) || rps < 1 || rps > 100 || !Number.isInteger(seconds) || seconds < 1 || seconds > 30) throw new Error('Invalid benchmark rate/duration.');

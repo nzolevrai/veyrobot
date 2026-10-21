@@ -1,5 +1,9 @@
 # Vérifications de reprise — 14 octobre 2026
 
+## Addendum — 15 octobre 2026
+
+La campagne conforme au runtime actuel a été exécutée après les corrections OAuth et dispatcher; voir le tableau complet, la méthode et les limites dans [`PERFORMANCE-BASELINE.md`](PERFORMANCE-BASELINE.md). Elle utilise l'exécuteur de production et un adaptateur Discord contrôlé sur PostgreSQL 17/Redis 7 isolés, sous Node 24.21.0. Les 9 300 actions et 179 échéances simulées ont terminé, avec drainage en 520 ms et aucun refus ni résultat incertain. Les plafonds d'admission n'ont pas été saturés. Il s'agit d'une observation mono-hôte reproductible, pas d'une preuve de comportement ou de capacité Discord réelle.
+
 ## Correctifs et preuves
 
 - Le proxy Next.js `/api/[...path]` refuse `Content-Length > 1 MiB` avant lecture, compte chaque bloc lu et annule le lecteur au dépassement. Il n'appelle pas l'API après un dépassement. Les erreurs de corps (400), taille (413), annulation client (499), panne amont (502) et délai amont (504) sont distinctes. `API_PROXY_TIMEOUT_MS` vaut 10 000 ms par défaut, borné entre 100 et 60 000 ms ; son signal et celui du navigateur sont combinés. La redirection reste manuelle, les en-têtes hop-by-hop et ceux listés par `Connection` sont retirés dans les deux sens, et chaque `Set-Cookie` est recopié. Tests Web Request/Response : corps sans longueur, taille déclarée et réelle, erreur de lecture, annulation avant et pendant l'amont, redirection et deux cookies ; un serveur HTTP local sans réponse vérifie le délai réel. L'intégration sur le serveur Next construit a rendu 413 pour un corps chunked trop grand, transmis un corps chunked borné, et validé OAuth, cookie et déconnexion avec API/Discord simulés.
