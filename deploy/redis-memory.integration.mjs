@@ -161,11 +161,29 @@ function startDockerObserver(name) {
       throw new Error(`Timed out waiting for external docker stats; errors=${JSON.stringify(state.errors)}`);
     },
     async stop() {
-      for (const child of [state.statsProcess, events]) {
-        if (!child) continue;
-        if (child.exitCode === null) child.kill('SIGTERM');
-        if (child.exitCode === null) await Promise.race([new Promise(resolve => child.once('close', resolve)), sleep(1_000)]);
-      }
+      const stopChild = async (name, child) => {
+        if (!child) return { name, closed: true, wasStarted: false };
+        const alreadyClosed = child.stdout?.destroyed && child.stderr?.destroyed && (child.exitCode !== null || child.signalCode !== null);
+        if (alreadyClosed) return { name, closed: true, exitCode: child.exitCode, signal: child.signalCode };
+        const closed = new Promise(resolve => child.once('close', (exitCode, signal) => resolve({ name, closed: true, exitCode, signal })));
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+        let result = await Promise.race([closed, sleep(1_000).then(() => undefined)]);
+        if (!result) {
+          child.kill('SIGKILL');
+          result = await Promise.race([closed, sleep(1_000).then(() => undefined)]);
+        }
+        if (!result) {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          child.unref();
+          return { name, closed: false, exitCode: child.exitCode, signal: child.signalCode, forced: true };
+        }
+        return result;
+      };
+      const results = [];
+      results.push(await stopChild('docker-stats', state.statsProcess));
+      results.push(await stopChild('docker-events', events));
+      return results;
     },
   };
 }
@@ -306,6 +324,7 @@ async function waitFor(label, predicate, timeout = 30_000) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 const cleanups = [];
+let successSummary;
 try {
   const version = docker(['run', '--rm', 'redis:7-alpine', 'redis-server', '--version']).stdout;
   assert.match(version, /v=7\./);
@@ -412,7 +431,7 @@ try {
   await waitFor('Redis AOF recovery after OOM', () => docker(['exec', oom, 'redis-cli', 'PING'], { allowFailure: true }).stdout === 'PONG', 30_000);
   const recovered = docker(['exec', oom, 'redis-cli', 'GET', 'durable:probe']).stdout;
   assert.equal(recovered, 'before-oom', 'the probe was fsynced before the OOM filler and recovered from AOF');
-  console.info(JSON.stringify({
+  successSummary = {
     event: 'redis_memory_integration_passed',
     redisVersion,
     aofRewrite: { cgroupLimitBytes: hostConfig.Memory, redisMaxmemoryBytes: 256 * 1024 ** 2, configuredHeadroomBytes: hostConfig.Memory - 256 * 1024 ** 2, peakCgroupBytes: aofPeakCgroupBytes, peakDockerStatsWorkingSetBytes: aofPeakRssBytes, redisMaxima: redisMetricsMax, dataKeysAfterRewrite: dbsize, concurrentWriteBatchSize: concurrentWrites, completion: 'aof_last_bgrewrite_status=ok' },
@@ -430,8 +449,12 @@ try {
       restarted: true,
     },
     limitation: 'Standalone Redis process evidence only; PostgreSQL durable operation and production worker recovery during cgroup OOM are covered only by separate maxmemory-saturation integration, not by this OOM scenario.',
-  }));
+  };
 } finally {
-  await oomObserver?.stop();
-  for (const cleanup of cleanups.reverse()) { try { cleanup(); } catch {} }
+  let observerStopResults = [];
+  try { observerStopResults = await oomObserver?.stop() ?? []; }
+  finally { for (const cleanup of cleanups.reverse()) { try { cleanup(); } catch {} } }
+  console.info(JSON.stringify({ event: 'redis_oom_observer_cleanup', processes: observerStopResults }));
+  if (observerStopResults.some(result => !result.closed)) throw new Error(`Docker observer processes did not close within 2 seconds: ${JSON.stringify(observerStopResults)}`);
 }
+console.info(JSON.stringify(successSummary));
