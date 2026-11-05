@@ -1,6 +1,6 @@
 # Triage des avis de sécurité des dépendances de production — 2026-11-05
 
-Base de départ : `7cd81d82f2f33a02b523dc518ac7bccd81b80e0d`. Audit effectué avec Node 24.22.2, pnpm 10.18.3 et `pnpm audit --prod --json` avant modification. Le rapport d’audit initial contient 17 occurrences de paquets vulnérables mais 12 avis uniques : les quatre avis `fast-uri` apparaissent une fois pour chacune des versions 3 et 4.
+Base de départ : `7cd81d82f2f33a02b523dc518ac7bccd81b80e0d`. Audit effectué avec Node 24.22.2, pnpm 10.18.3 et `pnpm audit --prod --json` avant modification. Le rapport d’audit initial contient 17 occurrences de chemins/version de paquets affectés et 13 avis uniques : les quatre avis `fast-uri` apparaissent une fois pour chacune des versions 3 et 4.
 
 ## Triage des avis uniques
 
@@ -32,7 +32,7 @@ Base de départ : `7cd81d82f2f33a02b523dc518ac7bccd81b80e0d`. Audit effectué av
 | Audit `--prod` | Avant | Après correction |
 |---|---:|---:|
 | Occurrences de chemins vulnérables | 17 | 0 avis connus par le registre consulté |
-| Avis uniques | 12 | 0 avis connus par le registre consulté |
+| Avis uniques | 13 | 0 avis connus par le registre consulté |
 | Élevés / modérés / faibles | 6 / 7 / 4 | 0 / 0 / 0 |
 
 Un audit sans résultat signifie seulement qu’aucun des avis connus du registre utilisé ne correspond aux versions résolues; il ne prouve pas l’absence de vulnérabilités inconnues, de défauts applicatifs ou de dépendances absentes de l’audit.

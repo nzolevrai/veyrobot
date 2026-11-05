@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 
@@ -72,6 +73,12 @@ let pendingKickCount = 0;
 let unbanCount = 0;
 let expiryMarker;
 let oomVolume;
+let oomWritesSucceeded = 0;
+let oomFillStopReason = 'not_started';
+let oomFillError;
+let oomLastObservation;
+let oomRedisMemory;
+let oomCgroupEventsPath;
 let oomKickCount = 0;
 let oomKickWasEntered = false;
 let oomKickRelease;
@@ -92,10 +99,111 @@ const actor = { id: actorId, permissions: { bitfield: 8n }, roles: { highest: { 
 const botMember = { permissions: { bitfield: 8n, has: () => true }, roles: { highest: { comparePositionTo: () => 1 } } };
 
 function snowflake() { return randomUUID().replace(/\D/g, '').padEnd(18, '7').slice(0, 18); }
-function docker(args, allowFailure = false) {
-  const result = spawnSync('docker', args, { encoding: 'utf8', timeout: 120_000 });
-  if (!allowFailure && result.status !== 0) throw new Error(`docker ${args.join(' ')} failed: ${result.stderr.slice(-2000)}`);
-  return { status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+function docker(args, allowFailure = false, timeoutMs = 120_000) {
+  const result = spawnSync('docker', args, { encoding: 'utf8', timeout: timeoutMs });
+  if (!allowFailure && (result.error || result.status !== 0)) throw new Error(`docker ${args[0]} failed: ${result.error?.code ?? result.error?.name ?? result.status}`);
+  return {
+    status: result.status,
+    stdout: typeof result.stdout === 'string' ? result.stdout.trim() : '',
+    stderr: typeof result.stderr === 'string' ? result.stderr.trim() : '',
+    errorCode: result.error?.code,
+    errorName: result.error?.name,
+  };
+}
+function safeRedisFailure(error) {
+  const code = typeof error?.code === 'string' && /^[A-Z0-9_]{2,24}$/.test(error.code) ? error.code : undefined;
+  const text = typeof error?.message === 'string' ? error.message.slice(0, 256) : '';
+  if (['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ETIMEDOUT', 'ERR_SOCKET_CLOSED'].includes(code)
+    || /connection (?:closed|ended)|closed before a response|socket.*(?:closed|reset|timed out)/i.test(text)) {
+    return { category: 'connection_lost', code, message: 'Redis probe connection ended before a response.' };
+  }
+  if (/^OOM command not allowed/i.test(text)) return { category: 'maxmemory_refusal', message: 'Redis refused the write due to maxmemory.' };
+  if (/^ERR\b/i.test(text)) return { category: 'redis_command_error', message: 'Redis returned a command error.' };
+  return { category: 'unknown_write_error', ...(code ? { code } : {}), message: 'Redis write failed with an unclassified error.' };
+}
+async function readOomRedisMemory() {
+  if (!rawRedis) return { available: false, reason: 'probe-connection-unavailable' };
+  try {
+    const memory = await rawRedis.command(['INFO', 'memory']);
+    const stats = await rawRedis.command(['INFO', 'stats']);
+    const keys = await rawRedis.command(['DBSIZE']);
+    const number = (source, key) => Number(source.match(new RegExp(`^${key}:(\\d+)`, 'm'))?.[1] ?? 0);
+    return {
+      available: true,
+      usedMemoryBytes: number(memory, 'used_memory'),
+      usedMemoryRssBytes: number(memory, 'used_memory_rss'),
+      usedMemoryPeakBytes: number(memory, 'used_memory_peak'),
+      allocatorResidentBytes: number(memory, 'allocator_resident'),
+      maxMemoryBytes: number(memory, 'maxmemory'),
+      totalSystemMemoryBytes: number(memory, 'total_system_memory'),
+      totalKeys: Number(keys),
+      totalCommandsProcessed: number(stats, 'total_commands_processed'),
+      rejectedConnections: number(stats, 'rejected_connections'),
+    };
+  } catch (error) {
+    return { available: false, error: safeRedisFailure(error) };
+  }
+}
+async function observeCgroupForPid(pid) {
+  if (process.platform !== 'linux') return { available: false, reason: 'host-cgroup-unavailable' };
+  try {
+    if (Number.isInteger(pid) && pid > 0) {
+      const entries = (await readFile(`/proc/${pid}/cgroup`, 'utf8')).trim().split('\n');
+      const unified = entries.find(line => line.startsWith('0::'));
+      if (!unified) return { available: false, reason: 'cgroup-v2-path-not-found' };
+      const relative = unified.slice(3).replace(/^\/+/, '');
+      if (relative.split('/').includes('..')) return { available: false, reason: 'invalid-cgroup-path' };
+      oomCgroupEventsPath = `/sys/fs/cgroup/${relative}/memory.events`;
+    }
+    if (!oomCgroupEventsPath) return { available: false, reason: 'cgroup-path-not-captured-before-stop' };
+    const raw = await readFile(oomCgroupEventsPath, 'utf8');
+    const values = Object.fromEntries(raw.trim().split('\n').map(line => {
+      const [name, value] = line.split(/\s+/, 2);
+      return [name, Number(value)];
+    }));
+    return { available: true, memoryEvents: values };
+  } catch {
+    return { available: false, reason: 'host-cgroup-read-unavailable' };
+  }
+}
+async function captureOomObservation(label) {
+  const inspected = docker(['inspect', container, '--format', '{{json .State}}|{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.Id}}'], true, 5_000);
+  let state;
+  let memoryLimitBytes;
+  let memorySwapBytes;
+  let containerId;
+  try {
+    const [stateJson, limit, swap, id] = inspected.stdout.split('|');
+    state = JSON.parse(stateJson);
+    memoryLimitBytes = Number(limit);
+    memorySwapBytes = Number(swap);
+    containerId = id;
+  } catch { /* Preserve the inspect status below when the container has disappeared. */ }
+  const statsResult = docker(['stats', '--no-stream', '--format', '{{json .}}', container], true, 5_000);
+  let stats;
+  try { stats = JSON.parse(statsResult.stdout); } catch { /* stats is unavailable after a stop on some Docker engines. */ }
+  const cgroup = await observeCgroupForPid(state?.Pid);
+  const observation = {
+    label,
+    containerInspectAvailable: inspected.status === 0 && Boolean(state),
+    containerInspectExitCode: inspected.status,
+    containerInspectErrorCode: typeof inspected.errorCode === 'string' && /^[A-Z0-9_]{2,24}$/.test(inspected.errorCode) ? inspected.errorCode : undefined,
+    containerState: state ? {
+      status: state.Status, running: state.Running, oomKilled: state.OOMKilled,
+      exitCode: state.ExitCode, errorPresent: Boolean(state.Error), pid: state.Pid,
+    } : undefined,
+    configuredMemoryBytes: Number.isFinite(memoryLimitBytes) ? memoryLimitBytes : undefined,
+    configuredMemorySwapBytes: Number.isFinite(memorySwapBytes) ? memorySwapBytes : undefined,
+    containerIdPrefix: typeof containerId === 'string' ? containerId.slice(0, 12) : undefined,
+    statsAvailable: statsResult.status === 0 && Boolean(stats),
+    statsExitCode: statsResult.status,
+    statsErrorCode: typeof statsResult.errorCode === 'string' && /^[A-Z0-9_]{2,24}$/.test(statsResult.errorCode) ? statsResult.errorCode : undefined,
+    memoryUsage: stats?.MemUsage,
+    memoryPercent: stats?.MemPerc,
+    cgroup,
+  };
+  oomLastObservation = observation;
+  return observation;
 }
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 async function within(label, promise, timeoutMs = 15_000) {
@@ -626,17 +734,59 @@ try {
   assert.equal(configured, 'OK', 'cgroup OOM phase disables Redis maxmemory so it cannot be confused with a noeviction refusal');
   assert.match(await rawRedis.command(['INFO', 'memory']), /^maxmemory:0$/m, 'cgroup test confirms logical Redis maxmemory is disabled');
   const oomBlock = 'q'.repeat(1024 * 1024);
-  let oomWriterStatus = 0;
+  oomFillStopReason = 'write_limit_reached';
+  oomRedisMemory = await readOomRedisMemory();
   for (let i = 0; i < 256; i++) {
-    try { await rawRedis.command(['SET', `cgroup-oom:${i}`, oomBlock]); }
-    catch { oomWriterStatus = 1; break; }
-    const state = JSON.parse(docker(['inspect', container, '--format', '{{json .State}}']).stdout);
-    if (!state.Running) { oomWriterStatus = 1; break; }
+    try {
+      await rawRedis.command(['SET', `cgroup-oom:${i}`, oomBlock]);
+      oomWritesSucceeded++;
+    } catch (error) {
+      oomFillError = safeRedisFailure(error);
+      const observation = await captureOomObservation('redis_write_interrupted');
+      if (!observation.containerInspectAvailable) oomFillStopReason = 'docker_container_state_unavailable';
+      else if (observation.containerState?.running === false) {
+        oomFillStopReason = observation.containerState.oomKilled === true ? 'container_oom_confirmed' : 'container_stopped_without_oom_confirmation';
+      } else {
+        oomFillStopReason = oomFillError.category === 'connection_lost' ? 'redis_connection_lost' : 'redis_write_error';
+      }
+      break;
+    }
+    const stateResult = docker(['inspect', container, '--format', '{{json .State}}'], true, 5_000);
+    let state;
+    try { state = JSON.parse(stateResult.stdout); } catch { /* The complete observation below records unavailable Docker state. */ }
+    if (oomWritesSucceeded % 16 === 0 || state?.Running === false || stateResult.status !== 0) {
+      await captureOomObservation('filler_write_checkpoint');
+    }
+    if (stateResult.status !== 0) {
+      oomFillStopReason = 'docker_container_state_unavailable';
+      break;
+    }
+    if (!state?.Running) {
+      oomFillStopReason = state?.OOMKilled === true ? 'container_oom_confirmed' : 'container_stopped_without_oom_confirmation';
+      break;
+    }
+    if (oomWritesSucceeded % 16 === 0) oomRedisMemory = await readOomRedisMemory();
   }
-  await until('Redis cgroup OOM kill (not maxmemory rejection)', async () => {
-    const result = docker(['inspect', container, '--format', '{{json .State}}'], true);
-    try { return JSON.parse(result.stdout).OOMKilled === true; } catch { return false; }
-  }, 30_000);
+  try {
+    await until('Redis cgroup OOM kill (not maxmemory rejection)', async () => {
+      const result = docker(['inspect', container, '--format', '{{json .State}}'], true, 5_000);
+      try { return JSON.parse(result.stdout).OOMKilled === true; } catch { return false; }
+    }, 30_000);
+    oomFillStopReason = 'container_oom_confirmed';
+  } catch (error) {
+    const observation = await captureOomObservation('oom_confirmation_timeout_before_cleanup');
+    console.error(JSON.stringify({
+      event: 'redis_cgroup_oom_diagnostics_before_cleanup',
+      writesSucceeded: oomWritesSucceeded,
+      writeLimit: 256,
+      fillStopReason: oomFillStopReason,
+      interruptedBy: oomFillError,
+      sanitizedWaitFailure: error instanceof Error ? 'OOMKilled confirmation was not observed within the established bound.' : 'OOMKilled confirmation failed unexpectedly.',
+      redisMemoryLastAvailable: oomRedisMemory,
+      docker: observation,
+    }));
+    throw error;
+  }
   console.info(JSON.stringify({ event: 'redis_cgroup_oom_confirmed', containerLimitBytes: 64 * 1024 ** 2 }));
   const oomState = JSON.parse(docker(['inspect', container, '--format', '{{json .State}}']).stdout);
   assert.equal(oomState.OOMKilled, true, 'Docker confirms the Redis process was cgroup OOM-killed');
@@ -721,7 +871,7 @@ try {
     workerRedisErrors: workerErrors.length, queueRedisErrors: queueErrors.length, oomQueueDeliveries,
     workerFailureEventsBeforeRemoval: workerFailures.length,
     recoveryScenarios: [...recoveryScenarios.values()].map(({ operationId, deliveries, stalled, mutations, failures, completions }) => ({ operationId, deliveries, stalled, mutations, failures: failures.length, completions })),
-    cgroupOom: { containerLimitBytes: 64 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, oomWriterStopped: oomWriterStatus === 1, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
+    cgroupOom: { containerLimitBytes: 64 * 1024 ** 2, oomKilled: oomState.OOMKilled, exitCode: oomState.ExitCode, writesSucceeded: oomWritesSucceeded, fillStopReason: oomFillStopReason, interruptedBy: oomFillError, lastRedisMemory: oomRedisMemory, lastDockerObservation: oomLastObservation, inFlightMutations: oomKickCount, pendingRowsRecovered: 1, expiriesRecovered: 1, duplicateMutations: false, aofVolume: 'isolated; Redis 7 appendonly everysec' },
   }));
 } finally {
   kickRelease?.();
