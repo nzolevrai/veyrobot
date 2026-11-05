@@ -1,4 +1,5 @@
-FROM node:24.21.0-bookworm-slim AS build
+FROM node:24.22.2-bookworm-slim AS build
+RUN test "$(node --version)" = "v24.22.2"
 WORKDIR /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.18.3 --activate
@@ -10,7 +11,8 @@ ENV API_INTERNAL_URL=${API_INTERNAL_URL}
 ENV DATABASE_URL=postgresql://build:build@127.0.0.1:5432/build?schema=public
 RUN pnpm install --frozen-lockfile && pnpm db:generate && pnpm build
 
-FROM node:24.21.0-bookworm-slim AS runtime
+FROM node:24.22.2-bookworm-slim AS runtime
+RUN test "$(node --version)" = "v24.22.2"
 WORKDIR /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production

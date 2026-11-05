@@ -178,6 +178,7 @@ try {
   compose(['up', '--build', 'migrate']);
   const migrationId = containerId('migrate');
   assert.equal(Number(inspect(migrationId, '{{.State.ExitCode}}')), 0, 'production migration image completed successfully');
+  assert.equal(compose(['run', '--rm', '--no-deps', 'migrate', 'node', '--version']).stdout, 'v24.22.2', 'production image embeds the pinned Node 24.22.2 runtime');
   compose(['run', '--rm', '--no-deps', '-e', 'RECOVERY_GATE_INITIALIZE=1', '-e', `VEYROBOT_RECOVERY_EPOCH=${epoch}`, 'migrate', 'corepack', 'pnpm', '--filter', '@veyrobot/db', 'recovery-gate:init']);
   compose(['up', '-d', 'api', 'dashboard', 'bot']);
   await until('API and dashboard healthy and controlled worker alive', () => {
@@ -189,6 +190,9 @@ try {
   console.info(JSON.stringify({ event: 'resource_profile_services_healthy' }));
 
   const containers = Object.fromEntries(['postgres', 'redis', 'migrate', 'api', 'bot', 'dashboard'].map(service => [service, containerId(service)]));
+  for (const service of ['api', 'bot', 'dashboard']) {
+    assert.equal(docker(['exec', containers[service], 'node', '--version']).stdout, 'v24.22.2', `${service} runs the pinned Node 24.22.2 runtime`);
+  }
   const appliedLimits = Object.fromEntries(Object.entries(containers).map(([service, id]) => [service, Number(inspect(id, '{{.HostConfig.Memory}}'))]));
   for (const [service, expected] of Object.entries(expectedMemory)) assert.equal(appliedLimits[service], expected, `${service} actual Compose container cgroup limit`);
   const redisHostConfig = JSON.parse(inspect(containers.redis, '{{json .HostConfig}}'));

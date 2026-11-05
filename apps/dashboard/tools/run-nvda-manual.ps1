@@ -12,6 +12,11 @@ function Invoke-Checked([string]$File, [string[]]$Arguments) {
   if ($LASTEXITCODE -ne 0) { throw "$File exited with code $LASTEXITCODE" }
 }
 
+function Invoke-CheckedPnpm([string[]]$Arguments) {
+  & (Join-Path $repoRoot 'tools/pnpm.ps1') @Arguments
+  if ($LASTEXITCODE -ne 0) { throw "VeyroBot pnpm launcher exited with code $LASTEXITCODE" }
+}
+
 function Save-Environment([string]$Name, [string]$Value) {
   $savedEnvironment[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
   [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
@@ -20,15 +25,14 @@ function Save-Environment([string]$Name, [string]$Value) {
 try {
   $nodeVersionFile = Join-Path $repoRoot '.node-version'
   $pinnedNodeVersion = (Get-Content -LiteralPath $nodeVersionFile -ErrorAction Stop | Select-Object -First 1).Trim()
-  $pinnedNodeDirectory = Join-Path $env:LOCALAPPDATA "VeyroBot\runtime\node-v$pinnedNodeVersion-win-x64"
-  if (Test-Path -LiteralPath (Join-Path $pinnedNodeDirectory 'node.exe')) {
-    Save-Environment 'PATH' "$pinnedNodeDirectory;$env:PATH"
+  if ($pinnedNodeVersion -ne '24.22.2') { throw "Version Node inattendue dans .node-version : $pinnedNodeVersion" }
+  Invoke-CheckedPnpm @('--version')
+  $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+  $pinnedNodeExecutable = Join-Path $env:LOCALAPPDATA "VeyroBot\runtime\node-v$pinnedNodeVersion-win-$architecture\node.exe"
+  $nodeVersion = (& $pinnedNodeExecutable --version).Trim()
+  if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne "v$pinnedNodeVersion") {
+    throw "Node v$pinnedNodeVersion requis par le projet; version sélectionnée : $nodeVersion"
   }
-  $nodeVersion = (& node --version).Trim()
-  if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(24\.(1[7-9]|[2-9]\d)|2[5-9]\.)') {
-    throw "Node >=24.17.0 requis; version détectée : $nodeVersion"
-  }
-  if (-not (Get-Command corepack -ErrorAction SilentlyContinue)) { throw 'Corepack est requis.' }
   if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker Desktop/Engine est requis.' }
   & docker info --format '{{.ServerVersion}}' *> $null
   if ($LASTEXITCODE -ne 0) { throw 'Le moteur Docker est indisponible.' }
@@ -43,7 +47,7 @@ try {
     }
   }
   if (-not $firefoxDirectory) {
-    throw 'Firefox Playwright absent. Installe-le dans le cache utilisateur avec : corepack pnpm --filter @veyrobot/dashboard exec playwright install firefox ; puis relance cette commande.'
+    throw 'Firefox Playwright absent. Installe-le dans le cache utilisateur avec : tools/pnpm.ps1 --filter @veyrobot/dashboard exec playwright install firefox ; puis relance cette commande.'
   }
   Save-Environment 'PLAYWRIGHT_BROWSERS_PATH' $playwrightCache
 
@@ -67,10 +71,10 @@ try {
   Save-Environment 'DASHBOARD_BROWSER_ENGINE' 'firefox'
   Save-Environment 'DASHBOARD_NVDA_MANUAL' '1'
 
-  Invoke-Checked 'corepack' @('pnpm', 'db:generate')
-  Invoke-Checked 'corepack' @('pnpm', 'db:migrate')
-  Invoke-Checked 'corepack' @('pnpm', 'build')
-  Invoke-Checked 'corepack' @('pnpm', '--filter', '@veyrobot/api', 'exec', 'node', 'test/integration.mjs')
+  Invoke-CheckedPnpm @('db:generate')
+  Invoke-CheckedPnpm @('db:migrate')
+  Invoke-CheckedPnpm @('build')
+  Invoke-CheckedPnpm @('--filter', '@veyrobot/api', 'exec', 'node', 'test/integration.mjs')
 }
 finally {
   foreach ($name in $savedEnvironment.Keys) {

@@ -9,20 +9,21 @@ Lire `README.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE-MATRIX.md`, `docs/DASHBO
 - `apps/bot` : Gateway discord.js, commandes slash et worker BullMQ. Il distribue les demandes enregistrées, appelle Discord et réconcilie les résultats et échéances.
 - `packages/db` : schéma, migrations et accès Prisma/PostgreSQL ; `packages/contracts` : types et permissions partagés ; `packages/moderation/service` : règles et soumission métier sans Discord.js ; `packages/moderation/executor` : vérifications d'action et mutations Discord consommées par le bot. L'entrée racine reste un barrel de compatibilité.
 
-Utiliser Node >= 24.17.0 (24.21.0 dans `.node-version`, `.nvmrc`, CI et Docker), pnpm 10.18.3 et un gestionnaire Node qui sélectionne réellement cette version. Vérifier `node --version` : le `corepack.cmd` de Windows peut utiliser un autre Node. Les commandes depuis la racine sont :
+Utiliser Node 24.22.2 LTS (patch publié le 28 octobre 2026, après la version de sécurité 24.22.1 du 21 octobre) et pnpm 10.18.3. `.node-version`, `.nvmrc`, `engines`, CI et Docker doivent rester alignés. Sous Windows, utiliser `tools/pnpm.ps1` : il vérifie/installe Node dans `%LOCALAPPDATA%\VeyroBot\runtime`, vérifie le checksum officiel et utilise un shim Corepack limité au processus du projet, car le `corepack.cmd` système peut choisir un autre Node. Sur Unix, sélectionner `.node-version` et employer Corepack sans `--activate`. Les commandes Windows depuis la racine sont :
 
 ```text
-corepack prepare pnpm@10.18.3 --activate
-corepack pnpm install --frozen-lockfile
+tools/pnpm.ps1 install --frozen-lockfile
 docker compose up -d postgres redis
-corepack pnpm db:generate
-corepack pnpm db:migrate
-corepack pnpm dev
-corepack pnpm typecheck
-corepack pnpm lint
-corepack pnpm test
-corepack pnpm build
+tools/pnpm.ps1 db:generate
+tools/pnpm.ps1 db:migrate
+tools/pnpm.ps1 dev
+tools/pnpm.ps1 typecheck
+tools/pnpm.ps1 lint
+tools/pnpm.ps1 test
+tools/pnpm.ps1 build
 ```
+
+Sur Unix, les commandes équivalentes utilisent `corepack pnpm …` après sélection de Node 24.22.2. Le helper Windows modifie seulement l'environnement du processus lancé, n'active aucun Node global et ne touche pas la configuration des autres projets.
 
 Créer `.env` localement à partir de `.env.example` sans recopier de valeurs dans la documentation. `db:migrate` exige PostgreSQL et `DATABASE_URL`. La suite `test` exige également que `DATABASE_URL` soit définie, même quand `RUN_POSTGRES_INTEGRATION` est absent ; une URL factice suffit alors pour les tests simulés. Le développement exige aussi Redis et les identifiants Discord pour les parcours réels ; les tests d'intégration PostgreSQL exigent migrations appliquées et `RUN_POSTGRES_INTEGRATION=1`. CI lance PostgreSQL 17 et Redis 7, génération, migration, contrôle schéma/migrations, typecheck, build, lint et tests; `RUN_POSTGRES_INTEGRATION=1` et `RUN_REDIS_INTEGRATION=1` rendent les intégrations obligatoires. `corepack pnpm --filter @veyrobot/bot deploy:commands` publie les commandes uniquement dans `DISCORD_TEST_GUILD_ID` ; ne l'exécuter qu'avec la guilde de test voulue.
 

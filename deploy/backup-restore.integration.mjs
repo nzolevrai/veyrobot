@@ -100,7 +100,7 @@ let freshCreated = false;
 let concurrentCreated = false;
 try {
   const nodeVersion = process.versions.node.split('.').map(Number);
-  assert.ok(nodeVersion[0] > 24 || (nodeVersion[0] === 24 && nodeVersion[1] >= 17), `Node >=24.17 required; got ${process.versions.node}`);
+  assert.ok(nodeVersion[0] === 24 && (nodeVersion[1] > 22 || (nodeVersion[1] === 22 && nodeVersion[2] >= 2)), `Node >=24.22.2 and <25 required; got ${process.versions.node}`);
   await writeFile(composeFile, `services:\n  postgres:\n    image: postgres:17-alpine\n    environment:\n      POSTGRES_USER: ${pgUser}\n      POSTGRES_DB: ${sourceDb}\n      POSTGRES_HOST_AUTH_METHOD: trust\n    ports:\n      - "127.0.0.1::5432"\n  redis:\n    image: redis:7-alpine\n    ports:\n      - "127.0.0.1::6379"\n`);
   composeStarted = true;
   await docker([...composePrefix, 'up', '-d', 'postgres', 'redis']);

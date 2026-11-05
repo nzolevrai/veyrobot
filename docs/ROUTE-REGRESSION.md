@@ -23,7 +23,7 @@ La lecture des dossiers ne relance plus immédiatement une requête après chaqu
 
 ## Validation
 
-- Lint, vérification TypeScript, suite de tests et builds réussis avec Node 24.17 ou supérieur.
+- Lint, vérification TypeScript, suite de tests et builds doivent utiliser le patch Node LTS courant épinglé par `.node-version`, CI et Docker (24.22.2, publié le 28 octobre 2026).
 - Test d’intégration PostgreSQL/API/Next : OAuth simulé, serveur autorisé, route directe, actualisation, cookie absent, API arrêtée, 429 Discord, dossiers et persistance. Aucun appel de modération Discord réel.
 - HTTP local après redémarrage : `/health` 200 ; `/` 200 ; `/api/me` et `/api/guilds` sans session 401 `SESSION_ABSENT` ; route de serveur sans session 307.
 

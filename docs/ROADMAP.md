@@ -38,7 +38,7 @@ Délégations d'équipe révocables, droits/quota centralisés, configuration d'
 
 ## Décisions importantes
 
-- Node 24.21.0, minimum discord.js 14.27.0 : Node 24.17.0. Le runtime compatible est sélectionné dans les fichiers locaux, Docker et CI.
+- Node 24.22.2 LTS, patch du 28 octobre succédant au correctif de sécurité du 21 octobre, est épinglé dans les fichiers locaux, le moteur du projet, Docker et CI. Les rapports de mesures plus anciens conservent leurs versions réellement exécutées.
 - Un processus bot supporté actuellement. Plusieurs bots partageant le même token n'ont ni coordination REST globale ni routage shard livré.
 - L'API écrit les demandes dans PostgreSQL sans Redis. Le bot est seul responsable de la publication BullMQ; une panne Redis retarde le travail sans perdre la demande.
 - Worker concurrence quatre, mais une opération active maximum par guild. La sélection SQL est indexée et publie au plus un dossier par guild à la fois. Les sanctions précèdent la purge par priorité.

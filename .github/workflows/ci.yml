@@ -40,7 +40,7 @@ jobs:
           version: 10.18.3
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.21.0
+          node-version: 24.22.2
           cache: pnpm
       - name: Verify production Compose budgets are rendered and enforced
         run: node deploy/verify-compose-budgets.mjs
