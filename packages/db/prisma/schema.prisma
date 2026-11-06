@@ -110,3 +110,11 @@ model SessionGrant {
   revokedAt DateTime?
   @@index([expiresAt])
 }
+
+/// Runtime authorization is intentionally stored outside the operational tables.
+/// The expected epoch is supplied by deployment configuration, not by a backup.
+model RecoveryGate {
+  id String @id @default("singleton") @db.VarChar(16)
+  epochHash String @db.VarChar(64)
+  updatedAt DateTime @updatedAt
+}

@@ -12,6 +12,7 @@ const seconds = Number(process.env.BENCH_SECONDS ?? 1800);
 const phaseSeconds = Number(process.env.BENCH_PHASE_SECONDS ?? 300);
 const idleSeconds = Number(process.env.BENCH_IDLE_SECONDS ?? 300);
 const quietGuilds = Number(process.env.BENCH_QUIET_GUILDS ?? 100);
+const dominantGuildCount = Number(process.env.BENCH_DOMINANT_GUILDS ?? 3);
 const normalRps = Number(process.env.BENCH_NORMAL_RPS ?? 2);
 const dominantRps = Number(process.env.BENCH_DOMINANT_RPS ?? 8);
 const burstRps = Number(process.env.BENCH_BURST_RPS ?? 20);
@@ -26,18 +27,20 @@ const runId = randomUUID().replaceAll('-', '').slice(0, 12);
 const prefix = `bench_${runId}_`;
 const queueName = 'veyrobot-moderation';
 const env = process.env;
-if (![seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, progressSeconds, drainTimeoutMs, dispatcherIntervalMs].every(Number.isFinite) || seconds < 30 || seconds > 86_400 || phaseSeconds < 30 || idleSeconds < 0 || quietGuilds < 2 || quietGuilds > 2_000 || normalRps < 0.1 || normalRps > 100 || dominantRps < 0.1 || dominantRps > 100 || burstRps < 0.1 || burstRps > 200 || burstSeconds < 1 || burstSeconds > 60 || expiryPerMinute < 0 || expiryPerMinute > 60 || discordDelayMs < 0 || discordDelayMs > 5_000 || sampleSeconds < 1 || sampleSeconds > 60 || progressSeconds < 0 || dispatcherIntervalMs < 100 || dispatcherIntervalMs > 60_000) throw new Error('Invalid benchmark parameters.');
+if (![seconds, phaseSeconds, idleSeconds, quietGuilds, dominantGuildCount, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, progressSeconds, drainTimeoutMs, dispatcherIntervalMs].every(Number.isFinite) || seconds < 30 || seconds > 86_400 || phaseSeconds < 30 || idleSeconds < 0 || quietGuilds < 2 || quietGuilds > 2_000 || dominantGuildCount < 1 || dominantGuildCount > 8 || quietGuilds + dominantGuildCount > 2_000 || normalRps < 0.1 || normalRps > 100 || dominantRps < 0.1 || dominantRps > 100 || burstRps < 0.1 || burstRps > 200 || burstSeconds < 1 || burstSeconds > 60 || expiryPerMinute < 0 || expiryPerMinute > 60 || discordDelayMs < 0 || discordDelayMs > 5_000 || sampleSeconds < 1 || sampleSeconds > 60 || progressSeconds < 0 || dispatcherIntervalMs < 100 || dispatcherIntervalMs > 60_000) throw new Error('Invalid benchmark parameters.');
 if (seconds < 1800 && env.BENCH_ALLOW_SHORT !== '1') throw new Error('A decision campaign must run at least 1800s. Use BENCH_ALLOW_SHORT=1 only for a harness smoke test.');
-if (!env.DATABASE_URL?.includes('veyrobot_arch_bench')) throw new Error('Use the isolated veyrobot_arch_bench database.');
+if (!env.DATABASE_URL?.includes('veyrobot_foundation_bench')) throw new Error('Use the isolated veyrobot_foundation_bench database.');
 const redisDb = env.REDIS_URL ? new URL(env.REDIS_URL).pathname : '';
 if (!/^\/(?:[1-9]|1[0-5])$/.test(redisDb)) throw new Error('Use a dedicated nonzero Redis logical database (1–15) for the benchmark.');
 
-const guildIds = Array.from({ length: quietGuilds + 1 }, (_, index) => String(200_000_000_000_000_000n + BigInt(index)));
-const dominantGuild = guildIds[0];
+const guildIds = Array.from({ length: quietGuilds + dominantGuildCount }, (_, index) => String(200_000_000_000_000_000n + BigInt(index)));
+const dominantGuildIds = guildIds.slice(0, dominantGuildCount);
+let nextDominantGuild = 0;
 const actorId = '123456789012345679';
 const counters = { offered: 0, accepted: 0, refused: 0, admissionErrors: 0, arrivalsDelayed: 0, completed: 0, failed: 0, uncertain: 0, expired: 0, expiryUncertain: 0, expiryFailed: 0, discordActionCalls: 0, discordExpiryCalls: 0, dispatchErrors: 0 };
 const enqueueAttemptTimes = new Map();
-const latency = { quietDispatch: [], quietSerialization: [], quietWorkerWait: [], quietTotal: [], dominantDispatch: [], dominantSerialization: [], dominantWorkerWait: [], dominantTotal: [], expiryDispatch: [], expirySerialization: [], expiryWorkerWait: [], expiryTotal: [] };
+const attemptStartTimes = new Map();
+const latency = { quietAdmission: [], dominantAdmission: [], quietDispatcherElapsed: [], quietSerializationWait: [], quietQueueWait: [], quietAcceptToStart: [], quietExecution: [], quietAcceptToFinish: [], dominantDispatcherElapsed: [], dominantSerializationWait: [], dominantQueueWait: [], dominantAcceptToStart: [], dominantExecution: [], dominantAcceptToFinish: [], expiryAgeToStart: [], expirySerializationWait: [], expiryExecution: [], expiryDueToFinish: [] };
 const lastGuildFinishAt = new Map();
 let busyGuildSkips = 0;
 const samples = [];
@@ -97,33 +100,52 @@ function recordEnqueueAttempt(event) {
 }
 function recordAttemptStarted(attempt) {
   const enqueueAttempt = enqueueAttemptTimes.get(attempt.operationId);
-  if (!enqueueAttempt) return;
+  if (!enqueueAttempt && attempt.kind !== 'expiry') return;
   const startedAt = Date.now();
   const previousFinishAt = lastGuildFinishAt.get(attempt.guildId) ?? attempt.createdAt.getTime();
-  const enqueueStartedAt = enqueueAttempt.last;
+  const enqueueStartedAt = enqueueAttempt?.last;
   if (attempt.kind === 'expiry') {
     const dueAt = attempt.scheduledAt?.getTime() ?? attempt.createdAt.getTime();
-    latency.expiryDispatch.push(Math.max(0, enqueueStartedAt - Math.max(dueAt, previousFinishAt)));
-    latency.expirySerialization.push(Math.max(0, previousFinishAt - dueAt));
-    latency.expiryWorkerWait.push(Math.max(0, startedAt - Math.max(enqueueStartedAt, previousFinishAt)));
-    latency.expiryTotal.push(Math.max(0, startedAt - dueAt));
+    latency.expirySerializationWait.push(Math.max(0, previousFinishAt - dueAt));
+    latency.expiryAgeToStart.push(Math.max(0, startedAt - dueAt));
+    attemptStartTimes.set(attempt.operationId, { startedAt: performance.now(), referenceAt: dueAt, kind: 'expiry' });
   } else {
-    const category = attempt.guildId === dominantGuild ? 'dominant' : 'quiet';
-    latency[`${category}Dispatch`].push(Math.max(0, enqueueStartedAt - Math.max(attempt.createdAt.getTime(), previousFinishAt)));
-    latency[`${category}Serialization`].push(Math.max(0, previousFinishAt - attempt.createdAt.getTime()));
-    latency[`${category}WorkerWait`].push(Math.max(0, startedAt - Math.max(enqueueStartedAt, previousFinishAt)));
-    latency[`${category}Total`].push(Math.max(0, startedAt - attempt.createdAt.getTime()));
+    const category = dominantGuildIds.includes(attempt.guildId) ? 'dominant' : 'quiet';
+    if (enqueueStartedAt) {
+      latency[`${category}DispatcherElapsed`].push(Math.max(0, enqueueStartedAt - Math.max(attempt.createdAt.getTime(), previousFinishAt)));
+      latency[`${category}QueueWait`].push(Math.max(0, startedAt - Math.max(enqueueStartedAt, previousFinishAt)));
+    }
+    latency[`${category}SerializationWait`].push(Math.max(0, previousFinishAt - attempt.createdAt.getTime()));
+    latency[`${category}AcceptToStart`].push(Math.max(0, startedAt - attempt.createdAt.getTime()));
+    attemptStartTimes.set(attempt.operationId, { startedAt: performance.now(), referenceAt: attempt.createdAt.getTime(), kind: category });
   }
   enqueueAttemptTimes.delete(attempt.operationId);
+}
+function recordAttemptFinished(guildId, operationId) {
+  const attempt = attemptStartTimes.get(operationId);
+  if (!attempt) return;
+  const endedAt = Date.now();
+  const executionMs = performance.now() - attempt.startedAt;
+  if (attempt.kind === 'expiry') {
+    latency.expiryExecution.push(executionMs);
+    latency.expiryDueToFinish.push(Math.max(0, endedAt - attempt.referenceAt));
+  } else {
+    latency[`${attempt.kind}Execution`].push(executionMs);
+    latency[`${attempt.kind}AcceptToFinish`].push(Math.max(0, endedAt - attempt.referenceAt));
+  }
+  attemptStartTimes.delete(operationId);
+  lastGuildFinishAt.set(guildId, endedAt);
 }
 function chooseProfile(elapsedSeconds) {
   const phase = Math.floor(elapsedSeconds / phaseSeconds) % 4;
   const minuteSeconds = elapsedSeconds % 60;
-  if (phase === 0) return { name: 'normal', rps: normalRps, guild: () => guildIds[1 + (counters.offered % quietGuilds)] };
-  if (phase === 1) return { name: 'dominant', rps: dominantRps, guild: () => counters.offered % 5 === 0 ? guildIds[1 + (counters.offered % quietGuilds)] : dominantGuild };
-  if (phase === 2 && minuteSeconds < burstSeconds) return { name: 'burst', rps: burstRps, guild: () => counters.offered % 10 === 0 ? guildIds[1 + (counters.offered % quietGuilds)] : dominantGuild };
-  if (phase === 2) return { name: 'normal', rps: normalRps, guild: () => guildIds[1 + (counters.offered % quietGuilds)] };
-  return { name: 'mixed', rps: normalRps + dominantRps / 2, guild: () => counters.offered % 3 === 0 ? guildIds[1 + (counters.offered % quietGuilds)] : dominantGuild };
+  const quietGuild = () => guildIds[dominantGuildCount + (counters.offered % quietGuilds)];
+  const dominantGuild = () => dominantGuildIds[nextDominantGuild++ % dominantGuildCount];
+  if (phase === 0) return { name: 'normal', rps: normalRps, guild: quietGuild };
+  if (phase === 1) return { name: 'dominant', rps: dominantRps, guild: () => counters.offered % 5 === 0 ? quietGuild() : dominantGuild() };
+  if (phase === 2 && minuteSeconds < burstSeconds) return { name: 'burst', rps: burstRps, guild: () => counters.offered % 10 === 0 ? quietGuild() : dominantGuild() };
+  if (phase === 2) return { name: 'normal', rps: normalRps, guild: quietGuild };
+  return { name: 'mixed', rps: normalRps + dominantRps / 2, guild: () => counters.offered % 3 === 0 ? quietGuild() : dominantGuild() };
 }
 
 async function admitAction(category, guildId) {
@@ -131,10 +153,12 @@ async function admitAction(category, guildId) {
   const targetId = String(300_000_000_000_000_000n + BigInt(counters.offered));
   const data = { ...{ operationId }, guildId, actorId, targetId, action: 'KICK', reason: 'isolated production worker benchmark' };
   counters.offered++;
+  const receivedAt = performance.now();
   pendingAdmission++;
   try {
     await withModerationAdmission(prisma, guildId, operationId, tx => submitModerationAction(tx, data));
     counters.accepted++;
+    latency[`${dominantGuildIds.includes(guildId) ? 'dominant' : 'quiet'}Admission`].push(performance.now() - receivedAt);
   } catch (error) {
     if (error?.code === 'MODERATION_BACKLOG_LIMIT') counters.refused++;
     else { counters.admissionErrors++; throw error; }
@@ -143,7 +167,7 @@ async function admitAction(category, guildId) {
 async function createExpiry() {
   const sequence = counters.expired + counters.expiryUncertain + counters.expiryFailed + counters.discordExpiryCalls;
   const operationId = `${prefix}expiry_${String(Date.now())}_${String(sequence).padStart(5, '0')}`;
-  const guildId = guildIds[1 + (sequence % quietGuilds)];
+  const guildId = guildIds[dominantGuildCount + (sequence % quietGuilds)];
   const targetId = String(400_000_000_000_000_000n + BigInt(sequence));
   const row = await prisma.moderationCase.create({ data: { guildId, actorId, targetId, action: 'TEMPBAN', reason: 'isolated expiry benchmark', status: 'succeeded', operationId, banMarker: `veyro-case-${operationId}`, banGeneration: 1, expiryStatus: 'scheduled', expiresAt: new Date(Date.now() - 1), createdAt: new Date() } });
   counters.expired++;
@@ -190,7 +214,7 @@ try {
   if (Object.values(existingJobs).some(value => value > 0)) throw new Error('Isolated Redis DB 9 queue is not empty; refusing to touch pre-existing jobs.');
   worker = createModerationWorker(mockClient, redisConnection(env.REDIS_URL), prisma, await import('@veyrobot/moderation'), (config, action, createdAt) => config?.memberActionsEnabled !== true && createdAt > (config?.updatedAt ?? new Date(0)), () => { if (dispatch) setImmediate(() => void dispatch()); }, {
     onAttemptStarted: recordAttemptStarted,
-    onAttemptFinished: guildId => { lastGuildFinishAt.set(guildId, Date.now()); },
+    onAttemptFinished: recordAttemptFinished,
     onGuildBusySkip: () => { busyGuildSkips++; },
   });
   worker.on('error', error => { counters.dispatchErrors++; console.error(JSON.stringify({ event: 'bench_worker_error', name: error?.name })); });
@@ -266,7 +290,7 @@ try {
   console.log(JSON.stringify({
     runId, scope: 'production createDispatcher + createModerationWorker + executeModerationAction/expireTemporaryBan; local controlled Discord adapter; isolated PostgreSQL and Redis DB; no real Discord requests',
     machine: { node: process.version, platform: `${os.type()} ${os.release()}`, cpus: os.cpus().length, cpuModel: os.cpus()[0]?.model },
-    config: { seconds, phaseSeconds, idleSeconds, quietGuilds, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, drainTimeoutMs, workerConcurrency: 4, maxActivePerGuild: 1, admissionGlobal: Number(env.MAX_PENDING_GLOBAL ?? 5000), admissionPerGuild: Number(env.MAX_PENDING_PER_GUILD ?? 100), poolMax: Number(env.DATABASE_POOL_SIZE ?? 10), dispatcherIntervalMs, redisDatabase: redisDb },
+    config: { seconds, phaseSeconds, idleSeconds, quietGuilds, dominantGuildCount, normalRps, dominantRps, burstRps, burstSeconds, expiryPerMinute, discordDelayMs, sampleSeconds, drainTimeoutMs, workerConcurrency: 4, maxActivePerGuild: 1, admissionGlobal: Number(env.MAX_PENDING_GLOBAL ?? 5000), admissionPerGuild: Number(env.MAX_PENDING_PER_GUILD ?? 100), poolMax: Number(env.DATABASE_POOL_SIZE ?? 10), dispatcherIntervalMs, redisDatabase: redisDb, admissionPath: 'direct production PostgreSQL admission use case (not HTTP API)' },
     counts: { ...counters, busyGuildSkips, unmatchedEnqueueAttempts: enqueueAttemptTimes.size, rows: rows.length, terminal: actionRows.filter(row => ['succeeded', 'failed', 'uncertain'].includes(row.status)).length, expiredCompleted: expiryRows.filter(row => ['succeeded', 'failed', 'uncertain', 'superseded'].includes(row.expiryStatus)).length, pendingAfterDrain: pendingRows },
     latencyMs: Object.fromEntries(Object.entries(latency).map(([key, value]) => [key, summary(value)])),
     category: Object.fromEntries(byCategory),

@@ -9,20 +9,21 @@ Lire `README.md`, `docs/ARCHITECTURE.md`, `docs/FEATURE-MATRIX.md`, `docs/DASHBO
 - `apps/bot` : Gateway discord.js, commandes slash et worker BullMQ. Il distribue les demandes enregistrées, appelle Discord et réconcilie les résultats et échéances.
 - `packages/db` : schéma, migrations et accès Prisma/PostgreSQL ; `packages/contracts` : types et permissions partagés ; `packages/moderation/service` : règles et soumission métier sans Discord.js ; `packages/moderation/executor` : vérifications d'action et mutations Discord consommées par le bot. L'entrée racine reste un barrel de compatibilité.
 
-Utiliser Node >= 24.17.0 (24.21.0 dans `.node-version`, `.nvmrc`, CI et Docker), pnpm 10.18.3 et un gestionnaire Node qui sélectionne réellement cette version. Vérifier `node --version` : le `corepack.cmd` de Windows peut utiliser un autre Node. Les commandes depuis la racine sont :
+Utiliser Node 24.22.2 LTS (patch publié le 28 octobre 2026, après la version de sécurité 24.22.1 du 21 octobre) et pnpm 10.18.3. `.node-version`, `.nvmrc`, `engines`, CI et Docker doivent rester alignés. Sous Windows, utiliser `tools/pnpm.ps1` : il vérifie/installe Node dans `%LOCALAPPDATA%\VeyroBot\runtime`, vérifie le checksum officiel et utilise un shim Corepack limité au processus du projet, car le `corepack.cmd` système peut choisir un autre Node. Sur Unix, sélectionner `.node-version` et employer Corepack sans `--activate`. Les commandes Windows depuis la racine sont :
 
 ```text
-corepack prepare pnpm@10.18.3 --activate
-corepack pnpm install --frozen-lockfile
+tools/pnpm.ps1 install --frozen-lockfile
 docker compose up -d postgres redis
-corepack pnpm db:generate
-corepack pnpm db:migrate
-corepack pnpm dev
-corepack pnpm typecheck
-corepack pnpm lint
-corepack pnpm test
-corepack pnpm build
+tools/pnpm.ps1 db:generate
+tools/pnpm.ps1 db:migrate
+tools/pnpm.ps1 dev
+tools/pnpm.ps1 typecheck
+tools/pnpm.ps1 lint
+tools/pnpm.ps1 test
+tools/pnpm.ps1 build
 ```
+
+Sur Unix, les commandes équivalentes utilisent `corepack pnpm …` après sélection de Node 24.22.2. Le helper Windows modifie seulement l'environnement du processus lancé, n'active aucun Node global et ne touche pas la configuration des autres projets.
 
 Créer `.env` localement à partir de `.env.example` sans recopier de valeurs dans la documentation. `db:migrate` exige PostgreSQL et `DATABASE_URL`. La suite `test` exige également que `DATABASE_URL` soit définie, même quand `RUN_POSTGRES_INTEGRATION` est absent ; une URL factice suffit alors pour les tests simulés. Le développement exige aussi Redis et les identifiants Discord pour les parcours réels ; les tests d'intégration PostgreSQL exigent migrations appliquées et `RUN_POSTGRES_INTEGRATION=1`. CI lance PostgreSQL 17 et Redis 7, génération, migration, contrôle schéma/migrations, typecheck, build, lint et tests; `RUN_POSTGRES_INTEGRATION=1` et `RUN_REDIS_INTEGRATION=1` rendent les intégrations obligatoires. `corepack pnpm --filter @veyrobot/bot deploy:commands` publie les commandes uniquement dans `DISCORD_TEST_GUILD_ID` ; ne l'exécuter qu'avec la guilde de test voulue.
 
@@ -36,7 +37,8 @@ Créer `.env` localement à partir de `.env.example` sans recopier de valeurs da
 - Limiter l'admission des demandes actives (`MAX_PENDING_GLOBAL`, `MAX_PENDING_PER_GUILD`) avec refus 429 explicite ; conserver le même `operationId` pour un nouvel essai. Le verrou de démarrage PostgreSQL impose un seul processus bot avec ce token tant que propriété des shards et coordination REST ne sont pas livrées. Un jeton de fencing empêche un ancien exécuteur d'écraser la base, mais ne peut pas annuler un appel Discord déjà parti.
 - Distinguer les échecs explicites Discord (notamment permissions et autres 4xx connus) des réponses ambiguës (timeout, 5xx, interruption après début de mutation). Une mutation ambiguë devient `uncertain` et demande examen humain : aucune répétition automatique aveugle. Les 429 sont normalement gérés par l'ordonnanceur REST discord.js ; si l'erreur remonte, enregistrer l'échec selon le chemin existant. Aucun appel Discord et écriture SQL ne forment une transaction atomique. Préserver les générations de bans temporaires : `generation` représente la dernière demande, `appliedGeneration` n'avance qu'avec le succès PostgreSQL durable. Documenter les courses externes qui restent possibles.
 
-- Dans Fastify, laisser `trustProxy` désactivé par défaut; n'accepter les proxys que via `API_TRUSTED_PROXIES` avec pairs stables. Le proxy Next retire les en-têtes `Forwarded` et `X-Forwarded-*` entrants; les routes authentifiées se limitent par session.
+- Dans Fastify, laisser `trustProxy` désactivé par défaut; n'accepter les proxys que via `API_TRUSTED_PROXIES` avec pairs stables. Le proxy Next retire les en-têtes de transfert du navigateur. Pour une clé anonyme par IP derrière Next, configurer seulement l'en-tête explicitement écrasé par l'ingress (`DASHBOARD_TRUSTED_CLIENT_IP_HEADER`) et le même secret HMAC externe dans Next/API (`API_PROXY_CLIENT_IP_SECRET`); l'API ignore toute identité non signée. Le limiteur pré-auth IP (`API_PREAUTH_RATE_LIMIT_MAX`, 180/minute par défaut) s'exécute avant le parsing et les lectures de `SessionGrant` concernées; `/ready` reste une sonde distincte qui exécute `SELECT 1` et doit être protégée par la topologie réseau. Le quota normal et les limites spécifiques aux routes utilisent une session uniquement après validation du grant, sinon l'IP attestée/socket. Une panne de validation n'accorde jamais de quota de session. Les limites Fastify sont en mémoire par instance; garder un plafond global au frontal/WAF. Les sessions valides gardent un bucket distinct en plus du plafond IP pré-auth.
+- En production, la CSP Next utilise un nonce par réponse pour `script-src`; conserver son rendu dynamique et ne réintroduire `unsafe-inline` pour les scripts qu'après une revue de sécurité et un test navigateur. Le style inline reste permis pour les composants existants jusqu'à migration dédiée.
 - Les commandes Discord doivent être acquittées avant DB/admission et utiliser une réponse compatible avec l'état de l'interaction (`reply`, `editReply`, `followUp`). Les erreurs internes API renvoient un statut classé et un message générique corrélé par `requestId`; ne pas renvoyer messages Prisma ou piles.
 ## Performance et interface
 
@@ -48,6 +50,7 @@ Créer `.env` localement à partir de `.env.example` sans recopier de valeurs da
 ## Vérification, secrets et documentation
 
 - Distinguer dans tout compte rendu : tests unitaires avec doubles, intégration locale réelle PostgreSQL/API, appels Discord réels sur serveur de test et validation visuelle dans un navigateur. Un build, un HTTP 200 ou un test simulé ne prouvent ni une sanction Discord réelle ni un rendu visuel correct. Indiquer les commandes exécutées, le résultat, les étapes non exécutées et leurs raisons. Ne jamais annoncer une vérification non effectuée, une absence totale d'erreurs ou une note parfaite par obligation.
+- Les tests d'intégration qui créent des actions `requested` doivent utiliser une base PostgreSQL isolée, non partagée avec un bot ou un dispatcher local actif; un processus de développement peut consommer les fixtures et rendre le résultat non déterministe. Utiliser également un Redis de test/une file dédiée, comme les services isolés en CI. Ne pas lancer ces tests sur une base contenant du travail réel.
 - Ne pas lire, afficher, committer ou publier `.env`, jetons, cookies, codes OAuth, clés, journaux sensibles ou configuration personnelle de l'assistant. Utiliser `.env.example` avec des valeurs fictives et des noms de variables. Inspecter les noms de fichiers suivis/préparés et le diff avant chaque commit ; arrêter la publication si un secret ou un fichier personnel est présent. Ne pas modifier une configuration globale d'assistant qui touche d'autres projets sans présenter au propriétaire les changements proposés.
 - Exécuter la rétention uniquement sur une base sauvegardée via `maintenance:retention` : lots et nombre de lots bornés, délais configurables. Préserver les `operationId`, dossiers d'action, états incertains, générations et échéances. Tester une restauration sur base isolée avant exploitation ; une migration additive est distincte d'un rollback applicatif.
 - Après chaque changement de comportement, mettre à jour le document pertinent : `README.md` pour l'installation et les limites visibles, `ARCHITECTURE.md` pour flux et garanties, `FEATURE-MATRIX.md` pour les capacités, `DASHBOARD-DESIGN.md` pour l'interface, `PERFORMANCE-BASELINE.md` pour les mesures, `ROADMAP.md` pour l'état et les suites. Garder cet AGENTS.md concis et durable, sans journal de session.

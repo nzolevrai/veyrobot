@@ -12,7 +12,7 @@ test('PostgreSQL persists and reloads a warning dossier', { skip: !enabled }, as
   const targetId = '123456789012345678';
   await assert.rejects(createWarningCase({ guildId: testGuildId, actorId: '123456789012345680', targetId, reason: 'Must be disabled' }), /désactivé/);
   await prisma.guildConfig.create({ data: { guildId: testGuildId, updatedBy: '123456789012345680', warningsEnabled: true, language: 'en', timeZone: 'Europe/Paris', embedColor: '#123ABC' } });
-  const record = await createWarningCase({ guildId: testGuildId, actorId: '123456789012345680', targetId, reason: 'Integration persistence check' });
+  const record = await createWarningCase({ operationId: `warn-${crypto.randomUUID()}`, guildId: testGuildId, actorId: '123456789012345680', targetId, reason: 'Integration persistence check' });
   createdId = record.id;
   const loaded = await prisma.moderationCase.findFirst({ where: { id: record.id, guildId: record.guildId, targetId } });
   assert.ok(loaded);

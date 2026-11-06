@@ -6,6 +6,10 @@ import { createDispatcher } from './dispatcher.js';
 import { z } from 'zod';
 import { acquireSingleBotLease } from './single-instance.js';
 import { registerInteractionHandler } from './interactions.js';
+import { logBotError, logBotOperation } from './error-log.js';
+import { reconcileInterruptedModeration } from './reconciliation.js';
+import { readBotCacheCounts } from './resource-snapshot.js';
+import { destroyClientBeforeReleasingLease } from './shutdown-order.js';
 
 const lastErrorLogAt = new Map<string, number>();
 const errorTotals = new Map<string, number>();
@@ -15,10 +19,16 @@ function logThrottled(key: string, message: string, error: unknown): void {
   if (now - (lastErrorLogAt.get(key) ?? 0) < 60_000) return;
   lastErrorLogAt.set(key, now);
   if (lastErrorLogAt.size > 32) lastErrorLogAt.delete(lastErrorLogAt.keys().next().value!);
-  console.error(message, error instanceof Error ? error.name : 'unknown error');
+  logBotError('bot_error', key, message, error);
+}
+function redisInfoNumber(info: string, key: string, field?: string): number {
+  const line = info.split(/\r?\n/).find(value => value.startsWith(`${key}:`));
+  if (!field) return Number(line?.slice(key.length + 1).split(',')[0] ?? 0) || 0;
+  const match = line?.match(new RegExp(`(?:^|,)${field}=(\\d+)(?:,|$)`));
+  return match ? Number(match[1]) : 0;
 }
 
-const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379') });
+const envSchema = z.object({ DISCORD_BOT_TOKEN: z.string().min(1), DISCORD_CLIENT_ID: z.string().min(1), DATABASE_URL: z.string().min(1), REDIS_URL: z.string().url().default('redis://localhost:6379'), VEYROBOT_RECOVERY_EPOCH: z.string().min(32).max(256) });
 const envResult = envSchema.safeParse(process.env);
 if (!envResult.success) {
   const fields = [...new Set(envResult.error.issues.map(issue => issue.path.join('.')))];
@@ -26,12 +36,20 @@ if (!envResult.success) {
   process.exit(1);
 }
 const env = envResult.data;
+const { prisma, assertRecoveryAuthorized } = await import('@veyrobot/db');
+try {
+  await assertRecoveryAuthorized(prisma, env.VEYROBOT_RECOVERY_EPOCH);
+} catch {
+  console.error('Bot startup refused: recovery authorization is missing, stale, or unavailable.');
+  await prisma.$disconnect();
+  process.exit(1);
+}
 const releaseBotLease = await acquireSingleBotLease(env.DATABASE_URL, () => {
   console.error('Verrou de processus bot perdu : arrêt pour éviter deux exécuteurs actifs.');
   process.exit(1);
 });
-const [{ rejectPendingAfterDisable, prisma, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
-const { markInterruptedOperationsUncertain, redisConnection } = moderation;
+const [{ rejectPendingAfterDisable, postgresPool, takePoolAcquireMetrics }, moderation] = await Promise.all([import('@veyrobot/db'), import('@veyrobot/moderation')]);
+const { redisConnection } = moderation;
 // Uncertain network/5xx responses must reach our durable state machine; avoid
 // the REST layer automatically repeating non-idempotent moderation requests.
 const client = new Client({ intents: [GatewayIntentBits.Guilds], rest: { retries: 0, timeout: 15_000 } });
@@ -49,7 +67,7 @@ const failProcess = (error: unknown, source: string) => {
   if (!fatalShutdown) fatalShutdown = (async () => {
     try {
       if (stopBot) await stopBot();
-      else { await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); }
+      else { await worker.close(); await queue.close(); await prisma.$disconnect(); await destroyClientBeforeReleasingLease(client, releaseBotLease); }
     } catch (shutdownError) { logThrottled('fatal-shutdown', 'Fatal shutdown cleanup failed', shutdownError); }
     process.exit(1);
   })();
@@ -60,7 +78,7 @@ process.on('uncaughtException', error => failProcess(error, 'uncaught-exception'
 
 client.once(Events.ClientReady, async ready => {
   console.info(`Connecté comme ${ready.user.tag}`);
-  await markInterruptedOperationsUncertain(prisma).catch(error => console.error('Could not reconcile interrupted moderation actions', error));
+  await reconcileInterruptedModeration(prisma).catch(error => logBotError('reconcile_failed', 'startup_reconcile', 'Could not reconcile interrupted moderation actions', error, { phase: 'lease_reconciliation' }));
   const ownedShardIds = client.shard?.ids ?? [0];
   const publishPresence = async () => {
     if (!client.isReady()) return;
@@ -93,19 +111,21 @@ client.once(Events.ClientReady, async ready => {
     } finally { membershipSyncing = false; }
   };
   await syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync failed; retry scheduled', error));
-  const dispatchRequested = createDispatcher(prisma, queue, () => client.isReady(), logThrottled);
+  const dispatchRequested = createDispatcher(prisma, queue, () => client.isReady(), logThrottled, undefined, event => logBotOperation({
+    event: 'moderation_dispatch', ...event,
+  }));
   wakeRequestDispatcher = dispatchRequested;
   await publishPresence().catch(err => logThrottled('presence-heartbeat', 'initial presence sync failed', err));
   const timer = setInterval(() => void publishPresence().catch(err => logThrottled('presence-heartbeat', 'presence heartbeat failed', err)), 30_000);
   if (!membershipsSynced) membershipRetryTimer = setInterval(() => void syncGuildMemberships().catch(error => logThrottled('guild-membership-sync', 'guild membership sync retry failed', error)), 30_000);
   await dispatchRequested();
   const dispatchTimer = setInterval(() => void dispatchRequested(), 1_000);
-  const staleOperationTimer = setInterval(() => void markInterruptedOperationsUncertain(prisma).catch(error => console.error('stale moderation operation reconciliation failed', error)), 60_000);
+  const staleOperationTimer = setInterval(() => void reconcileInterruptedModeration(prisma).catch(error => logBotError('reconcile_failed', 'stale_operation_reconcile', 'Stale moderation operation reconciliation failed', error, { phase: 'lease_reconciliation' })), 60_000);
   const loopDelay = monitorEventLoopDelay({ resolution: 20 });
   loopDelay.enable();
   let previousElu = performance.eventLoopUtilization();
   const metricsTimer = setInterval(() => { void (async () => {
-    const [rows, queueCounts, connections] = await Promise.all([
+    const [rows, queueCounts, connections, redisInfo] = await Promise.all([
       prisma.$queryRaw<Array<{ requested: bigint; running: bigint; uncertainActions: bigint; uncertainExpiries: bigint; oldestRequestedSeconds: number | null; overdueExpiries: bigint; oldestExpirySeconds: number | null }>>`
         SELECT
           (SELECT COUNT(*) FROM "ModerationCase" WHERE status = 'requested') AS requested,
@@ -117,17 +137,22 @@ client.once(Events.ClientReady, async ready => {
           (SELECT EXTRACT(EPOCH FROM now() - MIN("expiresAt"))::float8 FROM "ModerationCase" WHERE action = 'TEMPBAN' AND status = 'succeeded' AND "expiryStatus" = 'scheduled' AND "expiresAt" < now()) AS "oldestExpirySeconds"`,
       queue.getJobCounts('waiting', 'active', 'delayed', 'failed'),
       prisma.$queryRaw<Array<{ count: number; lockWaiters: number }>>`SELECT COUNT(*)::integer AS count, COUNT(*) FILTER (WHERE wait_event_type = 'Lock')::integer AS "lockWaiters" FROM pg_stat_activity WHERE datname = current_database()`,
+      queue.getBackend().client.then(client => client.info()),
     ]);
     const memory = process.memoryUsage();
     const elu = performance.eventLoopUtilization(previousElu);
     previousElu = performance.eventLoopUtilization();
-    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
-      errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, externalBytes: memory.external,
+    console.info(JSON.stringify({ metric: 'bot_operational_snapshot', moderation: rows[0], queue: queueCounts, redis: {
+      usedMemoryBytes: redisInfoNumber(redisInfo, 'used_memory'), maxMemoryBytes: redisInfoNumber(redisInfo, 'maxmemory'),
+      connectedClients: redisInfoNumber(redisInfo, 'connected_clients'), oomErrors: redisInfoNumber(redisInfo, 'errorstat_OOM', 'count'),
+    }, sql: { ...connections[0], pool: { total: postgresPool.totalCount, idle: postgresPool.idleCount, waiting: postgresPool.waitingCount }, acquisition: takePoolAcquireMetrics() },
+      errors: Object.fromEntries(errorTotals), rssBytes: memory.rss, heapUsedBytes: memory.heapUsed,
+      externalBytes: memory.external, arrayBuffersBytes: memory.arrayBuffers, cacheCounts: readBotCacheCounts(client),
       eventLoopUtilization: elu.utilization, eventLoopDelayP95Ms: loopDelay.percentile(95) / 1e6 }, (_key, value) => typeof value === 'bigint' ? Number(value) : value));
     loopDelay.reset();
   })().catch(error => logThrottled('operational-metrics', 'Operational snapshot failed', error)); }, 60_000);
   metricsTimer.unref();
-  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); client.destroy(); await releaseBotLease(); };
+  const shutdown = async () => { clearInterval(timer); if (membershipRetryTimer) clearInterval(membershipRetryTimer); clearInterval(dispatchTimer); clearInterval(staleOperationTimer); clearInterval(metricsTimer); loopDelay.disable(); await worker.close(); await queue.close(); await prisma.$disconnect(); await destroyClientBeforeReleasingLease(client, releaseBotLease); };
   stopBot = shutdown;
   process.once('SIGINT', () => void shutdown()); process.once('SIGTERM', () => void shutdown());
 });
@@ -143,6 +168,7 @@ catch (error) {
   await worker.close().catch(() => undefined);
   await queue.close().catch(() => undefined);
   await prisma.$disconnect().catch(() => undefined);
-  await releaseBotLease();
-  throw error;
+  await destroyClientBeforeReleasingLease(client, releaseBotLease);
+  logBotError('bot_start_failed', 'discord_login', 'Discord client login failed', error);
+  process.exitCode = 1;
 }

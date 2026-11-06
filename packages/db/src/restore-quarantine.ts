@@ -1,7 +1,9 @@
 import type { PrismaClient } from './generated/prisma/client.js';
+import { recoveryEpochHash } from './recovery-gate.js';
 
-/** Call once against an isolated restored database before any API or bot starts. */
-export async function quarantineRestoredWork(client: PrismaClient, now = new Date()) {
+/** Rotate to a fresh externally managed epoch while quarantining restored work in one transaction. */
+export async function quarantineRestoredWork(client: PrismaClient, recoveryEpoch: string, now = new Date()) {
+  const epochHash = recoveryEpochHash(recoveryEpoch);
   return client.$transaction(async tx => {
     const actions = await tx.moderationCase.updateMany({
       where: { status: { in: ['requested', 'running'] } },
@@ -22,6 +24,12 @@ export async function quarantineRestoredWork(client: PrismaClient, now = new Dat
       where: { action: 'TEMPBAN', expiryStatus: 'running' },
       data: { expiryStatus: 'uncertain', expiryResult: 'Restauration ancienne : un débannissement a pu être exécuté après le snapshot. Réconciliation humaine requise; aucun rejeu automatique.' },
     });
-    return { actionsQuarantined: actions.count, temporaryActionsQuarantined: temporaryActionRows.count, scheduledExpiriesQuarantined: scheduled.count, runningExpiriesQuarantined: runningExpiries.count };
+    const sessionsRevoked = await tx.sessionGrant.updateMany({ where: { revokedAt: null }, data: { revokedAt: now } });
+    await tx.recoveryGate.upsert({
+      where: { id: 'singleton' },
+      create: { id: 'singleton', epochHash },
+      update: { epochHash },
+    });
+    return { actionsQuarantined: actions.count, temporaryActionsQuarantined: temporaryActionRows.count, scheduledExpiriesQuarantined: scheduled.count, runningExpiriesQuarantined: runningExpiries.count, sessionsRevoked: sessionsRevoked.count };
   });
 }

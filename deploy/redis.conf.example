@@ -1,0 +1,10 @@
+# Copy to .secrets/redis.conf on the deployment host, set requirepass to the
+# same URL-encoded password used in REDIS_URL, and keep the host file untracked.
+requirepass replace_with_random_password
+appendonly yes
+appendfsync everysec
+# Keep PostgreSQL as the durable outbox; disable RDB snapshots to avoid a
+# second persistence mechanism and their fork/copy-on-write peak. AOF rewrite
+# still needs container memory headroom.
+save ""
+maxmemory-policy noeviction

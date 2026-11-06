@@ -1,15 +1,20 @@
 'use client';
 
 import { LoaderCircle } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import { Notice, PageHeader } from './components';
-import { SettingsPage } from './configuration';
-import { ActionsView, CasesView, OverviewView, WarningsView } from './views';
 import { useDashboard } from './dashboard-context';
 import { moduleRegistry, type ModuleId } from './module-registry';
 import type { GuildConfig, View } from './dashboard-types';
 
 export type Section = 'overview' | 'settings' | 'premium' | 'warnings' | 'member-actions' | 'channel-actions' | 'records';
 const destinations: Record<View, Section> = { overview: 'overview', settings: 'settings', warnings: 'warnings', actions: 'member-actions', cases: 'records' };
+function FeatureLoading() { return <div className="loading-row" role="status"><LoaderCircle size={18} className="spin" /> Chargement…</div>; }
+const OverviewView = dynamic(() => import('./overview-view').then(module => module.OverviewView), { loading: FeatureLoading });
+const SettingsPage = dynamic(() => import('./configuration').then(module => module.SettingsPage), { loading: FeatureLoading });
+const WarningsView = dynamic(() => import('./warnings-view').then(module => module.WarningsView), { loading: FeatureLoading });
+const ActionsView = dynamic(() => import('./actions-view').then(module => module.ActionsView), { loading: FeatureLoading });
+const CasesView = dynamic(() => import('./records-view').then(module => module.CasesView), { loading: FeatureLoading });
 function ModuleSwitch({ id }: { id: ModuleId }) {
   const { draft, update, configLoading } = useDashboard();
   const module = moduleRegistry.find(item => item.id === id);

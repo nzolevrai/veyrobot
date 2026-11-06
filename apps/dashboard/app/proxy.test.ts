@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
+import { createHmac } from 'node:crypto';
 import { proxyRequest } from './api/proxy.js';
+import { clientIpSigningPayload } from '@veyrobot/contracts/client-ip';
 
 function streamedRequest(chunks: Uint8Array[], headers: Record<string, string> = {}, signal?: AbortSignal): Request {
   return new Request('http://localhost/api/test', {
@@ -37,6 +39,104 @@ test('forwards a bounded body without Content-Length and filters hop headers in 
   assert.equal(response.headers.get('location'), '/next');
   assert.equal(response.headers.get('x-response-drop'), null);
   assert.equal(response.headers.getSetCookie().length, 2);
+});
+
+test('proxyRequest removes every forwarded and hop header while preserving application headers', async () => {
+  const incoming = new Headers({
+    'x-forwarded-a': 'a', 'x-forwarded-b': 'b', 'x-forwarded-c': 'c', 'x-forwarded-d': 'd', 'x-forwarded-e': 'e',
+    'x-forwarded-client-cert': 'client-cert', 'x-forwarded-for': '192.0.2.1', 'x-forwarded-host': 'forged.example',
+    'x-forwarded-proto': 'http', 'x-forwarded-port': '80', 'forwarded': 'for=192.0.2.1', 'x-real-ip': '192.0.2.1',
+    'x-veyrobot-client-ip': '192.0.2.1', 'x-veyrobot-client-ip-signature': 'forged',
+    'connection': 'x-nominated-hop', 'x-nominated-hop': 'drop-me',
+    'content-type': 'application/json', 'x-application-trace': 'keep-me',
+  });
+  let observed: Headers | undefined;
+  await proxyRequest(new Request('http://localhost/api/test', { headers: incoming }), ['test'], '', async (_url, init) => {
+    observed = init?.headers as Headers;
+    return new Response('ok');
+  });
+  assert.ok(observed, 'proxyRequest should call the upstream');
+  for (const name of ['x-forwarded-a', 'x-forwarded-b', 'x-forwarded-c', 'x-forwarded-d', 'x-forwarded-e', 'x-forwarded-client-cert', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'forwarded', 'x-real-ip', 'x-veyrobot-client-ip', 'x-veyrobot-client-ip-signature', 'connection', 'x-nominated-hop']) {
+    assert.equal(observed.get(name), null, `${name} must not reach the API`);
+  }
+  assert.equal(observed.get('content-type'), 'application/json');
+  assert.equal(observed.get('x-application-trace'), 'keep-me');
+});
+
+test('forwards client identity only from the configured ingress header and signs it', async () => {
+  const priorHeader = process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
+  const priorSecret = process.env.API_PROXY_CLIENT_IP_SECRET;
+  process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = 'x-real-ip';
+  process.env.API_PROXY_CLIENT_IP_SECRET = 'test-only-signing-secret-32-bytes';
+  try {
+    const upstream: typeof fetch = async (_url, init) => {
+      const headers = init?.headers as Headers;
+      assert.equal(headers.get('x-veyrobot-client-ip'), '203.0.113.9');
+      assert.equal(headers.get('x-veyrobot-client-ip-signature'), createHmac('sha256', 'test-only-signing-secret-32-bytes').update(clientIpSigningPayload('203.0.113.9')).digest('hex'));
+      assert.equal(headers.get('x-forwarded-for'), null);
+      assert.equal(headers.get('x-forwarded-client-cert'), null);
+      return new Response('ok');
+    };
+    await proxyRequest(new Request('http://localhost/api/test', { headers: {
+      'x-real-ip': '203.0.113.9', 'x-veyrobot-client-ip': '198.51.100.1',
+      'x-veyrobot-client-ip-signature': 'forged', 'x-forwarded-for': '192.0.2.2', 'x-forwarded-client-cert': 'forged-cert',
+    } }), ['test'], '', upstream);
+  } finally {
+    if (priorHeader === undefined) delete process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER; else process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = priorHeader;
+    if (priorSecret === undefined) delete process.env.API_PROXY_CLIENT_IP_SECRET; else process.env.API_PROXY_CLIENT_IP_SECRET = priorSecret;
+  }
+});
+
+test('canonicalizes trusted ingress values and refuses ambiguous source headers', async () => {
+  const priorHeader = process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
+  const priorSecret = process.env.API_PROXY_CLIENT_IP_SECRET;
+  process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = 'x-real-ip';
+  process.env.API_PROXY_CLIENT_IP_SECRET = 'test-only-signing-secret-32-bytes';
+  try {
+    const seen: Array<[string | null, string | null]> = [];
+    const upstream: typeof fetch = async (_url, init) => {
+      const headers = init?.headers as Headers;
+      seen.push([headers.get('x-veyrobot-client-ip'), headers.get('x-veyrobot-client-ip-signature')]);
+      return new Response('ok');
+    };
+    await proxyRequest(new Request('http://localhost/api/test', { headers: { 'x-real-ip': '2001:0DB8:0:0:0:0:0:1' } }), ['test'], '', upstream);
+    await proxyRequest(new Request('http://localhost/api/test', { headers: { 'x-real-ip': '2001:db8::1' } }), ['test'], '', upstream);
+    await proxyRequest(new Request('http://localhost/api/test', { headers: { 'x-real-ip': '192.0.2.1, 198.51.100.2' } }), ['test'], '', upstream);
+    const duplicateSource = new Headers();
+    duplicateSource.append('x-real-ip', '192.0.2.1');
+    duplicateSource.append('x-real-ip', '198.51.100.2');
+    await proxyRequest(new Request('http://localhost/api/test', { headers: duplicateSource }), ['test'], '', upstream);
+    assert.equal(seen[0]?.[0], '2001:db8::1');
+    assert.equal(seen[0]?.[0], seen[1]?.[0]);
+    assert.equal(seen[0]?.[1], seen[1]?.[1]);
+    assert.deepEqual(seen[2], [null, null], 'a combined or duplicated ingress value is not signed');
+    assert.deepEqual(seen[3], [null, null], 'duplicate source fields are combined and rejected');
+  } finally {
+    if (priorHeader === undefined) delete process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER; else process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = priorHeader;
+    if (priorSecret === undefined) delete process.env.API_PROXY_CLIENT_IP_SECRET; else process.env.API_PROXY_CLIENT_IP_SECRET = priorSecret;
+  }
+});
+
+test('without a configured trusted source, forged identity headers are removed and not signed', async () => {
+  const priorHeader = process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
+  const priorSecret = process.env.API_PROXY_CLIENT_IP_SECRET;
+  delete process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER;
+  process.env.API_PROXY_CLIENT_IP_SECRET = 'test-only-signing-secret-32-bytes';
+  try {
+    await proxyRequest(new Request('http://localhost/api/test', { headers: {
+      'x-real-ip': '192.0.2.55', 'x-veyrobot-client-ip': '192.0.2.99',
+      'x-veyrobot-client-ip-signature': 'f'.repeat(64),
+    } }), ['test'], '', async (_url, init) => {
+      const headers = init?.headers as Headers;
+      assert.equal(headers.get('x-real-ip'), null);
+      assert.equal(headers.get('x-veyrobot-client-ip'), null);
+      assert.equal(headers.get('x-veyrobot-client-ip-signature'), null);
+      return new Response('ok');
+    });
+  } finally {
+    if (priorHeader === undefined) delete process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER; else process.env.DASHBOARD_TRUSTED_CLIENT_IP_HEADER = priorHeader;
+    if (priorSecret === undefined) delete process.env.API_PROXY_CLIENT_IP_SECRET; else process.env.API_PROXY_CLIENT_IP_SECRET = priorSecret;
+  }
 });
 
 test('distinguishes body read errors, client cancellation, upstream outage and timeout', async () => {

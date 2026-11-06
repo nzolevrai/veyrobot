@@ -3,6 +3,7 @@ node_modules
 .env
 .env.*
 !.env.example
+.secrets/
 *.log
 *.log.*
 *.dump
