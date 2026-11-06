@@ -1,5 +1,7 @@
 # Banc de charge local (hors Discord)
 
+La mesure du découpage JavaScript du dashboard du 6 novembre 2026 est séparée des bancs serveur ci-dessous ; voir [DASHBOARD-BUNDLE-SPLIT-2026-11-06.md](DASHBOARD-BUNDLE-SPLIT-2026-11-06.md) pour les tailles avant/après vérifiées sous Chromium et Firefox.
+
 ## Protocole prévu — parcours HTTP complet
 
 Avant l'exécution du banc `deploy/http-performance.integration.mjs`, les critères sont les suivants. Le test utilise PostgreSQL 17 et Redis 7 isolés, deux sessions OAuth de test valides, autorisations et CSRF actifs, et des plafonds de quota explicitement actifs mais supérieurs au nombre d'appels prévu. Le plafond d'admission par serveur est réglé à 8 pour rendre le refus déterministe; il n'est pas désactivé. Le simulateur d'action Discord attend 35 ms par action terminée et n'ouvre aucune connexion Discord.
