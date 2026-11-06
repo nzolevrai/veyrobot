@@ -48,7 +48,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction, onAct
     const target = interaction.options.getUser('membre', true);
     const reason = interaction.options.getString('raison', true).trim();
     try {
-      const item = await createWarningCase({ guildId: interaction.guildId, actorId: interaction.user.id, targetId: target.id, reason });
+      const item = await createWarningCase({ operationId: interaction.id, guildId: interaction.guildId, actorId: interaction.user.id, targetId: target.id, reason });
       await respondSafely(interaction, { embeds: [new EmbedBuilder().setColor(embedColor).setTitle(english ? 'Warning saved' : 'Avertissement enregistré').setDescription(english ? `User: ${target.id}\nCase: ${item.id}` : `Utilisateur : ${target.id}\nDossier : ${item.id}`)] });
     } catch (error) {
       logInteractionFailure(error);
@@ -87,7 +87,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction, onAct
 export function registerInteractionHandler(client: Client, onActionAccepted?: () => void): void {
   client.on(Events.InteractionCreate, interaction => {
     if (!interaction.isChatInputCommand()) return;
-    void runInteractionSafely(() => handleInteraction(interaction, onActionAccepted), async error => {
+    return runInteractionSafely(() => handleInteraction(interaction, onActionAccepted), async error => {
       await respondSafely(interaction, { content: 'Le traitement a échoué. Consultez le dossier avant de réessayer.' });
       if (error instanceof Error) logInteractionFailure(error);
     });

@@ -2,7 +2,8 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { PrismaClient } from './generated/prisma/client.js';
-import { persistWarningCase, type WarningCaseInput } from './warning-case.js';
+import type { Prisma } from './generated/prisma/client.js';
+import { isReplayConflict, isSameWarningReplay, persistWarningCase, type WarningCaseInput } from './warning-case.js';
 import { performance } from 'node:perf_hooks';
 
 export type { WarningCaseInput } from './warning-case.js';
@@ -43,10 +44,48 @@ export * from './admission.js';
 export * from './restore-quarantine.js';
 export * from './recovery-gate.js';
 
+async function assertWarningsEnabled(tx: Prisma.TransactionClient, guildId: string): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ warningsEnabled: boolean }>>`
+    SELECT "warningsEnabled" FROM "GuildConfig" WHERE "guildId" = ${guildId} FOR SHARE
+  `;
+  if (!rows[0]?.warningsEnabled) throw Object.assign(new Error('Le module Avertissements est désactivé sur ce serveur.'), { statusCode: 400, code: 'MODULE_DISABLED' });
+}
+
 export async function createWarningCase(input: WarningCaseInput) {
-  return prisma.$transaction(async tx => {
-    const config = await tx.guildConfig.findUnique({ where: { guildId: input.guildId }, select: { warningsEnabled: true } });
-    if (!config?.warningsEnabled) throw Object.assign(new Error('Le module Avertissements est désactivé sur ce serveur.'), { statusCode: 400, code: 'MODULE_DISABLED' });
-    return persistWarningCase({ create: ({ data }) => tx.moderationCase.create({ data }) }, input);
-  }, { isolationLevel: 'Serializable' });
+  if (!input.operationId) {
+    return prisma.$transaction(async tx => {
+      await assertWarningsEnabled(tx, input.guildId);
+      return persistWarningCase({ create: ({ data }) => tx.moderationCase.create({ data }) }, input);
+    }, { isolationLevel: 'Serializable' });
+  }
+  const replayInput: WarningCaseInput & { operationId: string } = { ...input, operationId: input.operationId };
+  const existing = await prisma.moderationCase.findUnique({ where: { operationId: replayInput.operationId } });
+  if (existing) {
+    if (isSameWarningReplay(existing, replayInput)) return existing;
+    throw Object.assign(new Error('Identifiant d’interaction déjà associé à un dossier différent.'), { code: 'INTERACTION_REPLAY_CONFLICT' });
+  }
+
+  try {
+    return await prisma.$transaction(async tx => {
+      await assertWarningsEnabled(tx, input.guildId);
+      await tx.moderationCase.createMany({
+        data: [{ ...replayInput, action: 'WARN', status: 'completed' }],
+        skipDuplicates: true,
+      });
+      const record = await tx.moderationCase.findUnique({ where: { operationId: replayInput.operationId } });
+      if (!record) throw new Error('Le dossier avertissement n’a pas pu être relu après son écriture.');
+      if (!isSameWarningReplay(record, replayInput)) {
+        throw Object.assign(new Error('Identifiant d’interaction déjà associé à un dossier différent.'), { code: 'INTERACTION_REPLAY_CONFLICT' });
+      }
+      return record;
+    });
+  } catch (error) {
+    // Concurrent deliveries can both pass the first lookup. The unique database
+    // constraint selects one winner; the loser returns it only if its payload
+    // matches the same Discord interaction exactly.
+    if (!isReplayConflict(error)) throw error;
+    const replay = await prisma.moderationCase.findUnique({ where: { operationId: replayInput.operationId } });
+    if (replay && isSameWarningReplay(replay, replayInput)) return replay;
+    throw error;
+  }
 }
