@@ -1,0 +1,45 @@
+name: Redis OOM investigation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/redis-oom-investigation.yml
+      - deploy/redis-oom-investigation.mjs
+      - docs/REDIS-OOM-INVESTIGATION.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redis-oom-investigation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+      - name: Record runner kernel and Docker runtime
+        run: |
+          uname -a
+          uname -r
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}} serverGit={{.Server.GitCommit}} api={{.Server.APIVersion}}'
+          docker info --format 'kernel={{.KernelVersion}} cgroup={{.CgroupVersion}} os={{.OperatingSystem}} driver={{.Driver}} memoryBytes={{.MemTotal}}'
+      - name: Compare in-container and external Redis fillers on Redis 7.4.12
+        run: node deploy/redis-oom-investigation.mjs
+        env:
+          REDIS_DIAGNOSTIC_IMAGE: redis:7.4.12-alpine
+          REDIS_OOM_DIAGNOSTIC_DIR: ${{ runner.temp }}/veyrobot-redis-oom-diagnostics
+      - name: Upload bounded Redis OOM diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-oom-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/veyrobot-redis-oom-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
